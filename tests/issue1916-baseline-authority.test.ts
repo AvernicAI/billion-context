@@ -40,7 +40,10 @@ import { setLogCapture } from "../src/logger.ts";
 //   I: plugin lane threads the same parameters (applyUsageSample wiring);
 //   K: meter switch (#1536 identity change) admits an incomparable reading;
 //   L: young sessions (< REWRITE_MIN_KNOWN_REFS refs) stay unarmed — thin
-//      stateless clients keep their stale-baseline rescue (e2e-image-billing).
+//      stateless clients keep their stale-baseline rescue (e2e-image-billing);
+//   J: helper edges — zero total / absent baseline admit without side effects;
+//   M: streak semantics — unshaped spam can't pre-charge the valve, any
+//      admission resets the run.
 
 const INCIDENT_BASELINE = 251_655; // A族 input in the #1911 decisive sequence
 const FOREIGN_SAMPLE = 69_419; // B族 input — the fold denominator that poisoned #1911
@@ -307,6 +310,37 @@ test("#1916 L: young sessions stay unarmed — thin stateless clients keep their
     });
     assert.equal(armed.stats.lastInputTokens, 260_144, "the identical drop IS quarantined once the session carries real history");
     assert.ok(lArmed.some((l) => l.includes("quarantined")), `armed session must quarantine: ${JSON.stringify(lArmed)}`);
+});
+
+test("#1916 M: streak semantics — unshaped spam cannot pre-charge the valve, any admission resets the run", () => {
+    const s = matureSession(20_000);
+    for (let i = 0; i < 3; i++) {
+        captureLogs(() => {
+            settleUsageReport(s, { total: FOREIGN_SAMPLE + i, reportedCached: 3072, protocol: "anthropic", incomingMsgCount: 1 });
+        });
+    }
+    assert.equal(s.foreignSampleStreak, undefined, "unshaped spam neither advances nor pre-charges the run");
+    const { lines: lShaped } = captureLogs(() => {
+        settleUsageReport(s, { total: 88_000, reportedCached: 3072, protocol: "anthropic", incomingMsgCount: 12 });
+    });
+    assert.equal(s.stats.lastInputTokens, INCIDENT_BASELINE, "first shaped low sample quarantines despite three prior unshaped ones (no stolen streak)");
+    assert.ok(lShaped.some((l) => l.includes("quarantined")), `expected quarantine of the shaped sample: ${JSON.stringify(lShaped)}`);
+    assert.ok(!lShaped.some((l) => l.includes("escape valve")), `valve must not fire off a pre-charged run: ${JSON.stringify(lShaped)}`);
+
+    const s2 = matureSession(20_000);
+    captureLogs(() => {
+        settleUsageReport(s2, { total: 90_000, reportedCached: 3072, protocol: "anthropic", incomingMsgCount: 12 });
+        settleUsageReport(s2, { total: 91_000, reportedCached: 3072, protocol: "anthropic", incomingMsgCount: 12 });
+        settleUsageReport(s2, { total: 300_000, reportedCached: 250_000, protocol: "anthropic", incomingMsgCount: 12 });
+    });
+    assert.equal(s2.stats.lastInputTokens, 300_000, "upward sample admitted");
+    assert.equal(s2.foreignSampleStreak, undefined, "the admission reset the run");
+    const { lines: lAfter } = captureLogs(() => {
+        settleUsageReport(s2, { total: 80_000, reportedCached: 3072, protocol: "anthropic", incomingMsgCount: 12 });
+    });
+    assert.equal(s2.stats.lastInputTokens, 300_000, "post-admission low sample starts a fresh run — quarantined at count one");
+    assert.ok(lAfter.some((l) => l.includes("quarantined")), `expected fresh-run quarantine: ${JSON.stringify(lAfter)}`);
+    assert.ok(!lAfter.some((l) => l.includes("escape valve")), `valve must not ride a stale pre-admission run: ${JSON.stringify(lAfter)}`);
 });
 
 test("#1916 J: helper edge — zero/non-positive and no-baseline states admit without side effects", () => {

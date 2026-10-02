@@ -806,9 +806,10 @@ const FOREIGN_STREAK_ADMIT = 3;
  *   valve      — FOREIGN_STREAK_ADMIT consecutive quarantined samples from
  *                requests shaped like the real conversation: a client
  *                legitimately truncating its view produces exactly this
- *                pattern. Single-message foreign shapes can never admit
- *                through the valve; an unknown shape (undefined count) fails
- *                closed.
+ *                pattern. Unshaped (single-message / unknown-count) samples
+ *                neither advance nor break the run — they can never admit
+ *                through the valve and cannot pre-charge it either; any
+ *                admission (upward, explained or valved) resets the run.
  * Everything else is quarantined: the caller returns before writing stats,
  * the nudge reference, cached aggregates, ledger samples or seam pairing. The
  * failure direction is sticky-HIGH until a legitimate sample regrows or
@@ -827,15 +828,24 @@ export function admitUsageSample(
     identityChanged?: boolean,
 ): boolean {
     const stats = session.stats;
-    if (stats.lastInputTokensSource !== "usage") return true;
+    const shapedLikeConversation = incomingMsgCount !== undefined && incomingMsgCount >= REWRITE_MIN_INCOMING_TOTAL;
+    const resetStreak = (): void => { delete session.foreignSampleStreak; };
+    if (stats.lastInputTokensSource !== "usage") {
+        resetStreak();
+        return true;
+    }
     if (!(total > 0)) return true;
-    if (Object.keys(session.state.messageRefs.byRaw).length < REWRITE_MIN_KNOWN_REFS) return true;
+    if (Object.keys(session.state.messageRefs.byRaw).length < REWRITE_MIN_KNOWN_REFS) {
+        resetStreak();
+        return true;
+    }
     const baseline = stats.lastInputTokens;
     const stored = session.metadata?.["effectiveConfig"];
     const margin = nudgeGrowthInterval(stored && typeof stored === "object" ? (stored as Config) : undefined);
-    if (!(baseline > total + margin)) return true;
-    const shapedLikeConversation = incomingMsgCount !== undefined && incomingMsgCount >= REWRITE_MIN_INCOMING_TOTAL;
-    const resetStreak = (): void => { delete session.foreignSampleStreak; };
+    if (!(baseline > total + margin)) {
+        resetStreak();
+        return true;
+    }
     if (identityChanged === true) {
         resetStreak();
         loggerLog("info", `[${session.id}] [acp-usage] meter-switch usage sample input=${total} admitted over baseline ${baseline} (wire/upstream/model changed, #1916)`);
@@ -854,8 +864,8 @@ export function admitUsageSample(
         loggerLog("info", `[${session.id}] [acp-usage] compaction-boundary usage sample input=${total} admitted over baseline ${baseline} (single-use explanation consumed, #1916)`);
         return true;
     }
-    const streak = (session.foreignSampleStreak?.count ?? 0) + 1;
-    session.foreignSampleStreak = { count: streak };
+    const streak = (session.foreignSampleStreak?.count ?? 0) + (shapedLikeConversation ? 1 : 0);
+    if (shapedLikeConversation) session.foreignSampleStreak = { count: streak };
     if (streak >= FOREIGN_STREAK_ADMIT && shapedLikeConversation) {
         resetStreak();
         loggerLog("warn", `[${session.id}] [acp-usage] ${streak} consecutive low usage samples from a ${incomingMsgCount}-message request — admitting input=${total} over baseline ${baseline} (escape valve, #1916)`);
