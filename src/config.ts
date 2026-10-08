@@ -1827,6 +1827,8 @@ type FileConfig = {
     codexCompact?: string;
     /** Auto-mode classifier local-forge switch (#2740) — env BILI_AUTO_MODE_FORGE. */
     autoModeForge?: { enabled?: boolean };
+    /** TRAE Code native auto-compact instruction neutralizer (#2411) — BILI_TRAE_COMPACT ("intercept" | "pass"). */
+    traeCompact?: string;
     /** CCR retrieval TTL in ms (#2030) — was BILI_CCR_RETRIEVAL_TTL_MS (default 600000). */
     ccrRetrievalTtlMs?: number;
     /** Large-decompress temp-file cap (#2030) — was BILI_DECOMPRESS_TMP_CAP (default 50). */
@@ -1880,6 +1882,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
     "autoModeForge",
+    "traeCompact",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:
