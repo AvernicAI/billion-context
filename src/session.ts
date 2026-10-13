@@ -1337,9 +1337,9 @@ export type NativeRebaseLedger = {
 // suppression window once the cap trips. A legitimate second compaction is spaced
 // by real work (minutes), well under the cap; only a tight self-retriggering loop
 // reaches MAX_CONSECUTIVE inside one cooldown.
-export const NATIVE_REBASE_COOLDOWN_MS = 5 * 60 * 1000;
+const NATIVE_REBASE_COOLDOWN_MS = 5 * 60 * 1000;
 export const NATIVE_REBASE_MAX_CONSECUTIVE = 3;
-export const NATIVE_REBASE_BREAKER_COOLDOWN_MS = 30 * 60 * 1000;
+const NATIVE_REBASE_BREAKER_COOLDOWN_MS = 30 * 60 * 1000;
 
 /** Decide + perform the native-compaction rebase with the #3033 convergence
  *  guards, replacing the raw mark+reconcile pair the prepare* lanes used to call
