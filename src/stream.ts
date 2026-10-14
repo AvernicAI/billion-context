@@ -718,7 +718,7 @@ function previewRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: Rewri
             continue;
         }
         if (r.skippedOverlap) {
-            lines.push(`${head}: SKIPPED (overlaps an earlier range in the same call) — ${r.skippedOverlap}`);
+            lines.push(`${head}: SKIPPED (overlaps an earlier range in the same call)${r.warnings?.length ? ` — ${r.warnings.join(" ")}` : ""}`);
             continue;
         }
         if (r.alreadyCovered) {
