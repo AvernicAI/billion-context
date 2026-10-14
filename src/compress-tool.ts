@@ -444,7 +444,9 @@ export function parseCompressInput(input: unknown, callId?: string) {
         // so it needs the explicit kind arm.
         loggerLog("warn", `[acp-compress-input] partial: ${parsed.ranges.length} range(s) applied, ${parsed.diagnostics.invalidItems} rejected (kind=${parsed.diagnostics.kind}) reasons=[${(parsed.diagnostics.invalidReasons ?? []).join(" | ")}]`);
     }
-    return { ranges: parsed.ranges, diagnostics: parsed.diagnostics };
+    // #3185: dryRun previews are routed to the kernel's previewCompression —
+    // the flag must survive this boundary or the call silently commits.
+    return { ranges: parsed.ranges, diagnostics: parsed.diagnostics, dryRun: parsed.dryRun === true };
 }
 
 // #1439: shared by the streaming Responses adapter AND the non-streaming JSON
