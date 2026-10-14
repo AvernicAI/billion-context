@@ -9,7 +9,8 @@ import { createInitialState, defaultConfig } from "acp-kernel";
 import type { CompressionBlock } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { SessionStore, _setStoreForTest, relPathFor } from "../src/persist.ts";
+import { createStorageCodec, parseEncryptionKey } from "../src/encrypt.ts";
 import { VERSION } from "../src/version.ts";
 import type { Session } from "../src/session.ts";
 import { getSession, _resetSessionsForTest } from "../src/session.ts";
@@ -335,17 +336,26 @@ withSessionsDir("session detail surfaces the per-file storage-mode stamp (#2671/
         setEnv("full", undefined);
         writeFileSync(path.join(dir, "index.db"), "not a sqlite database");
         await writeOne("sm-openfail");
+
     } finally {
         writeFileSync(path.join(dir, "index.db"), "");
         setEnv(saved[0], saved[1]);
     }
-
     _setStoreForTest(new SessionStore({ enabled: false }));
     _resetDiskCacheForTest();
     assert.equal((await buildSessionDetail("sm-default"))?.storageMode, "shadow", "absent everywhere now defaults to shadow");
     assert.equal((await buildSessionDetail("sm-full"))?.storageMode, "full");
-    assert.equal((await buildSessionDetail("sm-blocked"))?.storageMode, "legacy", "blocked-by-encryption writes no db copy → stamps legacy");
     assert.equal((await buildSessionDetail("sm-openfail"))?.storageMode, "legacy", "failed sidecar open writes no db copy → stamps legacy");
+    // sm-blocked's envelope is BILIENC1-encrypted with the temp key above.
+    // The web disk scan decodes with a codec captured when its lazy store
+    // singleton was first built (keyless in this suite), so it honestly
+    // skips that file — real key-rotation behavior. Verify the stamp
+    // through the codec directly instead (#3135③).
+    const blockedRaw = readFileSync(path.join(dir, relPathFor("sm-blocked", "openai")));
+    const blockedCodec = createStorageCodec({ key: parseEncryptionKey("00".repeat(32)) });
+    assert.ok(blockedCodec, "codec builds with an explicit key");
+    const blockedRec = JSON.parse(blockedCodec.decode(blockedRaw)) as { payload?: { metadata?: { storageMode?: string } }; metadata?: { storageMode?: string } };
+    assert.equal(blockedRec.payload?.metadata?.storageMode ?? blockedRec.metadata?.storageMode, "legacy", "blocked-by-encryption writes no db copy → stamps legacy");
 });
 
 withSessionsDir("#3093: live (never-persisted) sessions carry the provenance stamps", async (_dir) => {
