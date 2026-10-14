@@ -61,6 +61,10 @@ export interface CompressParseDiagnostics {
 
 export interface ParsedCompressInput {
   ranges: CompressRangeSpec[];
+  /** #3185: set when the call carried `dryRun: true` — the call previews
+   * instead of committing, so ranges may lack summaries (they are ignored
+   * and must not be dropped for that reason). */
+  dryRun?: boolean;
   diagnostics: CompressParseDiagnostics;
 }
 
@@ -108,7 +112,11 @@ function parseStringInput(
   diag.rawPrefix = clampPrefix(raw, 800);
   diag.length = raw.length;
   const cleaned = stripFence(raw.trim());
-  const first = parseStringCore(cleaned, callId, diag);
+  // Salvage-mode inputs never reach parseObjectValue, so the flag has to be
+  // detected from the raw text there; for parseable objects the exact field
+  // check below wins.
+  const rawDryRun = detectDryRunInRaw(cleaned);
+  const first = parseStringCore(cleaned, callId, diag, rawDryRun);
   // Weak local models emit single-quoted args ({'content': [...]}). The
   // salvage regex only recognizes double-quoted "content", so a truncated
   // single-quoted prefix recovers nothing on the first pass. Retry once
@@ -124,7 +132,7 @@ function parseStringInput(
       };
       retryDiag.rawPrefix = diag.rawPrefix;
       retryDiag.length = diag.length;
-      const retry = parseStringCore(normalized, callId, retryDiag);
+      const retry = parseStringCore(normalized, callId, retryDiag, rawDryRun);
       if (retry.ranges.length > first.ranges.length) {
         retryDiag.quoteSalvage = true;
         return retry;
@@ -138,6 +146,7 @@ function parseStringCore(
   cleaned: string,
   callId: string | undefined,
   diag: CompressParseDiagnostics,
+  rawDryRun: boolean,
 ): ParsedCompressInput {
   if (cleaned === "") {
     diag.kind = "empty-input";
@@ -163,7 +172,18 @@ function parseStringCore(
 
   // Unparseable prefix: salvage the complete content-array entries.
   const entries = salvageContentEntries(cleaned);
-  return finishSalvage(entries, callId, diag, looksTruncated(cleaned));
+  return finishSalvage(entries, callId, diag, looksTruncated(cleaned), rawDryRun);
+}
+
+/** #3185: best-effort dryRun detection for inputs that never reach an object
+ * parse (truncated/salvage prefixes). Matches `"dryRun": true` with optional
+ * quotes/whitespace; a summary body containing that literal text is a
+ * false positive only in already-degraded salvage mode, where reviving the
+ * preview is the desired behavior anyway. */
+const DRY_RUN_FLAG_RE = /["']?\bdryRun\b["']?\s*:\s*true\b/i;
+
+function detectDryRunInRaw(s: string): boolean {
+  return DRY_RUN_FLAG_RE.test(s);
 }
 
 function parseObjectValue(
@@ -172,17 +192,18 @@ function parseObjectValue(
   diag: CompressParseDiagnostics,
 ): ParsedCompressInput {
   diag.keys = Object.keys(value);
+  const dryRun = value["dryRun"] === true;
   const content = value["content"];
   if (content === undefined) {
     // Model drift: a single range at the top level (no content array).
     // The proxy defends against this shape; the kernel now owns it.
-    const single = validateEntry(value, callId);
+    const single = validateEntry(value, callId, dryRun);
     if ("range" in single) {
       diag.kind = "ok";
-      return finish([single.range], diag);
+      return finish([single.range], diag, dryRun);
     }
     diag.kind = "missing-content";
-    return finish([], diag);
+    return finish([], diag, dryRun);
   }
 
   let entries: unknown[];
@@ -204,15 +225,15 @@ function parseObjectValue(
       // header line, so the summary body never has to parse.
       const bare = stripJsonWrapperResidue(content);
       const entries = splitLineEntries(bare);
-      const { ranges, invalid, reasons } = validateEntries(entries, callId);
+      const { ranges, invalid, reasons } = validateEntries(entries, callId, dryRun);
       if (ranges.length > 0) {
         diag.invalidItems = invalid;
         if (reasons.length > 0) diag.invalidReasons = reasons;
         diag.kind = "ok";
-        return finish(ranges, diag);
+        return finish(ranges, diag, dryRun);
       }
       diag.kind = "content-not-array";
-      return finish([], diag);
+      return finish([], diag, dryRun);
     }
     entries = parsed.entries;
     salvaged = parsed.salvaged;
@@ -233,7 +254,7 @@ function parseObjectValue(
     return finish([], diag);
   }
 
-  const { ranges, invalid, reasons } = validateEntries(entries, callId);
+  const { ranges, invalid, reasons } = validateEntries(entries, callId, dryRun);
   // Top-level fallbacks: topic and summaryMaxChars apply to every range
   // that does not specify its own (omp/pi schemas define both at the top
   // level; per-entry values win).
@@ -255,7 +276,7 @@ function parseObjectValue(
     : ranges.length > 0
       ? "ok"
       : "no-valid-ranges";
-  return finish(ranges, diag);
+  return finish(ranges, diag, dryRun);
 }
 
 function parseContentArray(
@@ -296,9 +317,14 @@ function parseContentArrayCore(
 function finish(
   ranges: CompressRangeSpec[],
   diag: CompressParseDiagnostics,
+  dryRun?: boolean,
 ): ParsedCompressInput {
   diag.ok = ranges.length > 0;
-  return { ranges, diagnostics: diag };
+  return {
+    ranges,
+    ...(dryRun ? { dryRun: true } : {}),
+    diagnostics: diag,
+  };
 }
 
 function finishSalvage(
@@ -306,13 +332,14 @@ function finishSalvage(
   callId: string | undefined,
   diag: CompressParseDiagnostics,
   truncatedShape: boolean,
+  dryRun?: boolean,
 ): ParsedCompressInput {
-  const { ranges, invalid, reasons } = validateEntries(entries, callId);
+  const { ranges, invalid, reasons } = validateEntries(entries, callId, dryRun);
   diag.invalidItems = invalid;
   if (reasons.length > 0) diag.invalidReasons = reasons;
   diag.kind =
     entries.length > 0 || truncatedShape ? "truncated" : "malformed-json";
-  return finish(ranges, diag);
+  return finish(ranges, diag, dryRun);
 }
 
 // #1001 (problem 3): models routinely split the documented line form across
@@ -350,13 +377,14 @@ function coalesceLineEntries(entries: unknown[]): unknown[] {
 function validateEntries(
   entries: unknown[],
   callId: string | undefined,
+  dryRun?: boolean,
 ): { ranges: CompressRangeSpec[]; invalid: number; reasons: string[] } {
   const ranges: CompressRangeSpec[] = [];
   const reasons: string[] = [];
   let invalid = 0;
   const items = coalesceLineEntries(entries);
   for (let i = 0; i < items.length; i++) {
-    const outcome = validateEntry(items[i], callId);
+    const outcome = validateEntry(items[i], callId, dryRun);
     if ("range" in outcome) ranges.push(outcome.range);
     else {
       invalid++;
@@ -387,6 +415,7 @@ function normalizeLineRef(raw: string): string {
 function parseLineEntry(
   entry: string,
   callId: string | undefined,
+  dryRun?: boolean,
 ): EntryOutcome {
   const nl = entry.indexOf("\n");
   const head = (nl === -1 ? entry : entry.slice(0, nl)).trim();
@@ -407,7 +436,9 @@ function parseLineEntry(
     endRef = startRef;
     afterRefs = single.index + single[0].length;
   }
-  if (summary.length === 0)
+  // #3185: a preview carries no summary by contract, so a header-only line
+  // is complete for it; the empty placeholder is ignored downstream.
+  if (summary.length === 0 && !dryRun)
     return { reason: "line entry: missing summary after the refs header line" };
   const explicitTopic = head.slice(afterRefs).trim();
   const range: CompressRangeSpec = {
@@ -526,8 +557,9 @@ function stripJsonWrapperResidue(s: string): string {
 function validateEntry(
   entry: unknown,
   callId: string | undefined,
+  dryRun?: boolean,
 ): EntryOutcome {
-  if (typeof entry === "string") return parseLineEntry(entry, callId);
+  if (typeof entry === "string") return parseLineEntry(entry, callId, dryRun);
   if (entry === null || typeof entry !== "object" || Array.isArray(entry))
     return { reason: "not an object" };
   const e = entry as Record<string, unknown>;
@@ -545,9 +577,16 @@ function validateEntry(
       reason: "missing range bounds (need startRef/startId and endRef/endId)",
     };
   }
+  // #3185: previews carry no summary by contract — an absent or empty one
+  // must not drop the entry; the placeholder is ignored downstream. A
+  // non-string summary still drops (garbage is garbage in either mode).
   const summary = stringOr(e["summary"]);
-  if (summary === undefined) return { reason: "missing summary" };
-  const range: CompressRangeSpec = { startRef: start, endRef: end, summary };
+  if (summary === undefined && !dryRun) return { reason: "missing summary" };
+  const range: CompressRangeSpec = {
+    startRef: start,
+    endRef: end,
+    summary: summary ?? "",
+  };
   const topic = stringOr(e["topic"]);
   if (topic !== undefined) range.topic = topic;
   const maxChars = e["summaryMaxChars"];

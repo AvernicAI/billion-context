@@ -62,7 +62,8 @@ const COMPRESS_RANGE_OBJECT = {
     },
     summary: {
       type: "string",
-      description: "Self-contained summary replacing the range",
+      description:
+        "Self-contained summary replacing the range. REQUIRED unless dryRun=true",
     },
   },
 };
@@ -141,7 +142,12 @@ export const COMPRESS_PARAMETERS = {
     summary: {
       type: "string",
       description:
-        "Flat single-range form (no content): self-contained summary replacing the range",
+        "Flat single-range form (no content): self-contained summary replacing the range. REQUIRED unless dryRun=true",
+    },
+    dryRun: {
+      type: "boolean",
+      description:
+        "Preview without committing: validates the range(s) and reports what would fold, what is excluded (protected tools, recent zone, checkpoint carriers), what is withdrawn (turn integrity), which existing blocks would be absorbed, and the estimated tokens saved — zero side effects (nothing stored, no refs allocated). OMIT summary when dryRun=true (it is ignored). Re-issue the same ranges with dryRun omitted and your summary to commit.",
     },
   },
 };
@@ -177,6 +183,7 @@ export function parseCompressInput(
     return [];
   }
   const obj = input as Record<string, unknown>;
+  const dryRun = obj.dryRun === true;
   let content: unknown = obj.content;
   if (typeof content === "string") {
     try {
@@ -188,10 +195,10 @@ export function parseCompressInput(
       return [];
     }
   }
-  const single = toRange(obj);
+  const single = toRange(obj, dryRun);
   const ranges = Array.isArray(content)
     ? content
-        .map((r) => toRange(r as Record<string, unknown>))
+        .map((r) => toRange(r as Record<string, unknown>, dryRun))
         .filter((r): r is ParsedRange => r !== null)
     : single
       ? [single]
@@ -205,19 +212,34 @@ export function parseCompressInput(
   return ranges;
 }
 
-function toRange(r: Record<string, unknown>): ParsedRange | null {
+/** #3185: true when a compress argument object carries dryRun: true — hosts
+ *  route such calls to the preview path instead of committing. */
+export function compressDryRun(input: unknown): boolean {
+  return (
+    typeof input === "object" &&
+    input !== null &&
+    !Array.isArray(input) &&
+    (input as Record<string, unknown>).dryRun === true
+  );
+}
+
+function toRange(r: Record<string, unknown>, dryRun: boolean): ParsedRange | null {
   const startRef = pick(r, "startId", "startRef");
   const endRef = pick(r, "endId", "endRef");
   const summary = r.summary;
-  if (
-    typeof startRef !== "string" ||
-    typeof endRef !== "string" ||
-    typeof summary !== "string"
-  ) {
+  if (typeof startRef !== "string" || typeof endRef !== "string") {
     return null;
   }
+  // #3185: previews carry no summary by contract — accept the entry with an
+  // empty placeholder (ignored downstream); non-dryRun calls still require it.
+  if (typeof summary !== "string" && !dryRun) return null;
   const topic = typeof r.topic === "string" ? r.topic : undefined;
-  return { startRef, endRef, summary, ...(topic ? { topic } : {}) };
+  return {
+    startRef,
+    endRef,
+    summary: typeof summary === "string" ? summary : "",
+    ...(topic ? { topic } : {}),
+  };
 }
 
 function pick(r: Record<string, unknown>, ...keys: string[]): unknown {
@@ -251,7 +273,7 @@ Each message in the conversation is annotated with a <acp tokens="2.1K" type="to
 
 You have five context-management tools:
 
-- compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\\nsummary…\\nm00300–m00350 Deploy\\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary (a valid JSON string: \\\" and \\n). A single range is the same shape with one block. Object entries {startId,endId,summary,topic?} in the content array are also accepted. Never split a batch into one call per range.
+- compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\\nsummary…\\nm00300–m00350 Deploy\\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary (a valid JSON string: \\\" and \\n). A single range is the same shape with one block. Object entries {startId,endId,summary,topic?} in the content array are also accepted. Never split a batch into one call per range. Pass dryRun:true (and omit summary) to preview first: the report says whether the range is valid, what gets excluded or withdrawn, and how many tokens would be saved, without committing anything; re-issue with dryRun omitted and your summary to commit.
 - decompress — Restore a previously compressed block's content. By default restores one tier up (T2→T1 summaries, not raw messages). Use full: true to restore all the way to original messages. Use toFile to write to file instead of inflating context. Example: decompress({ blockId: "b5" }) or decompress({ blockId: "b5", toFile: "path" }) or decompress({ blockId: "b5", full: true }).
 - search_context — Search compressed block summaries (and optionally visible messages) by keyword. Use BEFORE decompressing to find the right block. Example: search_context({ query: "auth token refresh" }).
 - acp_status — Context status with compressible ranges. No args = overview + ranges. Use to find what to compress next.`,
@@ -695,12 +717,18 @@ export const COMPRESS_TOOL_GOOGLE = {
             },
             summary: {
               type: "string",
-              description: "Self-contained summary replacing the range",
+              description:
+                "Self-contained summary replacing the range. REQUIRED unless dryRun=true",
             },
           },
-          required: ["startId", "endId", "summary"],
+          required: ["startId", "endId"],
         },
       },
+    },
+    dryRun: {
+      type: "boolean",
+      description:
+        "Preview without committing: validates the range(s) and reports what would fold, what is excluded (protected tools, recent zone, checkpoint carriers), what is withdrawn (turn integrity), which existing blocks would be absorbed, and the estimated tokens saved — zero side effects. OMIT summary when dryRun=true (it is ignored). Re-issue with dryRun omitted and your summary to commit.",
     },
     required: ["content"],
   },

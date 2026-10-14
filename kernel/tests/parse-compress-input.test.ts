@@ -1236,3 +1236,89 @@ test("line-form split still breaks on headers after blank lines and element resi
     ],
   );
 });
+
+// #3185: dryRun previews carry no summaries by contract.
+test("dryRun:true accepts object entries without summaries", () => {
+  const parsed = parseCompressArgs({
+    content: [
+      { startId: "m00001", endId: "m00002" },
+      { startId: "m00003", endId: "m00004" },
+    ],
+    dryRun: true,
+  });
+  assert.equal(parsed.dryRun, true);
+  assert.equal(parsed.diagnostics.kind, "ok");
+  assert.equal(parsed.diagnostics.invalidItems, 0);
+  assert.deepEqual(
+    parsed.ranges.map((r) => [r.startRef, r.endRef, r.summary]),
+    [
+      ["m00001", "m00002", ""],
+      ["m00003", "m00004", ""],
+    ],
+  );
+});
+
+test("missing summary is still rejected when dryRun is absent or false", () => {
+  for (const input of [
+    { content: [{ startId: "m00001", endId: "m00002" }] },
+    { content: [{ startId: "m00001", endId: "m00002" }], dryRun: false },
+  ]) {
+    const parsed = parseCompressArgs(input);
+    assert.equal(parsed.dryRun, undefined, JSON.stringify(input));
+    assert.equal(parsed.ranges.length, 0, JSON.stringify(input));
+    assert.equal(parsed.diagnostics.invalidItems, 1, JSON.stringify(input));
+    assert.ok(
+      parsed.diagnostics.invalidReasons?.[0]!.includes("missing summary"),
+      JSON.stringify(parsed.diagnostics),
+    );
+  }
+});
+
+test("dryRun:true accepts flat top-level refs without a summary", () => {
+  const parsed = parseCompressArgs({
+    startId: "m00001",
+    endId: "m00002",
+    dryRun: true,
+  });
+  assert.equal(parsed.dryRun, true);
+  assert.equal(parsed.ranges.length, 1);
+  assert.deepEqual([parsed.ranges[0]!.startRef, parsed.ranges[0]!.summary], [
+    "m00001",
+    "",
+  ]);
+});
+
+test("string input detects the dryRun flag for JSON-shaped arguments", () => {
+  const parsed = parseCompressArgs(
+    '{"content":[{"startId":"m00001","endId":"m00002"}],"dryRun":true}',
+  );
+  assert.equal(parsed.dryRun, true);
+  assert.equal(parsed.ranges.length, 1);
+  assert.equal(parsed.ranges[0]!.summary, "");
+});
+
+test("truncated string input keeps the dryRun flag through salvage", () => {
+  const parsed = parseCompressArgs(
+    '{"dryRun":true,"content":[{"startId":"m00001","endRef":"m00002","summary":"s"},{"startId":"m00003","endRef":"m00004","summ',
+  );
+  assert.equal(parsed.dryRun, true);
+  const first = parsed.ranges.find((r) => r.startRef === "m00001");
+  assert.ok(first, "salvage kept the complete entry");
+});
+
+test("line-form header-only entries are accepted under dryRun only", () => {
+  const preview = parseCompressArgs({
+    content: ["m00001-m00005"],
+    dryRun: true,
+  });
+  assert.equal(preview.dryRun, true);
+  assert.equal(preview.ranges.length, 1);
+  assert.deepEqual(
+    [preview.ranges[0]!.startRef, preview.ranges[0]!.endRef, preview.ranges[0]!.summary],
+    ["m00001", "m00005", ""],
+  );
+
+  const real = parseCompressArgs({ content: ["m00001-m00005"] });
+  assert.equal(real.ranges.length, 0);
+  assert.equal(real.diagnostics.invalidItems, 1);
+});
