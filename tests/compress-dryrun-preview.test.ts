@@ -142,3 +142,23 @@ test("#3185: real compress after a preview behaves exactly like without one", ()
     assert.equal(bA.compressedTokens, bB.compressedTokens, "same token math");
     assert.deepEqual(previewed.session.state.messageRefs.byRef, control.session.state.messageRefs.byRef, "same ref space");
 });
+
+test("#3193 review: malformed dryRun (no valid ranges) reports PREVIEW FAILED and never arms failure tracking", () => {
+    const ctx = makeCtx();
+    seedRefs(ctx);
+    // Two shapes that parse to ZERO valid ranges while carrying the flag:
+    // a bare flag (missing content) and a non-object content entry.
+    const shapes = [() => parseCompressInput({ dryRun: true }), () => parseCompressInput({ dryRun: true, content: [42] })];
+    // Three repeats of one spec would trip the loop breaker on a real path (threshold 3).
+    for (let i = 0; i < 3; i++) {
+        for (const make of shapes) {
+            const res = applyRanges(make(), ctx);
+            assert.equal(res.outcome, "refused");
+            assert.ok(res.text.includes("PREVIEW FAILED"), `preview-failed marker, got: ${res.text.slice(0, 120)}`);
+            assert.ok(!res.text.includes("Repeat-failure guard"), "no repeat-guard text on a preview");
+            assert.ok(!res.text.includes("COMPRESS CIRCUIT BREAKER"), "loop breaker must not arm from previews");
+            assert.equal(ctx.session.metadata["compressFailKeys"], undefined, `fail-streak key must stay unset (round ${i + 1})`);
+            assert.equal(ctx.session.metadata["compressFailStreak"], undefined, `loop streak must stay unset (round ${i + 1})`);
+        }
+    }
+});

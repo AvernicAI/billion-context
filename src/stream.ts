@@ -765,6 +765,17 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
         const rawReasons = diagnostics.invalidReasons ?? [];
         for (const reason of rawReasons) ctx.log(`[acp-proxy: rejected entry: ${reason}]`);
+        // #3185 review: a malformed PREVIEW is still not an attempt — report
+        // the shape error so the model can correct it, but never arm the
+        // failure streak or the loop breaker (nothing was committed).
+        if (parsed.dryRun) {
+            const reasons = rawReasons.slice(0, 3).map((r) => (r.length > 160 ? safePrefix(r, 160) + "..." : r));
+            const why = reasons.length > 0 ? ` Rejected entries: ${reasons.join(" | ")}.` : "";
+            return compressResult(
+                `[Compression PREVIEW FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} Fix the refs/argument shape and re-issue the dryRun call — a preview never counts against the compress failure guard.`,
+                "refused", 0, `parse:${diagnostics.kind}`,
+            );
+        }
         // #1029: keep the ENTIRE failure on ONE line. buildVisibilityMarker
         // (the ❌ status line streamed to the client) keeps only line 1, so the
         // old multi-line "Rejected entries:" list reached clients as a dangling
