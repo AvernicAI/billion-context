@@ -1854,6 +1854,7 @@ export const WEB_CLIENT = `(function () {
         const gh = $("report-github");
         if (gh) gh.addEventListener("click", async (ev) => {
             ev.preventDefault();
+            if (gh.classList.contains("busy")) return;
             busy(gh, true);
             try {
                 const url = (await fetchReportDiagnostics()).url;
