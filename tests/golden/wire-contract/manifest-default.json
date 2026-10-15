@@ -130,7 +130,7 @@
             },
             "dryRun": {
               "type": "boolean",
-              "description": "Preview without committing: validates the range(s) and reports what would fold, what is excluded (protected tools, recent zone, checkpoint carriers), what is withdrawn (turn integrity), which existing blocks would be absorbed, and the estimated tokens saved — zero side effects (nothing stored, no refs allocated). OMIT summary when dryRun=true (it is ignored). Re-issue the same ranges with dryRun omitted and your summary to commit."
+              "description": "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true; re-issue the same ranges with your summary to commit."
             }
           }
         }
@@ -329,7 +329,7 @@
               },
               "dryRun": {
                 "type": "boolean",
-                "description": "Preview without committing: validates the range(s) and reports what would fold, what is excluded (protected tools, recent zone, checkpoint carriers), what is withdrawn (turn integrity), which existing blocks would be absorbed, and the estimated tokens saved — zero side effects (nothing stored, no refs allocated). OMIT summary when dryRun=true (it is ignored). Re-issue the same ranges with dryRun omitted and your summary to commit."
+                "description": "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true; re-issue the same ranges with your summary to commit."
               }
             }
           }
@@ -540,7 +540,7 @@
             },
             "dryRun": {
               "type": "boolean",
-              "description": "Preview without committing: validates the range(s) and reports what would fold, what is excluded (protected tools, recent zone, checkpoint carriers), what is withdrawn (turn integrity), which existing blocks would be absorbed, and the estimated tokens saved — zero side effects (nothing stored, no refs allocated). OMIT summary when dryRun=true (it is ignored). Re-issue the same ranges with dryRun omitted and your summary to commit."
+              "description": "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true; re-issue the same ranges with your summary to commit."
             }
           }
         }
