@@ -71,7 +71,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.os == 'macos-latest' && 'universal-apple-darwin' || '' }}
+          # universal-apple-darwin is a Tauri-CLI magic value, NOT a rustup
+          # target — rust-std has no such component. rustup needs BOTH real
+          # targets installed; tauri lipo's them into the universal binary.
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
       - name: Install Linux GUI build dependencies
         if: runner.os == 'Linux'
         run: |
