@@ -66,7 +66,8 @@ fn handle_conn(stream: Option<TcpStream>, canned: &[Canned]) {
     let _ = stream.flush();
 }
 
-const STATUS_OK: &str = r#"{"version":"0.1.197","diskVersion":"0.1.198","stale":false,"inFlight":0}"#;
+const STATUS_OK: &str =
+    r#"{"version":"0.1.197","diskVersion":"0.1.198","stale":false,"inFlight":0}"#;
 const STATS_OK: &str = r#"{
   "sessions": [
     {"id":"ses_abc","title":"Claude Code","label":"claude","contextTokens":190000,"contextWindow":200000,"inputTokens":1000000,"cachedTokens":950000,"cacheSamples":7},
@@ -78,10 +79,22 @@ const STATS_OK: &str = r#"{
 #[test]
 fn online_round_trip_parses_both_endpoints() {
     let (port, running) = start_mock(vec![
-        Canned { path: "/__bili/status", status_code: 200, body: STATUS_OK.into() },
-        Canned { path: "/__bili/stats", status_code: 200, body: STATS_OK.into() },
+        Canned {
+            path: "/__bili/status",
+            status_code: 200,
+            body: STATUS_OK.into(),
+        },
+        Canned {
+            path: "/__bili/stats",
+            status_code: 200,
+            body: STATS_OK.into(),
+        },
     ]);
-    let cfg = bili_tray_core::config::Config { port, poll_ms: 5000, timeout_ms: 2000 };
+    let cfg = bili_tray_core::config::Config {
+        port,
+        poll_ms: 5000,
+        timeout_ms: 2000,
+    };
     let state = bili_tray_core::stats::poll_once(&cfg);
     match state {
         bili_tray_core::TrayState::Online { status, stats } => {
@@ -94,10 +107,7 @@ fn online_round_trip_parses_both_endpoints() {
         }
         other => panic!("expected Online, got {other:?}"),
     }
-    let tip = bili_tray_core::format::tooltip(
-        &bili_tray_core::stats::poll_once(&cfg),
-        port,
-    );
+    let tip = bili_tray_core::format::tooltip(&bili_tray_core::stats::poll_once(&cfg), port);
     assert!(tip.starts_with("bili v0.1.197 — 2 sessions"), "{tip}");
     running.store(false, Ordering::Relaxed);
 }
@@ -107,7 +117,11 @@ fn closed_port_is_offline_unreachable() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    let cfg = bili_tray_core::config::Config { port, poll_ms: 5000, timeout_ms: 500 };
+    let cfg = bili_tray_core::config::Config {
+        port,
+        poll_ms: 5000,
+        timeout_ms: 500,
+    };
     let t0 = Instant::now();
     let state = bili_tray_core::stats::poll_once(&cfg);
     assert!(t0.elapsed() < Duration::from_secs(2));
@@ -124,7 +138,11 @@ fn http_error_surfaces_as_offline() {
         status_code: 500,
         body: "boom".into(),
     }]);
-    let cfg = bili_tray_core::config::Config { port, poll_ms: 5000, timeout_ms: 2000 };
+    let cfg = bili_tray_core::config::Config {
+        port,
+        poll_ms: 5000,
+        timeout_ms: 2000,
+    };
     match bili_tray_core::stats::poll_once(&cfg) {
         bili_tray_core::TrayState::Offline { detail } => assert_eq!(detail, "http 500"),
         other => panic!("expected Offline, got {other:?}"),
@@ -139,7 +157,11 @@ fn non_json_status_is_offline_bad_json() {
         status_code: 200,
         body: "<html>not json</html>".into(),
     }]);
-    let cfg = bili_tray_core::config::Config { port, poll_ms: 5000, timeout_ms: 2000 };
+    let cfg = bili_tray_core::config::Config {
+        port,
+        poll_ms: 5000,
+        timeout_ms: 2000,
+    };
     match bili_tray_core::stats::poll_once(&cfg) {
         bili_tray_core::TrayState::Offline { detail } => assert_eq!(detail, "bad json"),
         other => panic!("expected Offline, got {other:?}"),
@@ -161,7 +183,11 @@ fn unresponsive_server_times_out() {
         }
         let _ = r;
     });
-    let cfg = bili_tray_core::config::Config { port, poll_ms: 5000, timeout_ms: 300 };
+    let cfg = bili_tray_core::config::Config {
+        port,
+        poll_ms: 5000,
+        timeout_ms: 300,
+    };
     let t0 = Instant::now();
     let state = bili_tray_core::stats::poll_once(&cfg);
     let elapsed = t0.elapsed();

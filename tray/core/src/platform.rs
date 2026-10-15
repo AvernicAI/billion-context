@@ -32,7 +32,10 @@ pub fn open_in_browser(url: &str) -> std::io::Result<()> {
 #[cfg(target_os = "windows")]
 pub fn open_in_browser(url: &str) -> std::io::Result<()> {
     // `start` takes the window title as its first argument; pass empty.
-    Command::new("cmd").args(["/C", "start", "", url]).spawn().map(|_| ())
+    Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn()
+        .map(|_| ())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]

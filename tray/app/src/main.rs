@@ -1,10 +1,13 @@
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
-use std::time::Duration;
 use bili_tray_core::config::Config;
 use bili_tray_core::format::{menu_model, tooltip};
 use bili_tray_core::stats::poll_once;
 use bili_tray_core::TrayState;
+use std::time::Duration;
 use tauri::{
     image::Image,
     menu::{Menu, MenuBuilder, MenuItem},
@@ -60,17 +63,18 @@ fn apply_state(app: &AppHandle, tray: &tauri::tray::TrayIcon, cfg: &Config) {
     let _ = tray.set_tooltip(Some(tooltip(&state, cfg.port)));
 }
 
-fn build_menu(
-    app: &AppHandle,
-    state: &TrayState,
-    port: u16,
-) -> tauri::Result<Menu<tauri::Wry>> {
+fn build_menu(app: &AppHandle, state: &TrayState, port: u16) -> tauri::Result<Menu<tauri::Wry>> {
     let model = menu_model(state, port);
     let header = MenuItem::with_id(app, "header", model.header.text, false, None::<&str>)?;
     let mut builder = MenuBuilder::new(app).item(&header);
     for line in &model.sessions {
-        let item =
-            MenuItem::with_id(app, line.id.as_str(), line.text.clone(), false, None::<&str>)?;
+        let item = MenuItem::with_id(
+            app,
+            line.id.as_str(),
+            line.text.clone(),
+            false,
+            None::<&str>,
+        )?;
         builder = builder.item(&item);
     }
     if let Some(more) = &model.more {

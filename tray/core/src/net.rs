@@ -30,9 +30,7 @@ impl std::fmt::Display for NetError {
 }
 
 pub fn split_base(base: &str) -> Result<(String, u16), NetError> {
-    let rest = base
-        .strip_prefix("http://")
-        .ok_or(NetError::Malformed)?;
+    let rest = base.strip_prefix("http://").ok_or(NetError::Malformed)?;
     let rest = rest.trim_end_matches('/');
     let mut parts = rest.rsplitn(2, ':');
     let port = parts
@@ -103,7 +101,10 @@ mod tests {
 
     #[test]
     fn split_base_parses_host_and_port() {
-        assert_eq!(split_base("http://127.0.0.1:8787"), Ok(("127.0.0.1".into(), 8787)));
+        assert_eq!(
+            split_base("http://127.0.0.1:8787"),
+            Ok(("127.0.0.1".into(), 8787))
+        );
         assert_eq!(
             split_base("http://localhost:9000/"),
             Ok(("localhost".into(), 9000))

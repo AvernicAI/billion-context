@@ -101,10 +101,7 @@ fn header_text(state: &TrayState) -> String {
         TrayState::Online { status, .. } => {
             let mut t = format!("billion-context v{}", status.version);
             if status.stale {
-                let disk = status
-                    .disk_version
-                    .as_deref()
-                    .unwrap_or("newer");
+                let disk = status.disk_version.as_deref().unwrap_or("newer");
                 t.push_str(&format!(" · restart pending (disk v{disk})"));
             }
             if let Some(reason) = &status.advisory_reason {
@@ -130,7 +127,10 @@ pub fn tooltip(state: &TrayState, port: u16) -> String {
             let n = stats.sessions.len();
             t.push_str(&format!(" — {n} session{}", if n == 1 { "" } else { "s" }));
             let sessions = sorted_sessions(&stats.sessions);
-            match sessions.first().and_then(|s| s.context_window.filter(|w| *w > 0)) {
+            match sessions
+                .first()
+                .and_then(|s| s.context_window.filter(|w| *w > 0))
+            {
                 Some(w) => {
                     let top = sessions.first().expect("checked above");
                     t.push_str(&format!(
@@ -182,7 +182,10 @@ pub fn menu_model(state: &TrayState, port: u16) -> MenuModel {
         if ordered.len() > MAX_SESSION_LINES {
             more = Some(Line {
                 id: "more".into(),
-                text: format!("…and {} more in the dashboard", ordered.len() - MAX_SESSION_LINES),
+                text: format!(
+                    "…and {} more in the dashboard",
+                    ordered.len() - MAX_SESSION_LINES
+                ),
             });
         }
     }
@@ -207,9 +210,16 @@ pub fn menu_model(state: &TrayState, port: u16) -> MenuModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BiliStatus, BiliStats};
+    use crate::{BiliStats, BiliStatus};
 
-    fn sess(id: &str, ctx: u64, win: Option<u64>, input: u64, cached: u64, samples: u64) -> SessionStats {
+    fn sess(
+        id: &str,
+        ctx: u64,
+        win: Option<u64>,
+        input: u64,
+        cached: u64,
+        samples: u64,
+    ) -> SessionStats {
         SessionStats {
             id: id.into(),
             label: None,
@@ -236,7 +246,10 @@ mod tests {
     #[test]
     fn session_line_full() {
         let s = sess("ses_abcd", 412_000, Some(200_000), 1_000_000, 960_000, 10);
-        assert_eq!(session_line(&s), "ses_abcd · ctx 412K/200K · cache 96% · ⚠ near limit");
+        assert_eq!(
+            session_line(&s),
+            "ses_abcd · ctx 412K/200K · cache 96% · ⚠ near limit"
+        );
     }
 
     #[test]
@@ -266,7 +279,10 @@ mod tests {
         let st = TrayState::Offline {
             detail: "unreachable".into(),
         };
-        assert_eq!(tooltip(&st, 8787), "bili offline — 127.0.0.1:8787: unreachable");
+        assert_eq!(
+            tooltip(&st, 8787),
+            "bili offline — 127.0.0.1:8787: unreachable"
+        );
         let m = menu_model(&st, 8787);
         assert_eq!(m.header.text, "billion-context: offline");
         assert!(m.sessions.is_empty());
@@ -309,7 +325,10 @@ mod tests {
             "bili v0.1.197 — 3 sessions · peak ctx 190K/200K · cache 94%"
         );
         let m = menu_model(&st, 8787);
-        assert_eq!(m.sessions[0].text, "b · ctx 190K/200K · cache 95% · ⚠ near limit");
+        assert_eq!(
+            m.sessions[0].text,
+            "b · ctx 190K/200K · cache 95% · ⚠ near limit"
+        );
         assert_eq!(m.sessions[1].text, "a · ctx 100K/200K · cache 90%");
         assert_eq!(m.sessions[2].text, "c · ctx 50K · cache 99%");
     }
@@ -335,7 +354,14 @@ mod tests {
     fn overflow_collapses_into_more_line() {
         let mut sessions = Vec::new();
         for i in 0..11 {
-            sessions.push(sess(&format!("sess-{i:02}"), (i as u64) * 1000, None, 0, 0, 0));
+            sessions.push(sess(
+                &format!("sess-{i:02}"),
+                (i as u64) * 1000,
+                None,
+                0,
+                0,
+                0,
+            ));
         }
         let st = TrayState::Online {
             status: BiliStatus {
@@ -348,6 +374,9 @@ mod tests {
         };
         let m = menu_model(&st, 8787);
         assert_eq!(m.sessions.len(), MAX_SESSION_LINES);
-        assert_eq!(m.more.as_ref().unwrap().text, "…and 3 more in the dashboard");
+        assert_eq!(
+            m.more.as_ref().unwrap().text,
+            "…and 3 more in the dashboard"
+        );
     }
 }

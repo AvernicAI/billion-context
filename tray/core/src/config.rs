@@ -92,7 +92,10 @@ pub fn save_to(cfg: &Config, p: &Path) -> std::io::Result<()> {
         poll_ms: Some(cfg.poll_ms),
         timeout_ms: Some(cfg.timeout_ms),
     };
-    fs::write(&tmp, serde_json::to_string_pretty(&shape).unwrap_or_default())?;
+    fs::write(
+        &tmp,
+        serde_json::to_string_pretty(&shape).unwrap_or_default(),
+    )?;
     fs::rename(&tmp, p)
 }
 
@@ -107,9 +110,12 @@ mod tests {
     // crate (cwd during `cargo test`) with unique names per run.
     fn fixture(name: &str) -> std::path::PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::current_dir()
-            .unwrap()
-            .join(format!("test-tmp-{}-{}-{}.json", std::process::id(), n, name));
+        let p = std::env::current_dir().unwrap().join(format!(
+            "test-tmp-{}-{}-{}.json",
+            std::process::id(),
+            n,
+            name
+        ));
         let _ = fs::remove_file(&p);
         p
     }

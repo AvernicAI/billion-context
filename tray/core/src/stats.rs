@@ -77,7 +77,11 @@ pub fn poll_once(cfg: &crate::config::Config) -> TrayState {
     };
     let value: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return TrayState::Offline { detail: "bad json".into() },
+        Err(_) => {
+            return TrayState::Offline {
+                detail: "bad json".into(),
+            }
+        }
     };
     let status = match parse_status(&value) {
         Ok(s) => s,
@@ -143,6 +147,8 @@ mod tests {
     #[test]
     fn parse_stats_empty_shapes() {
         assert!(parse_stats(&Value::Null).sessions.is_empty());
-        assert!(parse_stats(&serde_json::json!({"sessions":"nope"})).sessions.is_empty());
+        assert!(parse_stats(&serde_json::json!({"sessions":"nope"}))
+            .sessions
+            .is_empty());
     }
 }
