@@ -20,7 +20,6 @@ fn start_mock(canned: Vec<Canned>) -> (u16, Arc<AtomicBool>) {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     thread::spawn(move || {
-        listener.set_nonblocking(false);
         for stream in listener.incoming() {
             if !r.load(Ordering::Relaxed) {
                 break;
@@ -176,10 +175,9 @@ fn unresponsive_server_times_out() {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     thread::spawn(move || {
-        if let Ok(mut s) = listener.accept() {
+        if let Ok(_held) = listener.accept() {
             // Accept but never answer until the client gives up.
             thread::sleep(Duration::from_millis(1500));
-            let _ = s;
         }
         let _ = r;
     });

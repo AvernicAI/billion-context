@@ -45,10 +45,9 @@ fn cache_pct(s: &SessionStats) -> Option<u64> {
 }
 
 fn pressure(s: &SessionStats) -> Option<f64> {
-    match s.context_window.filter(|w| *w > 0) {
-        Some(w) => Some(s.context_tokens as f64 / w as f64),
-        None => None,
-    }
+    s.context_window
+        .filter(|w| *w > 0)
+        .map(|w| s.context_tokens as f64 / w as f64)
 }
 
 pub fn session_line(s: &SessionStats) -> String {
@@ -156,8 +155,9 @@ pub fn tooltip(state: &TrayState, port: u16) -> String {
                 .filter(|s| s.cache_samples > 0 && s.input_tokens > 0)
                 .map(|s| s.input_tokens)
                 .sum();
-            if input > 0 {
-                t.push_str(&format!(" · cache {}%", (cached * 100 / input).min(100)));
+            let pct = cached.checked_mul(100).and_then(|c| c.checked_div(input));
+            if let Some(pct) = pct {
+                t.push_str(&format!(" · cache {}%", pct.min(100)));
             }
             t
         }

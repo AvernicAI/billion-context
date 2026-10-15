@@ -70,7 +70,6 @@ pub fn get(base: &str, path: &str, timeout: Duration) -> Result<Vec<u8>, NetErro
     let first = addr_str
         .to_socket_addrs()
         .map_err(|e| NetError::Unreachable(e.to_string()))?
-        .into_iter()
         .next()
         .ok_or_else(|| NetError::Unreachable(addr_str.clone()))?;
     let mut stream = TcpStream::connect_timeout(&first, timeout)
