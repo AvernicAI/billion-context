@@ -19,9 +19,9 @@ import path from "node:path";
 import { DSH_PACKAGE, dshProfileDirs, dshProfileDepSpec, isRegistryDepSpec } from "./dsh-channel.js";
 import type { Logger } from "./logger.js";
 
-export type ProvenanceFindingKind = "copy-vs-lock" | "manifest-vs-lock" | "copy-vs-manifest";
+type ProvenanceFindingKind = "copy-vs-lock" | "manifest-vs-lock" | "copy-vs-manifest";
 
-export interface ProvenanceFinding {
+interface ProvenanceFinding {
     profile: string;
     kind: ProvenanceFindingKind;
     copyVersion: string;
@@ -69,7 +69,7 @@ const PKG_RE = new RegExp(`^\\s+${DSH_PACKAGE.replace(/[.*+?^${}()|[\]\\]/g, "\\
  *    it is the RESOLVED version.
  * Returns undefined when no lockfile exists or records no entry for the package.
  */
-export function readPnpmLockResolution(profileDir: string): LockResolution | undefined {
+function readPnpmLockResolution(profileDir: string): LockResolution | undefined {
     let text: string;
     try {
         text = fs.readFileSync(path.join(profileDir, "pnpm-lock.yaml"), "utf8");
