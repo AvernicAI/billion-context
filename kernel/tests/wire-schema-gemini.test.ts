@@ -101,9 +101,12 @@ test("content alternation: typed array alternative + typed string alternative", 
     "string",
     "items keep the line-form string alternative",
   );
+  // summary stays OUT of required (#3193 review): dryRun previews pass no
+  // summaries; commit-time enforcement lives in the parser (validateEntry),
+  // not in the schema.
   const expectedRequired: Array<[number, string[]]> = [
-    [1, ["startId", "endId", "summary"]],
-    [2, ["startRef", "endRef", "summary"]],
+    [1, ["startId", "endId"]],
+    [2, ["startRef", "endRef"]],
   ];
   for (const [i, required] of expectedRequired) {
     const obj = alt(arrayAlt.items as SchemaNode, i);
