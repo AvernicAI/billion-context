@@ -31,6 +31,12 @@ interface AcpStatusCtx {
     config: Config;
     messages: CoreMessage[];
     session: Session;
+    // #3236: the exact array class applyCompression runs on for this lane.
+    // Without it, processTurn's eligibility screening and the uncompressed
+    // view's foldability flags judge a different array class than execute.
+    // LoopCtx/RewriteCtx both carry it structurally; undefined when the lane
+    // has no split view (messages IS the apply class).
+    compressMessages?: CoreMessage[];
 }
 
 // #3192: the submit gate rejects any range that still cites a ref recorded DEAD
@@ -67,6 +73,7 @@ export function liveCompressionRanges(ctx: AcpStatusCtx): { nudge: NudgeDecision
         tokenCount: statusInputBaseline(ctx.session),
         renderTags: "none",
         contentStore: contentStoreOf(ctx.session),
+        applyView: ctx.compressMessages,
     });
     if (!turn.nudge) return undefined;
     const minChars = ctx.config.compress.minCompressRange;
@@ -159,6 +166,10 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         tool,
         sort,
         limit,
+        // #3236: screen uncompressed rows through the same projection apply
+        // executes — on the exact array class this lane applies on.
+        config: ccrLoopConfig(ctx.session, ctx.config),
+        originalMessages: ctx.compressMessages ?? ctx.messages,
         meta: {
             pack: ctx.session.meta.activePack ?? "default",
             host: `billion-context ${VERSION} (${BUILD_COMMIT})`,

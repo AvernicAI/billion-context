@@ -19,7 +19,6 @@ import { durableMessageToolPaths, withDurableProtection } from "../durable-messa
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
-import { storeEffectiveImageCompression, storeImageFullRestoreArmed, type ImageCompressionSettings } from "../image-compress.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
 import { externalSummaryEnabled } from "../external-summary-surface.js";
 import { estimateRawBodyTokens } from "../preflight.js";
@@ -66,6 +65,23 @@ import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape
 import { ccrPluginWireOk, storeEffectiveCcr, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
 import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, warnRouteMissIfNew, type Prepared } from "../server.js";
+
+// #2986: the derivedFromSessionId link is what keeps a kind child session
+// reachable along its parent chain after a restart — without it the shared
+// prefix is re-sent whole and over-window requests 503 (the #2985 failure). It
+// is established ONCE per child (low write frequency) but markDirty alone only
+// persists it on the debounced cadence: a non-graceful exit inside that window
+// drops the link and the child is permanently orphaned. Force an immediate
+// durable write so the link lands on disk within a tick instead of the debounce
+// window. Fire-and-forget on purpose: this runs on the model-request hot path,
+// so we must not stall this response or freeze the event loop (unlike
+// flushSync's Atomics.wait retry); a failed write logs here and the debounced
+// save retries on the next mutation.
+function persistLineageLinkNow(session: Session): void {
+    void getStore().writeNow(session).catch((err) => {
+        loggerLog("warn", `[${session.id}] [lineage] immediate lineage persist failed (${String(err)}); the debounced save will retry (#2986)`);
+    });
+}
 
 export async function handle(
     req: http.IncomingMessage,
@@ -570,7 +586,6 @@ async function handleRequest(
     // merge); resolved before the session is bound, then stamped onto it below so
     // every view / injection / execution site reads one value.
     let resolvedCcrCfg: CcrSettings | undefined;
-    let resolvedImageCompressionCfg: ImageCompressionSettings | undefined;
     // [#1336] host-only plan-aware search flag for this request scope (three-
     // level merge); stamped onto the session below like the other per-request
     // policies. Off unless compress.search.planAware=true at some level.
@@ -722,7 +737,6 @@ async function handleRequest(
             // arms. Turn it on only by setting compress.ccr.enabled=true at
             // some config level, after local verification.
             resolvedCcrCfg = compressCfg.ccr;
-        resolvedImageCompressionCfg = compressCfg.imageCompression;
             resolvedSearchPlanAware = compressCfg.search?.planAware === true;
             reqPrompts = resolveCompressPrompts(compressCfg);
             const surfaceRes = resolveCompressSurfaceDetailed(compressCfg);
@@ -1500,6 +1514,7 @@ async function handleRequest(
                     session.metadata.derivedFrom = resumeParent.id;
                     session.metadata.derivedFromSessionId = resumeParent.id;
                     markDirty(session);
+                    persistLineageLinkNow(session);
                     log("info", `[${sessionId}] [resume-inheritance] ${resume.via} of ${resumeParent.id} — inheriting refs/blocks/lineage (#1486)`);
                     try {
                         maybeAdoptResume({
@@ -1541,6 +1556,7 @@ async function handleRequest(
                     session.metadata.derivedFrom = derivedParent;
                     session.metadata.derivedFromSessionId = parentSession.id;
                     markDirty(session);
+                    persistLineageLinkNow(session);
                     maybeAdoptDerivedFork({ session, parent: parentSession, protocol, parsed, upstreamOrigin, enabled: opts.resumeInheritance !== false, log });
                     log("info", `[${session.id}] [derived] linked to parent session ${parentSession.id} (conversation ${derivedParent}) — decompress/search_context fall back to it read-only (#1333)`);
                 } else if (session.metadata.derivedLinkMissLogged !== true) {
@@ -1646,7 +1662,7 @@ async function handleRequest(
         const pluginCcrStamp = pluginMode
             ? (ccrPluginWireOk(protocol) && opts.compress.ccr?.enabled === true ? opts.compress.ccr : undefined)
             : (resolvedCcrCfg?.enabled === true ? resolvedCcrCfg : undefined);
-        // [#3272/#3266] Same structural gate as image_full's restore channel (#3270):
+        // [#3272/#3266] Same structural gate as the removed image_full restore channel (#3270):
         // the codex host rejects bili-injected tools at its tool router and records a
         // synthetic "unsupported call" output in its own resent history — every
         // acp_retrieve round-trip permanently forks that history from ours (prefix-cache
@@ -1655,23 +1671,6 @@ async function handleRequest(
         // placeholder is ever emitted; regular compress/decompress folding is unaffected
         // (the codex lane simply keeps large tool results verbatim until they are folded).
         storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk && !(protocol === "responses" && isCodexClient(req.headers)) ? pluginCcrStamp : undefined);
-        // [#1095] same channel/plugin-mode gating as CCR: image_full's restore
-        // round-trip needs a tool channel on this wire; without one the model
-        // could request originals it never gets back (silent-loss trap).
-        const imageCompressionStamped = opts.compress.injectTool && !pluginMode && storeChannelOk && resolvedImageCompressionCfg?.enabled === true;
-        storeEffectiveImageCompression(session, imageCompressionStamped ? resolvedImageCompressionCfg : undefined);
-        // [#3266] downsample pass and restore channel are gated separately. The
-        // codex host rejects bili-injected tools at its tool router and records
-        // a synthetic "unsupported call" output for them in its own history —
-        // every round-trip permanently forks the client's resent history from
-        // ours (prefix-cache collapse) and even a correct ref is logged
-        // unsupported there. Keep downsampling (the token saving) but do not
-        // advertise a restore path that can never succeed on that host.
-        // The write is deliberately UNCONDITIONAL (not guarded like the reader's
-        // armed-default): a non-image-stamped session must come out DISARMED,
-        // else the armed-on-absent default would advertise image_full on wires
-        // whose intended surface excludes it (wire-contract D pins that).
-        storeImageFullRestoreArmed(session, imageCompressionStamped && !(protocol === "responses" && isCodexClient(req.headers)));
         // [#1336] no channel gating: search_context is already available on
         // whichever mode served this session and the re-rank is pure output-
         // side policy on its result — both proxy and plugin lanes apply it.

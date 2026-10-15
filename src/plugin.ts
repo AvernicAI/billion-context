@@ -21,7 +21,6 @@ import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, containsToolCallXmlFragment, createBiliArtifactFilter, createIdentityStreamFilter, createMarkerLineFilter, createTagEchoFilter, isOrphanMarkupText, mayStartBiliInternal, mayStartDegenerateRenderTag, mayStartMarkerLine, mayStartRenderTag, mayStartToolCallEmission, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
-import { imageUsageSuffix } from "./image-compress.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import type { TruncationDiag } from "./stream-error.js";
 
@@ -1055,7 +1054,7 @@ export function forkParentRevisionLegacy(session: Session): string {
     const messages = session.pluginSnapshot;
     if (!messages) throw new Error("raw snapshot unavailable");
     const store = contentStoreOf(session);
-    const state = { ...session.state, imageFullRestored: session.state.imageFullRestored ?? [], imageShrinks: session.state.imageShrinks ?? [] };
+    const state = { ...session.state };
     return forkHash({ sessionId: session.id, messages, state, blockContents: Object.fromEntries(session.blockContents), contentStore: store });
 }
 
@@ -1460,6 +1459,9 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
                 tokenCount: statusInputBaseline(session),
                 renderTags: "none",
                 contentStore: contentStoreOf(session),
+                // #3236: screen advertised ranges on the apply class — the raw
+                // history, not this panel's processed view (#2627 split).
+                applyView: mem && mem.original.length > 0 ? mem.original : undefined,
             }).nudge;
         }
     } catch {
@@ -1961,7 +1963,7 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         const hit = reportedCached === null ? undefined : Math.round((100 * reportedCached) / total);
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
-        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}${imageUsageSuffix(session)}`);
+        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}`);
         settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin });
     }
     if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;

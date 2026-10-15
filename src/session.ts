@@ -1,4 +1,4 @@
-import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, resetImageFullState, type CompressionState, type Config, type CoreMessage, type MessageContentStore, type NudgeDecision } from "acp-kernel";
+import { createInitialState, defaultConfig, highestUsedIndex, indexToRef, type CompressionState, type Config, type CoreMessage, type MessageContentStore, type NudgeDecision } from "acp-kernel";
 import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
 import { getStore, effectiveFileStorageMode } from "./persist.js";
@@ -473,22 +473,6 @@ export type Session = {
         storedBytes: number;
         /** #1097: cumulative wire bytes saved by placeholder substitution. */
         storeBytesSaved: number;
-        /** #1095: image blocks downscaled this session (lifetime; optional —
-         *  absent in pre-#1095 records). */
-        imageShrunkCount?: number;
-        /** #1095: cumulative wire bytes saved by downscaling. */
-        imageBytesSaved?: number;
-        /** #1095: cumulative estimated visual tokens saved by downscaling. */
-        imageTokensSaved?: number;
-        /** #1095: total image_full tool calls issued. */
-        imageFullCalls?: number;
-        /** #1095: image_full calls that restored a downscaled ref. */
-        imageFullRestores?: number;
-        /** #3266: consecutive image_full failures (parse or rejection); reset
-         *  to 0 on any success. At >= 2 the restore note is suppressed — a
-         *  model that keeps failing with refs it guesses needs the loop to
-         *  stop, not another nudge per round. */
-        imageFullFailStreak?: number;
         /** #1179 CCR v2: range-level decompress restores served (ephemeral channel). */
         rangeRestores: number;
         /** #1336: whole-block decompress restores served. Optional — absent in
@@ -578,16 +562,7 @@ export type Session = {
      *  pruneRetrieveImgExports sweep for this session (throttled to once a
      *  minute in the request path). */
     lastImgPrune?: number;
-     /** #1095 in-memory only (NOT persisted): deterministic encode cache keyed
-     *  by sha256 of the ORIGINAL base64 → encoded payload. Identical inputs
-     *  must yield identical wire bytes across turns/restarts (prefix-cache
-     *  invariant), so this is a pure CPU cache, never a correctness source. */
-    imageEncodeCache?: Map<string, { b64: string; mediaType: string }>;
-    /** #1095 in-memory only (NOT persisted): sha256 fingerprints of the
-     *  original payloads shrunk per ref — lets image_full invalidate the exact
-     *  encode-cache entries a restored ref contributed. */
-    imageFingerprintsByRef?: Map<string, string[]>;
-    /** Number of in-flight requests using this session. A session with
+     /** Number of in-flight requests using this session. A session with
      *  inFlight > 0 must NOT be LRU-evicted: evicting it mid-stream flushes a
      *  half-mutated snapshot and then a miss reloads a SECOND Session object,
      *  causing split-brain writes to the same file. See persist.ts M5. */
@@ -1254,10 +1229,7 @@ export function cacheBlockContent(session: Session, blockId: string, content: Bl
 }
 
 export function resetSessionCompression(session: Session): void {
-    // Kernel contract (acp-kernel image-compress.d.ts): resetImageFullState on
-    // EVERY state reset — refs are re-issued here, so any surviving
-    // imageFullRestored/imageShrinks entries would misattribute.
-    session.state = resetImageFullState(createInitialState());
+    session.state = createInitialState();
     session.blockContents.clear();
     // The kernel contract ties the store to the state ('host resets the store
     // with the state'): a full rebase restarts refs at m00001, so old entries
@@ -1273,10 +1245,6 @@ export function resetSessionCompression(session: Session): void {
     delete session.metadata.ccrUndelivered;
     delete session.metadata.ccrDropNotes;
     session.ccrReconcilePending = false;
-    // #1095: same ref-reissue rationale as the content store — encode-cache /
-    // fingerprint entries keyed by old refs would misattribute after rebase.
-    session.imageEncodeCache?.clear();
-    session.imageFingerprintsByRef?.clear();
     session.stats.lastInputTokens = 0;
     // #857: a zeroed baseline carries no provenance — drop any stale flag.
     delete session.stats.lastInputTokensSource;
