@@ -83,7 +83,10 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev pkg-config
       - name: Install Tauri CLI
-        run: curl -L https://tauri.app/install.sh | sh
+        # the install.sh pipe dies on sh-is-dash (Linux) and on Windows/macOS
+        # sh flavors (bash-only syntax) — cargo install is portable everywhere
+        # the rust toolchain step already ran.
+        run: cargo install tauri-cli --version "^2" --locked
       - name: Build installer
         working-directory: tray/app
         run: cargo tauri build --bundles ${{ matrix.bundles }} ${{ matrix.args }}
