@@ -1502,6 +1502,7 @@ export const WEB_CLIENT = `(function () {
                 if (seam.providerSide.count > 0) sub.push(legendItem("background:#f0883e", t("det.leg_pside")));
                 if (seam.rewinds.count > 0) sub.push(legendItem("background:#57606a", t("det.leg_rewind")));
                 if (seam.client.count > 0) sub.push(legendItem("background:#0969da", t("det.leg_client")));
+                if (seam.reasoningDrop.count > 0) sub.push(legendItem("background:#8250df", t("det.leg_reasoning")));
                 sub.push(legendItem("background:#9aa1a8", t("det.leg_rest")));
                 parts.push('<span style="display:inline-flex;align-items:center;gap:8px;border:1px solid #d0d7de;border-radius:6px;padding:2px 8px;margin:2px 0">'
                     + legendItem("background:#8250df", t("det.cause_unattrib"))
