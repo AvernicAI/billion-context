@@ -7,12 +7,17 @@ pub const MIN_POLL_MS: u64 = 1_000;
 pub const MAX_POLL_MS: u64 = 60_000;
 pub const MIN_TIMEOUT_MS: u64 = 200;
 pub const MAX_TIMEOUT_MS: u64 = 30_000;
+/// Session rows shown in the menu, ordered by context pressure. 0 hides
+/// them all (summary line still shows); 3 is the default "basic menu".
+pub const DEFAULT_MENU_SESSIONS: usize = 3;
+pub const MAX_MENU_SESSIONS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
     pub port: u16,
     pub poll_ms: u64,
     pub timeout_ms: u64,
+    pub menu_sessions: usize,
 }
 
 impl Default for Config {
@@ -21,6 +26,7 @@ impl Default for Config {
             port: DEFAULT_PORT,
             poll_ms: DEFAULT_POLL_MS,
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            menu_sessions: DEFAULT_MENU_SESSIONS,
         }
     }
 }
@@ -29,6 +35,7 @@ impl Config {
     pub fn clamp(mut self) -> Self {
         self.poll_ms = self.poll_ms.clamp(MIN_POLL_MS, MAX_POLL_MS);
         self.timeout_ms = self.timeout_ms.clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS);
+        self.menu_sessions = self.menu_sessions.min(MAX_MENU_SESSIONS);
         if !(1..=65535).contains(&self.port) {
             self.port = DEFAULT_PORT;
         }
@@ -43,6 +50,8 @@ struct FileShape {
     poll_ms: Option<u64>,
     #[serde(rename = "timeoutMs")]
     timeout_ms: Option<u64>,
+    #[serde(rename = "menuSessions")]
+    menu_sessions: Option<usize>,
 }
 
 pub fn path() -> std::path::PathBuf {
@@ -74,6 +83,9 @@ pub fn load_from(p: &Path) -> Config {
     if let Some(ms) = shape.timeout_ms {
         cfg.timeout_ms = ms;
     }
+    if let Some(n) = shape.menu_sessions {
+        cfg.menu_sessions = n;
+    }
     cfg.clamp()
 }
 
@@ -91,6 +103,7 @@ pub fn save_to(cfg: &Config, p: &Path) -> std::io::Result<()> {
         port: Some(cfg.port),
         poll_ms: Some(cfg.poll_ms),
         timeout_ms: Some(cfg.timeout_ms),
+        menu_sessions: Some(cfg.menu_sessions),
     };
     fs::write(
         &tmp,
@@ -144,6 +157,7 @@ mod tests {
             port: 18788,
             poll_ms: 7000,
             timeout_ms: 900,
+            menu_sessions: 3,
         };
         save_to(&cfg, &p).unwrap();
         assert_eq!(load_from(&p), cfg);

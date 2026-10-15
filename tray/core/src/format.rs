@@ -1,4 +1,4 @@
-use crate::{SessionStats, TrayState, MAX_SESSION_LINES};
+use crate::{SessionStats, TrayState};
 
 pub fn fmt_tokens(n: u64) -> String {
     if n < 1_000 {
@@ -89,6 +89,8 @@ pub struct Line {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MenuModel {
     pub header: Line,
+    /// One aggregate row ("N sessions · Σ ctx X · cache Y%") when online.
+    pub summary: Option<Line>,
     pub sessions: Vec<Line>,
     pub more: Option<Line>,
     pub port_info: Line,
@@ -164,27 +166,60 @@ pub fn tooltip(state: &TrayState, port: u16) -> String {
     }
 }
 
-pub fn menu_model(state: &TrayState, port: u16) -> MenuModel {
+fn summary_line(stats: &crate::BiliStats) -> Option<String> {
+    if stats.sessions.is_empty() {
+        return None;
+    }
+    let n = stats.sessions.len();
+    let mut t = format!(
+        "{n} session{} · Σ ctx {}",
+        if n == 1 { "" } else { "s" },
+        fmt_tokens(stats.sessions.iter().map(|s| s.context_tokens).sum::<u64>())
+    );
+    let cached: u64 = stats
+        .sessions
+        .iter()
+        .filter(|s| s.cache_samples > 0 && s.input_tokens > 0)
+        .map(|s| s.cached_tokens)
+        .sum();
+    let input: u64 = stats
+        .sessions
+        .iter()
+        .filter(|s| s.cache_samples > 0 && s.input_tokens > 0)
+        .map(|s| s.input_tokens)
+        .sum();
+    if let Some(pct) = cached.checked_mul(100).and_then(|c| c.checked_div(input)) {
+        t.push_str(&format!(" · cache {}%", pct.min(100)));
+    }
+    Some(t)
+}
+
+pub fn menu_model(state: &TrayState, port: u16, max_sessions: usize) -> MenuModel {
     let header = Line {
         id: "header".into(),
         text: header_text(state),
     };
+    let mut summary = None;
     let mut sessions = Vec::new();
     let mut more = None;
     if let TrayState::Online { stats, .. } = state {
+        summary = summary_line(stats).map(|text| Line {
+            id: "summary".into(),
+            text,
+        });
         let ordered = sorted_sessions(&stats.sessions);
-        for (i, s) in ordered.iter().take(MAX_SESSION_LINES).enumerate() {
+        for (i, s) in ordered.iter().take(max_sessions).enumerate() {
             sessions.push(Line {
                 id: format!("s{i}"),
                 text: session_line(s),
             });
         }
-        if ordered.len() > MAX_SESSION_LINES {
+        if ordered.len() > max_sessions {
             more = Some(Line {
                 id: "more".into(),
                 text: format!(
                     "…and {} more in the dashboard",
-                    ordered.len() - MAX_SESSION_LINES
+                    ordered.len() - max_sessions
                 ),
             });
         }
@@ -201,6 +236,7 @@ pub fn menu_model(state: &TrayState, port: u16) -> MenuModel {
     };
     MenuModel {
         header,
+        summary,
         sessions,
         more,
         port_info,
@@ -283,7 +319,7 @@ mod tests {
             tooltip(&st, 8787),
             "bili offline — 127.0.0.1:8787: unreachable"
         );
-        let m = menu_model(&st, 8787);
+        let m = menu_model(&st, 8787, 3);
         assert_eq!(m.header.text, "billion-context: offline");
         assert!(m.sessions.is_empty());
         assert_eq!(m.port_info.text, "port 8787 — waiting for bili");
@@ -324,7 +360,7 @@ mod tests {
             tooltip(&st, 8787),
             "bili v0.1.197 — 3 sessions · peak ctx 190K/200K · cache 94%"
         );
-        let m = menu_model(&st, 8787);
+        let m = menu_model(&st, 8787, 3);
         assert_eq!(
             m.sessions[0].text,
             "b · ctx 190K/200K · cache 95% · ⚠ near limit"
@@ -372,11 +408,12 @@ mod tests {
             },
             stats: BiliStats { sessions },
         };
-        let m = menu_model(&st, 8787);
-        assert_eq!(m.sessions.len(), MAX_SESSION_LINES);
+        let m = menu_model(&st, 8787, 3);
+        assert_eq!(m.sessions.len(), 3);
         assert_eq!(
             m.more.as_ref().unwrap().text,
-            "…and 3 more in the dashboard"
+            "…and 8 more in the dashboard"
         );
+        assert_eq!(m.summary.as_ref().unwrap().text, "11 sessions · Σ ctx 55K");
     }
 }

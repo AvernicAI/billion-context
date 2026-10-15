@@ -115,6 +115,7 @@ fn online_round_trip_parses_both_endpoints() {
         port,
         poll_ms: 5000,
         timeout_ms: 2000,
+        menu_sessions: 3,
     };
     let state = bili_tray_core::stats::poll_once(&cfg);
     match state {
@@ -142,6 +143,7 @@ fn closed_port_is_offline_unreachable() {
         port,
         poll_ms: 5000,
         timeout_ms: 500,
+        menu_sessions: 3,
     };
     let t0 = Instant::now();
     let state = bili_tray_core::stats::poll_once(&cfg);
@@ -159,6 +161,7 @@ fn http_error_surfaces_as_offline() {
         port,
         poll_ms: 5000,
         timeout_ms: 2000,
+        menu_sessions: 3,
     };
     match bili_tray_core::stats::poll_once(&cfg) {
         bili_tray_core::TrayState::Offline { detail } => assert_eq!(detail, "http 500"),
@@ -178,6 +181,7 @@ fn non_json_status_is_offline_bad_json() {
         port,
         poll_ms: 5000,
         timeout_ms: 2000,
+        menu_sessions: 3,
     };
     match bili_tray_core::stats::poll_once(&cfg) {
         bili_tray_core::TrayState::Offline { detail } => assert_eq!(detail, "bad json"),
@@ -203,6 +207,7 @@ fn unresponsive_server_times_out() {
         port,
         poll_ms: 5000,
         timeout_ms: 300,
+        menu_sessions: 3,
     };
     let t0 = Instant::now();
     let state = bili_tray_core::stats::poll_once(&cfg);
@@ -228,6 +233,7 @@ fn online_round_trip_parses_chunked_endpoints_like_real_bili() {
         port,
         poll_ms: 5000,
         timeout_ms: 2000,
+        menu_sessions: 3,
     };
     let state = bili_tray_core::stats::poll_once(&cfg);
     running.store(false, Ordering::Relaxed);

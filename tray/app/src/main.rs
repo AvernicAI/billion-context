@@ -6,7 +6,6 @@
 use bili_tray_core::config::Config;
 use bili_tray_core::format::{menu_model, tooltip};
 use bili_tray_core::stats::poll_once;
-use bili_tray_core::TrayState;
 use std::time::Duration;
 use tauri::{
     menu::{Menu, MenuBuilder, MenuItem},
@@ -47,10 +46,11 @@ fn main() {
             // `handle` is the on_menu_event parameter — out of scope here.
             // The setup-scoped AppHandle is what the poller thread needs.
             let poller_app = app.handle().clone();
+            let mut ui_cache = UiCache::default();
             std::thread::Builder::new()
                 .name("bili-tray-poller".into())
                 .spawn(move || loop {
-                    apply_state(&poller_app, &poller_tray, &poller_cfg);
+                    apply_state(&poller_app, &poller_tray, &poller_cfg, &mut ui_cache);
                     std::thread::sleep(Duration::from_millis(poller_cfg.poll_ms));
                 })
                 .expect("poller thread must start");
@@ -62,19 +62,54 @@ fn main() {
 
 /// The menu is rebuilt whole each tick: Tauri v2 menu items cannot be hidden,
 /// so a fixed slot pool would render dead blank rows when sessions drop.
-fn apply_state(app: &AppHandle, tray: &tauri::tray::TrayIcon, cfg: &Config) {
-    let state = poll_once(cfg);
-    if let Ok(menu) = build_menu(app, &state, cfg.port) {
-        // set_menu wants the ContextMenu impl on Menu<R> itself, not &Menu<R>.
-        let _ = tray.set_menu(Some(menu));
-    }
-    let _ = tray.set_tooltip(Some(tooltip(&state, cfg.port)));
+/// Menu + tooltip are only pushed to the tray when their content actually
+/// changed — Tauri v2 re-setting an identical menu makes the whole popup
+/// flicker on every poll tick (visible on GTK at 5s cadence).
+#[derive(Default)]
+struct UiCache {
+    menu_items: Option<Vec<String>>,
+    tooltip: Option<String>,
 }
 
-fn build_menu(app: &AppHandle, state: &TrayState, port: u16) -> tauri::Result<Menu<tauri::Wry>> {
-    let model = menu_model(state, port);
-    let header = MenuItem::with_id(app, "header", model.header.text, false, None::<&str>)?;
+fn apply_state(app: &AppHandle, tray: &tauri::tray::TrayIcon, cfg: &Config, cache: &mut UiCache) {
+    let state = poll_once(cfg);
+    let model = menu_model(&state, cfg.port, cfg.menu_sessions);
+    let items: Vec<String> = std::iter::once(model.header.text.clone())
+        .chain(model.summary.iter().map(|l| l.text.clone()))
+        .chain(model.sessions.iter().map(|l| l.text.clone()))
+        .chain(model.more.iter().map(|l| l.text.clone()))
+        .chain(std::iter::once(model.port_info.text.clone()))
+        .collect();
+    if cache.menu_items.as_ref() != Some(&items) {
+        if let Ok(menu) = build_menu(app, &model) {
+            // set_menu wants the ContextMenu impl on Menu<R> itself, not &Menu<R>.
+            let _ = tray.set_menu(Some(menu));
+            cache.menu_items = Some(items);
+        }
+    }
+    let tip = tooltip(&state, cfg.port);
+    if cache.tooltip.as_ref() != Some(&tip) {
+        let _ = tray.set_tooltip(Some(tip.clone()));
+        cache.tooltip = Some(tip);
+    }
+}
+
+fn build_menu(
+    app: &AppHandle,
+    model: &bili_tray_core::format::MenuModel,
+) -> tauri::Result<Menu<tauri::Wry>> {
+    let header = MenuItem::with_id(
+        app,
+        "header",
+        model.header.text.clone(),
+        false,
+        None::<&str>,
+    )?;
     let mut builder = MenuBuilder::new(app).item(&header);
+    if let Some(summary) = &model.summary {
+        let item = MenuItem::with_id(app, "summary", summary.text.clone(), false, None::<&str>)?;
+        builder = builder.item(&item);
+    }
     for line in &model.sessions {
         let item = MenuItem::with_id(
             app,
@@ -90,7 +125,13 @@ fn build_menu(app: &AppHandle, state: &TrayState, port: u16) -> tauri::Result<Me
         builder = builder.item(&item);
     }
     let open = MenuItem::with_id(app, "open-dashboard", "Open Dashboard", true, None::<&str>)?;
-    let port_info = MenuItem::with_id(app, "port-info", model.port_info.text, false, None::<&str>)?;
+    let port_info = MenuItem::with_id(
+        app,
+        "port-info",
+        model.port_info.text.clone(),
+        false,
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, "quit", "Quit BiliTray", true, None::<&str>)?;
     builder
         .separator()
