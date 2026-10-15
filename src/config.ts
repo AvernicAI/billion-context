@@ -133,8 +133,27 @@ export type ProviderRoute = {
      *  - `max: <number>` — clamp the applied factor to ≤ max (e.g. `1` =
      *    allow deflation learning only, never inflation). Must be > 0 and ≤ 4
      *    (higher is inert anyway — the publication clamp already caps at 4).
-     *  Invalid values reject the config load loudly (strict #1909 discipline). */
+      *  Invalid values reject the config load loudly (strict #1909 discipline). */
     calibration?: { disabled?: boolean; max?: number };
+    /** #3254 level-2 (global → provider → model cascade): per-route in-request
+     *  model-content deadline. When armed, EVERY upstream attempt of the
+     *  compression loop must see MODEL CONTENT (text/reasoning delta, tool
+     *  call, thinking-family block) within `firstContentTimeoutMs` of the
+     *  response headers; relay pings / SSE keep-alive comments never count —
+     *  they are exactly what hid the 775s stall. On fire the loop aborts the
+     *  live upstream stream and exits with an in-band protocol-native error
+     *  (context intact; the host/client retry ladder takes over) instead of
+     *  letting a stalled-but-alive stream ride the client's own content
+     *  watchdog. Absent everywhere = feature off (byte-identical legacy);
+     *  explicit 0 disables the phase AT THIS LEVEL (falls back to nothing,
+     *  not to the lower level). Invalid values reject the config load loudly
+     *  (strict #1909 discipline). See contentGapTimeoutMs for the mid-stream
+     *  phase. */
+    firstContentTimeoutMs?: number;
+    /** #3254 level-2: inter-content deadline — re-armed on every model content
+     *  event after the first (mid-stream stalls included). Unset inherits the
+     *  resolved firstContentTimeoutMs value. Same levels/semantics. */
+    contentGapTimeoutMs?: number;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -153,6 +172,10 @@ export type ModelEntry = {
      *  (CODEARTS_BENEFIT_FALLBACK mirror). Env BILI_RESIGN_BENEFIT wins over
      *  this like every other knob. */
     benefit?: boolean;
+    /** #3254 level-3 (deepest): per-model overrides of the provider route's
+     *  model-content deadlines. Same semantics as the route-level fields. */
+    firstContentTimeoutMs?: number;
+    contentGapTimeoutMs?: number;
 };
 
 /** User-facing compression tuning. Configurable at three levels — global
@@ -1248,6 +1271,11 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const host = rawHost === "localhost" ? "127.0.0.1" : rawHost;
     const upstream = (env.ACP_UPSTREAM ?? fileConfig.upstream ?? "https://api.anthropic.com").replace(/\/$/, "");
     const routes = loadRoutes(env);
+    // #3254: the global network.* deadline tier is not covered by route
+    // parsing — validate it at startup too (a broken safety bound must not
+    // boot silently disabled).
+    parseDeadlineMs("network.firstContentTimeoutMs", fileConfig.network?.firstContentTimeoutMs);
+    parseDeadlineMs("network.contentGapTimeoutMs", fileConfig.network?.contentGapTimeoutMs);
     const namedProviders = loadNamedProviders(env);
     warnCcrPluginDivergences(routes, fileConfig.compress);
     const passthrough = passthroughState(env);
@@ -1757,6 +1785,22 @@ type FileConfig = {
         proxyKeepAliveMaxMs?: number;
         /** Post-response close linger budget (#1982; was env-only BILI_POST_RESPONSE_LINGER_MS; default 5000). */
         postResponseLingerMs?: number;
+        /** #3254 global in-request model-content deadline (level 1 of the
+         *  global → provider → model cascade): no MODEL CONTENT (text/reasoning
+         *  delta, tool call, thinking-family block) within this many ms of the
+         *  response headers → the compression loop aborts the live upstream
+         *  stream and exits with an in-band protocol-native error (context
+         *  intact; the client's retry ladder takes over) instead of letting a
+         *  stalled-but-alive stream ride the client's content watchdog. Relay
+         *  pings / SSE keep-alive comments never count. Deliberately FILE-ONLY
+         *  (no env layer): the per-route cascade needs a file shape env cannot
+         *  express. 0 = explicitly disabled; default unset = feature off
+         *  (byte-identical legacy). Invalid values reject loudly (strict
+         *  #1909), unlike the lenient numeric siblings above. */
+        firstContentTimeoutMs?: number;
+        /** #3254 inter-content phase: re-armed on every model content event;
+         *  unset inherits firstContentTimeoutMs (see that field for levels). */
+        contentGapTimeoutMs?: number;
         /** Opt-in plain-HTTP trust for private networks (#2984): when true, private hosts
          *  (RFC1918, 127/8, link-local, ULA, *.local/.lan/.internal) may be admitted over
          *  plaintext by the #2585 gates — agent-registry intake and the summary-endpoint
@@ -2263,7 +2307,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; calibration?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; calibration?: unknown; firstContentTimeoutMs?: unknown; contentGapTimeoutMs?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
@@ -2284,6 +2328,17 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
         if (imageTokenCap !== undefined) route.imageTokenCap = imageTokenCap;
         const calibration = parseCalibrationPolicy(obj.calibration);
         if (calibration) route.calibration = calibration;
+        // #3254: model-content deadlines — strict like calibration (a silently
+        // dropped safety bound would leave the stall invisible again). Model
+        // entries used to pass through raw; validate their copies too.
+        route.firstContentTimeoutMs = parseDeadlineMs("providers entry firstContentTimeoutMs", obj.firstContentTimeoutMs);
+        route.contentGapTimeoutMs = parseDeadlineMs("providers entry contentGapTimeoutMs", obj.contentGapTimeoutMs);
+        for (const [modelName, entry] of Object.entries(obj.models ?? {})) {
+            if (!entry || typeof entry !== "object") continue;
+            const me = entry as Record<string, unknown>;
+            parseDeadlineMs(`providers entry models.${modelName}.firstContentTimeoutMs`, me.firstContentTimeoutMs);
+            parseDeadlineMs(`providers entry models.${modelName}.contentGapTimeoutMs`, me.contentGapTimeoutMs);
+        }
         // #2336 lane credential override. Only parsed for NON-recipe-shaped
         // entries: a dialing recipe (baseUrl/api present) validates its own
         // credential fields in parseNamedProviderRecipe, and letting this
@@ -2361,6 +2416,38 @@ export function parseCalibrationPolicy(value: unknown): { disabled?: boolean; ma
     if (out.disabled === undefined && out.max === undefined)
         throw new Error('[acp-config] providers entry calibration requires at least one of "disabled" or "max"');
     return out;
+}
+
+// #3254: strict validator shared by the load-time route parsing and the
+// per-request resolver (the global network.* tier bypasses load-time parsing,
+// so a typo there must still reject loudly instead of silently disabling the
+// safety bound). 0 is a valid value — it means "disabled" at its level.
+export function parseDeadlineMs(fieldPath: string, value: unknown): number | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value === "number" && Number.isInteger(value) && value >= 0) return value;
+    throw new Error(`[acp-config] ${fieldPath} must be a non-negative integer number of milliseconds (got ${JSON.stringify(value)})`);
+}
+
+// #3254: three-level cascade (model > provider route > global network.*) for
+// the model-content deadlines. An explicit 0 wins AT ITS LEVEL (disables that
+// phase, no fall-through); an absent field inherits the next level down.
+// contentGapTimeoutMs inherits the resolved initial deadline when left absent.
+// Returns undefined when every phase is off or absent (feature fully off).
+export function resolveFirstContentDeadlines(
+    routes: ProviderRoutes,
+    upstreamUrl: string | undefined,
+    model: string | undefined,
+    globals: { firstContentTimeoutMs?: unknown; contentGapTimeoutMs?: unknown } | undefined,
+): { initialMs?: number; gapMs?: number } | undefined {
+    const route = findRoute(routes, upstreamUrl);
+    const entry = model ? route?.models?.[model] : undefined;
+    const initialMs = parseDeadlineMs("firstContentTimeoutMs", entry?.firstContentTimeoutMs ?? route?.firstContentTimeoutMs ?? globals?.firstContentTimeoutMs);
+    const gapMs = parseDeadlineMs("contentGapTimeoutMs", entry?.contentGapTimeoutMs ?? route?.contentGapTimeoutMs ?? globals?.contentGapTimeoutMs);
+    const out: { initialMs?: number; gapMs?: number } = {};
+    if (initialMs !== undefined && initialMs > 0) out.initialMs = initialMs;
+    if (gapMs !== undefined && gapMs > 0) out.gapMs = gapMs;
+    else if (gapMs === undefined && out.initialMs !== undefined) out.gapMs = out.initialMs;
+    return out.initialMs !== undefined || out.gapMs !== undefined ? out : undefined;
 }
 
 function parseStreamErrorShape(value: unknown): "protocol" | "completion" {

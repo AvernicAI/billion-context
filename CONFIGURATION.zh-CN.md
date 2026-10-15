@@ -152,6 +152,8 @@
 | `network.maxShrinkPerCompress` | number | unset | BILI_MAX_SHRINK_PER_COMPRESS | 单次压缩允许收缩历史的上限（防塌缩护栏）。 |
 | `network.proxyKeepAliveMaxMs` | number | 55000 (0 = one-shot connections) | BILI_PROXY_KEEPALIVE_MAX_MS | 经出站代理的连接最大存活时长，到期强制重建（规避陈旧 NAT 映射）。 |
 | `network.postResponseLingerMs` | number | 5000 | BILI_POST_RESPONSE_LINGER_MS | 代理主动发起的响应后关闭的优雅关闭预算：socket 挂起等待对端 FIN/TLS close_notify，到点销毁（reason=linger-backstop）。 |
+| `network.firstContentTimeoutMs` | number | 未设置（关闭） | — | 模型内容期限，阶段一（#3254）：上游一次尝试从响应开始到首个模型内容（文本/推理增量、工具调用、签名）之间的最长毫秒数；超时则 bili 中止卡死流并以带内错误结束回合。也可按线路（`providers[<key>]`）与按模型（`providers[<key>].models[<m>]`）设置；级联 model > route > global，显式 0 在所在层生效。按设计仅配置文件可设（每线路取值无法用单一进程级环境变量表达）。 |
+| `network.contentGapTimeoutMs` | number | 未设置（继承 firstContentTimeoutMs） | — | 模型内容期限，阶段二（#3254）：首个内容到达之后，相邻两个模型内容事件之间的最长毫秒数；每个内容事件重新计时（ping/注释不算内容）。缺省继承解析后的 `firstContentTimeoutMs`；0 仅禁用阶段二。三级级联与仅文件可设的理由同 `firstContentTimeoutMs`。 |
 | `network.allowPrivateHttpProviders` | boolean | false | BILI_ALLOW_PRIVATE_HTTP_PROVIDERS | 可选开关（#2984）：允许私网（RFC1918、127/8、link-local、ULA、*.local/.lan/.internal）明文 HTTP provider 进入 agent-registry 接收与摘要端点守卫。默认关——明文仅回环受信；公网 IP/域名与 CGNAT（100.64/10）无论如何都拒。1/true 启用。 |
 | `network.receiveBodyBytes` | number | 5368709120 | BILI_RECEIVE_BODY_BYTES | 单请求读入内存的入站 wire 字节上限，超限在 receive 阶段返回 413。由硬编码 100 MiB 提升到 5 GiB（#3128 owner 决定），使多 GB 单请求被接受而非断连。同时也是解码请求占用两个共享大解码准入槽位的阈值。WebSocket lane 保持固定 100 MiB 表面。 |
 | `network.decodedBodyBytes` | number | 10737418240 | BILI_DECODED_BODY_BYTES | content-encoding 解压（gzip/deflate/br/zstd）后的解码字节上限，解码过程中增量检查（decode 阶段 413）。默认为接收预算的 2 倍，沿用旧的 decode=2×wire 关系；用于防解压炸弹。 |
@@ -787,6 +789,8 @@
     "preflightDeadEndCooldownMs": 300000, // preflight 死路判定后的冷却
     "proxyKeepAliveMaxMs": 55000,         // 经上游代理的连接复用上限；0 不限
     "postResponseLingerMs": 5000,         // 响应后关闭的优雅关闭预算（#1982）
+    "firstContentTimeoutMs": 180000,      // #3254：响应开始后无模型内容的上限毫秒数；默认关闭；providers 内可按线路/模型覆盖
+    "contentGapTimeoutMs": 600000,        // #3254：首个内容之后相邻内容事件间的上限毫秒数；缺省继承 firstContentTimeoutMs
     "allowPrivateHttpProviders": false    // 私网明文 HTTP provider 可选放行（#2984）
   },
 
@@ -845,10 +849,10 @@
 
 ### `network`
 
-- **类型：** `{ upstreamTimeoutMs?: number; requestWatchdogMs?: number; replayRetryMax?: number; replayRetryBaseMs?: number; maxShrinkPerCompress?: number; keepAliveTimeoutMs?: number; clientErrorBackstopMs?: number; exposureLogIntervalMs?: number; streamKeepAliveMs?: number; preflightHoldMs?: number; preflightDeadEndCooldownMs?: number; proxyKeepAliveMaxMs?: number; postResponseLingerMs?: number; allowPrivateHttpProviders?: boolean }`
+- **类型：** `{ upstreamTimeoutMs?: number; requestWatchdogMs?: number; replayRetryMax?: number; replayRetryBaseMs?: number; maxShrinkPerCompress?: number; keepAliveTimeoutMs?: number; clientErrorBackstopMs?: number; exposureLogIntervalMs?: number; streamKeepAliveMs?: number; preflightHoldMs?: number; preflightDeadEndCooldownMs?: number; proxyKeepAliveMaxMs?: number;     postResponseLingerMs?: number; firstContentTimeoutMs?: number; contentGapTimeoutMs?: number; allowPrivateHttpProviders?: boolean }`
 - **默认：** `{}`（内置值依次为：`720000`、`2× 上游超时`、`3`、`1500`、未设置、`5000`、`30000`、`3600000`、`15000`、`30000`、`300000`、`55000`、`5000`、`false`）
 - **状态：** ACTIVE
-- **说明：** 进程级传输与重试时序（毫秒）。每个键按 env > file > default 解析，对应环境变量分别为 `BILI_UPSTREAM_TIMEOUT_MS`、`BILI_REQUEST_WATCHDOG_MS`、`BILI_REPLAY_RETRY_MAX`、`BILI_REPLAY_RETRY_BASE_MS`、`BILI_MAX_SHRINK_PER_COMPRESS`、`BILI_KEEP_ALIVE_TIMEOUT_MS`、`BILI_CLIENT_ERROR_BACKSTOP_MS`、`BILI_EXPOSURE_LOG_INTERVAL_MS`、`BILI_STREAM_KEEPALIVE_MS`、`BILI_PREFLIGHT_HOLD_MS`、`BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS`、`BILI_PROXY_KEEPALIVE_MAX_MS`、`BILI_POST_RESPONSE_LINGER_MS`、`BILI_ALLOW_PRIVATE_HTTP_PROVIDERS`。要点：`upstreamTimeoutMs` 端到端约束首字节时间与 chunk 间静默（#551）；`requestWatchdogMs` 是单请求总预算（负值 = 退出该约束）；`replayRetryMax` 统计瞬态上游拒绝后的尝试次数（#189/#1688）；`maxShrinkPerCompress` 限制单次压缩对请求的最大缩减比例，超限则引导模型选择更小的范围（#189）；`streamKeepAliveMs` 在响应零字节写出超过该时长时发一条 SSE 注释行（#1647）；`proxyKeepAliveMaxMs` 把经上游代理的连接复用窗口压在上游回收周期之下（#1263），`0` 取消上限；`postResponseLingerMs` 是代理主动发起的响应后关闭的优雅关闭预算 —— socket 被挂起等待对端 FIN/TLS close_notify，到点销毁（`reason=linger-backstop`）（#1982）；`allowPrivateHttpProviders` 是可选开关（#2984）：为 true 时，私网（RFC1918、127/8、link-local、IPv6 ULA/link-local、`*.local`/`.lan`/`.internal`）上的明文 HTTP provider baseUrl 被 agent-registry 接收与摘要端点守卫放行——这些守卫默认只信任回环明文；公网 IP/域名与 CGNAT（100.64/10）无论如何都拒；默认 false 保持 #2984 之前的行为逐字不变。完整细节见[环境变量表](#环境变量的配置键对照-2030)。
+- **说明：** 进程级传输与重试时序（毫秒）。除 `firstContentTimeoutMs`/`contentGapTimeoutMs`（#3254，仅文件可设——见下）外，每个键按 env > file > default 解析，对应环境变量分别为 `BILI_UPSTREAM_TIMEOUT_MS`、`BILI_REQUEST_WATCHDOG_MS`、`BILI_REPLAY_RETRY_MAX`、`BILI_REPLAY_RETRY_BASE_MS`、`BILI_MAX_SHRINK_PER_COMPRESS`、`BILI_KEEP_ALIVE_TIMEOUT_MS`、`BILI_CLIENT_ERROR_BACKSTOP_MS`、`BILI_EXPOSURE_LOG_INTERVAL_MS`、`BILI_STREAM_KEEPALIVE_MS`、`BILI_PREFLIGHT_HOLD_MS`、`BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS`、`BILI_PROXY_KEEPALIVE_MAX_MS`、`BILI_POST_RESPONSE_LINGER_MS`、`BILI_ALLOW_PRIVATE_HTTP_PROVIDERS`。要点：`upstreamTimeoutMs` 端到端约束首字节时间与 chunk 间静默（#551）；`requestWatchdogMs` 是单请求总预算（负值 = 退出该约束）；`replayRetryMax` 统计瞬态上游拒绝后的尝试次数（#189/#1688）；`maxShrinkPerCompress` 限制单次压缩对请求的最大缩减比例，超限则引导模型选择更小的范围（#189）；`streamKeepAliveMs` 在响应零字节写出超过该时长时发一条 SSE 注释行（#1647）；`proxyKeepAliveMaxMs` 把经上游代理的连接复用窗口压在上游回收周期之下（#1263），`0` 取消上限；`postResponseLingerMs` 是代理主动发起的响应后关闭的优雅关闭预算 —— socket 被挂起等待对端 FIN/TLS close_notify，到点销毁（`reason=linger-backstop`）（#1982）；`allowPrivateHttpProviders` 是可选开关（#2984）：为 true 时，私网（RFC1918、127/8、link-local、IPv6 ULA/link-local、`*.local`/`.lan`/`.internal`）上的明文 HTTP provider baseUrl 被 agent-registry 接收与摘要端点守卫放行——这些守卫默认只信任回环明文；公网 IP/域名与 CGNAT（100.64/10）无论如何都拒；默认 false 保持 #2984 之前的行为逐字不变；`firstContentTimeoutMs`/`contentGapTimeoutMs` 是仅文件可设的模型内容期限（#3254）：阶段一约束上游一次尝试从响应开始到首个模型内容（文本/推理增量、工具调用、签名）的最长等待，阶段二（`contentGapTimeoutMs`，每个内容事件重新计时——ping/注释不算内容）约束首个内容之后相邻内容事件间的静默；到期则 bili 中止卡死的上游流并以一条干净的带内错误结束回合（上下文完好，重发最后一条消息即可继续）——不做内部盲重取，客户端自身的重试梯照常接管；级联 model > provider route > global `network.*`，显式 0 在所在层生效，gap 缺省继承解析后的 initial；刻意不设 env 层，因为按线路/按模型的取值无法用单一进程级变量表达。完整细节见[环境变量表](#环境变量的配置键对照-2030)。
 
 ### `persist`
 
