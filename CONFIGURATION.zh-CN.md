@@ -147,13 +147,13 @@
 | `network.streamKeepAliveMs` | number | 15000 (0 disables) | BILI_STREAM_KEEPALIVE_MS | 模型块之间的下游流保活心跳间隔；0 禁用心跳。 |
 | `network.preflightHoldMs` | number | 30000 | BILI_PREFLIGHT_HOLD_MS | preflight 失败后，允许请求未校准放行的持有时长。 |
 | `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | 死胡同 preflight 后，对同一会话重试校准的冷却时长。 |
+| `network.firstContentTimeoutMs` | number | unset (off) | — | 模型内容期限，阶段一（#3254）：上游一次尝试从响应开始到首个模型内容之间的最长毫秒数；超时则 bili 中止卡死流并以一条干净的带内错误结束回合（不做内部盲重取——客户端重试梯照常接管）。providers 内也可按线路/按模型设置；级联 model > route > global，显式 0 在所在层生效。按设计仅配置文件可设。 |
+| `network.contentGapTimeoutMs` | number | unset (inherits firstContentTimeoutMs) | — | 模型内容期限，阶段二（#3254）：首个内容到达之后，相邻两个模型内容事件之间的最长毫秒数；每个内容事件重新计时（ping/注释不算内容）。缺省继承解析后的 firstContentTimeoutMs；显式 0 仅禁用阶段二。三级级联与仅文件可设的理由同 firstContentTimeoutMs。 |
 | `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | 同一请求在向上游暴露错误前的最大传输失败重放次数。 |
 | `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | 重放之间的基础退避延迟（指数增长）。 |
 | `network.maxShrinkPerCompress` | number | unset | BILI_MAX_SHRINK_PER_COMPRESS | 单次压缩允许收缩历史的上限（防塌缩护栏）。 |
 | `network.proxyKeepAliveMaxMs` | number | 55000 (0 = one-shot connections) | BILI_PROXY_KEEPALIVE_MAX_MS | 经出站代理的连接最大存活时长，到期强制重建（规避陈旧 NAT 映射）。 |
 | `network.postResponseLingerMs` | number | 5000 | BILI_POST_RESPONSE_LINGER_MS | 代理主动发起的响应后关闭的优雅关闭预算：socket 挂起等待对端 FIN/TLS close_notify，到点销毁（reason=linger-backstop）。 |
-| `network.firstContentTimeoutMs` | number | 未设置（关闭） | — | 模型内容期限，阶段一（#3254）：上游一次尝试从响应开始到首个模型内容（文本/推理增量、工具调用、签名）之间的最长毫秒数；超时则 bili 中止卡死流并以带内错误结束回合。也可按线路（`providers[<key>]`）与按模型（`providers[<key>].models[<m>]`）设置；级联 model > route > global，显式 0 在所在层生效。按设计仅配置文件可设（每线路取值无法用单一进程级环境变量表达）。 |
-| `network.contentGapTimeoutMs` | number | 未设置（继承 firstContentTimeoutMs） | — | 模型内容期限，阶段二（#3254）：首个内容到达之后，相邻两个模型内容事件之间的最长毫秒数；每个内容事件重新计时（ping/注释不算内容）。缺省继承解析后的 `firstContentTimeoutMs`；0 仅禁用阶段二。三级级联与仅文件可设的理由同 `firstContentTimeoutMs`。 |
 | `network.allowPrivateHttpProviders` | boolean | false | BILI_ALLOW_PRIVATE_HTTP_PROVIDERS | 可选开关（#2984）：允许私网（RFC1918、127/8、link-local、ULA、*.local/.lan/.internal）明文 HTTP provider 进入 agent-registry 接收与摘要端点守卫。默认关——明文仅回环受信；公网 IP/域名与 CGNAT（100.64/10）无论如何都拒。1/true 启用。 |
 | `network.receiveBodyBytes` | number | 5368709120 | BILI_RECEIVE_BODY_BYTES | 单请求读入内存的入站 wire 字节上限，超限在 receive 阶段返回 413。由硬编码 100 MiB 提升到 5 GiB（#3128 owner 决定），使多 GB 单请求被接受而非断连。同时也是解码请求占用两个共享大解码准入槽位的阈值。WebSocket lane 保持固定 100 MiB 表面。 |
 | `network.decodedBodyBytes` | number | 10737418240 | BILI_DECODED_BODY_BYTES | content-encoding 解压（gzip/deflate/br/zstd）后的解码字节上限，解码过程中增量检查（decode 阶段 413）。默认为接收预算的 2 倍，沿用旧的 decode=2×wire 关系；用于防解压炸弹。 |
@@ -310,6 +310,8 @@
 | `apiKeyEnv` | string (env var name) | unset | — | 通道凭据覆盖（#2336）：用该环境变量的值替换客户端凭据。与 credentialRef 二选一；见[通道凭据](#lane-credentials-apikeyenv--credentialref)。 |
 | `credentialRef` | string (store name) | unset | — | 经私有摘要凭据存储的通道凭据覆盖（secret:NAME 语义）。 |
 | `calibration` | { disabled?: boolean, max?: number } | unset (learned k̂ applies) | — | 按路由的 k̂ 校准策略（#3211）：对虚报报数线路做退出或钳制；见[线路级 k̂ 校准策略](#route-level-k-calibration-policy)。 |
+| `firstContentTimeoutMs` | number | unset (off) | — | 按线路的模型内容期限，阶段一（#3254）：响应开始后无模型内容的上限毫秒数；超时则中止卡死上游并以带内错误结束回合。也可在 models[<m>] 按模型设置；级联 model > route > global network.*，显式 0 在所在层生效。仅配置文件可设（无 env）。 |
+| `contentGapTimeoutMs` | number | unset (inherits firstContentTimeoutMs) | — | 按线路的模型内容期限，阶段二（#3254）：首个内容之后相邻模型内容事件间的上限毫秒数，逐事件重新计时。缺省继承解析后的 firstContentTimeoutMs；显式 0 仅禁用阶段二。级联与仅文件可设的理由同 firstContentTimeoutMs。 |
 | `compactionOptIn` | boolean | false | BILI_NON_HTTP_PROVIDERS | 仅命名条目：把非 http(s) baseUrl 供应商纳入压缩所有权（pi/omp 车道）；与 env BILI_NON_HTTP_PROVIDERS 取并集。 |
 
 **仅环境变量（无配置文件键）**
