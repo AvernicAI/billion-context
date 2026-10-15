@@ -800,7 +800,7 @@ function detectSeam(session: Session, led: CacheLedger): void {
             agg.reasoningDropMisses += 1;
             agg.reasoningDropMissed += line.tr;
             if (agg.reasoningDropMisses === 1) {
-                loggerLog("info", `[${session.id}] [cache-seam] compress-reasoning round-close rewrite (#651): hit ${line.hitPct}% (input=${line.input}, re-paid=${Math.round(line.tr)} tok) — the closed round's reasoning left the outbound view (known once-per-round re-bill, not a seam; compress.reasoning.drop:false disables the drop)`);
+                loggerLog("info", `[${session.id}] [cache-seam] compress-reasoning round-close rewrite (#651): hit ${line.hitPct}% (input=${line.input}, re-paid=${Math.round(line.tr)} tok) — the closed round's reasoning left the outbound view (not a seam; default flush:'fold' rides the next fold's re-billed region, flush:'close'/cap = this once-per-round/out-of-fold re-bill; compress.reasoning.drop:false disables the drop)`);
             }
             return;
         }
@@ -2045,7 +2045,7 @@ function formatSeam(r: BiliCacheReport): string {
         }
     }
     if (r.seam.reasoningDrop.count > 0) {
-        out.push("℞ COMPRESS-REASONING ROUND-CLOSE (#651) — known once-per-round re-bill");
+        out.push("℞ COMPRESS-REASONING DROP (#651/#3198) — reasoning reclaimed off the wire (default rides the next fold's re-billed region; flush:'close' = once-per-round re-bill)");
         out.push(`  ${r.seam.reasoningDrop.count} sample(s) · ${fmtTok(r.seam.reasoningDrop.missed)} tok re-billed where a closed compress round's reasoning left the outbound view — expected cost of compress.reasoning.drop (default on): the drop rewrites that stretch of history exactly once per round. Not a seam; set compress.reasoning.drop=false to keep reasoning (larger prompts, no re-bill).`);
     }
     if (r.seam.abortCorrelated > 0) {

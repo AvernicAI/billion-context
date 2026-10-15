@@ -50,7 +50,7 @@ test("reasoning drop: round-close growth books prov=reasoning, not a seam", () =
     const report = buildSessionCacheReport(s);
     assert.equal(report.seam.reasoningDrop.count, 1);
     const text = handleAcpCache(s).text;
-    assert.match(text, /COMPRESS-REASONING ROUND-CLOSE/);
+    assert.match(text, /COMPRESS-REASONING DROP/);
     assert.doesNotMatch(text, /⚠ CACHE SEAM/);
 });
 
