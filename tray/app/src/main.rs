@@ -9,7 +9,6 @@ use bili_tray_core::stats::poll_once;
 use bili_tray_core::TrayState;
 use std::time::Duration;
 use tauri::{
-    image::Image,
     menu::{Menu, MenuBuilder, MenuItem},
     tray::TrayIconBuilder,
     AppHandle,
@@ -18,13 +17,18 @@ use tauri::{
 const TRAY_ID: &str = "bili-main";
 
 fn main() {
-    let cfg = Config::load();
+    let cfg = bili_tray_core::config::load();
     let dashboard_url = format!("http://127.0.0.1:{}/__bili/", cfg.port);
 
     tauri::Builder::default()
         .setup(move |app| {
-            let icon = Image::from_bytes(include_bytes!("../icons/128x128.png"))
-                .expect("embedded tray icon must decode");
+            // bundle icons (tauri.conf.json) are embedded at compile time —
+            // no runtime PNG decode needed (Image::from_bytes does not exist
+            // on this tauri version; default_window_icon is already RGBA).
+            let icon = app
+                .default_window_icon()
+                .cloned()
+                .expect("bundled tray icon must be embedded");
             let tray = TrayIconBuilder::with_id(TRAY_ID)
                 .icon(icon)
                 .tooltip("")
@@ -40,10 +44,13 @@ fn main() {
 
             let poller_cfg = cfg;
             let poller_tray = tray.clone();
+            // `handle` is the on_menu_event parameter — out of scope here.
+            // The setup-scoped AppHandle is what the poller thread needs.
+            let poller_app = app.handle().clone();
             std::thread::Builder::new()
                 .name("bili-tray-poller".into())
                 .spawn(move || loop {
-                    apply_state(handle.clone(), &poller_tray, &poller_cfg);
+                    apply_state(&poller_app, &poller_tray, &poller_cfg);
                     std::thread::sleep(Duration::from_millis(poller_cfg.poll_ms));
                 })
                 .expect("poller thread must start");
@@ -58,7 +65,8 @@ fn main() {
 fn apply_state(app: &AppHandle, tray: &tauri::tray::TrayIcon, cfg: &Config) {
     let state = poll_once(cfg);
     if let Ok(menu) = build_menu(app, &state, cfg.port) {
-        let _ = tray.set_menu(Some(&menu));
+        // set_menu wants the ContextMenu impl on Menu<R> itself, not &Menu<R>.
+        let _ = tray.set_menu(Some(menu));
     }
     let _ = tray.set_tooltip(Some(tooltip(&state, cfg.port)));
 }
