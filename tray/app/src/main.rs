@@ -18,6 +18,8 @@ const TRAY_ID: &str = "bili-main";
 fn main() {
     let cfg = bili_tray_core::config::load();
     let dashboard_url = format!("http://127.0.0.1:{}/__bili/", cfg.port);
+    let open_cfg_path = bili_tray_core::config::path();
+    let log_path = bili_tray_core::platform::bili_state_dir().join("bili.log");
 
     tauri::Builder::default()
         .setup(move |app| {
@@ -33,8 +35,14 @@ fn main() {
                 .tooltip("")
                 .show_menu_on_left_click(true)
                 .on_menu_event(move |handle: &AppHandle, event| match event.id().as_ref() {
-                    "open-dashboard" => {
+                    "open-sessions" => {
                         let _ = bili_tray_core::platform::open_in_browser(&dashboard_url);
+                    }
+                    "open-config" => {
+                        let _ = bili_tray_core::platform::open_path(&open_cfg_path);
+                    }
+                    "open-logs" => {
+                        let _ = bili_tray_core::platform::open_path(&log_path);
                     }
                     "quit" => handle.exit(0),
                     _ => {}
@@ -73,11 +81,8 @@ struct UiCache {
 
 fn apply_state(app: &AppHandle, tray: &tauri::tray::TrayIcon, cfg: &Config, cache: &mut UiCache) {
     let state = poll_once(cfg);
-    let model = menu_model(&state, cfg.port, cfg.menu_sessions);
+    let model = menu_model(&state, cfg.port);
     let items: Vec<String> = std::iter::once(model.header.text.clone())
-        .chain(model.summary.iter().map(|l| l.text.clone()))
-        .chain(model.sessions.iter().map(|l| l.text.clone()))
-        .chain(model.more.iter().map(|l| l.text.clone()))
         .chain(std::iter::once(model.port_info.text.clone()))
         .collect();
     if cache.menu_items.as_ref() != Some(&items) {
@@ -105,26 +110,9 @@ fn build_menu(
         false,
         None::<&str>,
     )?;
-    let mut builder = MenuBuilder::new(app).item(&header);
-    if let Some(summary) = &model.summary {
-        let item = MenuItem::with_id(app, "summary", summary.text.clone(), false, None::<&str>)?;
-        builder = builder.item(&item);
-    }
-    for line in &model.sessions {
-        let item = MenuItem::with_id(
-            app,
-            line.id.as_str(),
-            line.text.clone(),
-            false,
-            None::<&str>,
-        )?;
-        builder = builder.item(&item);
-    }
-    if let Some(more) = &model.more {
-        let item = MenuItem::with_id(app, "more", more.text.clone(), false, None::<&str>)?;
-        builder = builder.item(&item);
-    }
-    let open = MenuItem::with_id(app, "open-dashboard", "Open Dashboard", true, None::<&str>)?;
+    let sessions = MenuItem::with_id(app, "open-sessions", "Open Sessions", true, None::<&str>)?;
+    let config = MenuItem::with_id(app, "open-config", "Open Config", true, None::<&str>)?;
+    let logs = MenuItem::with_id(app, "open-logs", "Open Logs", true, None::<&str>)?;
     let port_info = MenuItem::with_id(
         app,
         "port-info",
@@ -133,9 +121,11 @@ fn build_menu(
         None::<&str>,
     )?;
     let quit = MenuItem::with_id(app, "quit", "Quit BiliTray", true, None::<&str>)?;
-    builder
+    MenuBuilder::new(app)
+        .item(&header)
         .separator()
-        .item(&open)
+        .items(&[&sessions, &config, &logs])
+        .separator()
         .item(&port_info)
         .separator()
         .item(&quit)
