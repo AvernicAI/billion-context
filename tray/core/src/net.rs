@@ -49,7 +49,15 @@ pub fn split_base(base: &str) -> Result<(String, u16), NetError> {
 /// handling on purpose: the only caller is 127.0.0.1, and honoring
 /// HTTP_PROXY here would break exactly the users who run proxies globally.
 fn map_io(e: std::io::Error) -> NetError {
-    if e.kind() == std::io::ErrorKind::TimedOut {
+    // Deadline expiry surfaces as ErrorKind::TimedOut on some platforms
+    // and as raw EAGAIN (os error 11; WSAEWOULDBLOCK 10035 on Windows) on
+    // others — and the mapping has been observed to vary between runs of
+    // the same binary. This crate never enables non-blocking mode itself,
+    // so any EAGAIN here can only be our own read/write deadline expiring.
+    if e.kind() == std::io::ErrorKind::TimedOut
+        || e.kind() == std::io::ErrorKind::WouldBlock
+        || matches!(e.raw_os_error(), Some(11) | Some(10035))
+    {
         NetError::Timeout
     } else {
         NetError::Io(e.to_string())
