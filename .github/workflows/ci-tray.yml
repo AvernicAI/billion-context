@@ -5,11 +5,14 @@ name: Tray CI
 # never through npm (package.json "files" allowlist excludes it) and never
 # through the dsh/plugin lanes, so this workflow is its entire delivery chain.
 on:
+  # NOTE: no `paths` filter on push — a paths filter also gates TAG pushes
+  # (tag refs are excluded whenever only `branches` is listed), which would
+  # make the tray-v* release lane below unreachable. Tag pushes skip cheaply
+  # anyway: core-tests is skipped on tag refs, so master pushes only pay the
+  # ubuntu core job.
   push:
     branches: [master]
-    paths:
-      - "tray/**"
-      - ".github/workflows/ci-tray.yml"
+    tags: ["tray-v*"]
   pull_request:
     paths:
       - "tray/**"
