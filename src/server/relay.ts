@@ -1498,7 +1498,10 @@ export async function forward(
             // #3254: model-content deadlines — three-level cascade (model >
             // route > global network.*), resolved per request so config edits
             // apply without a restart; absent everywhere → undefined → legacy.
-            const firstContentDeadline = resolveFirstContentDeadlines(opts.routes, loopBillingUpstream, (parsedReq as { model?: string }).model, loadConfigFile().network);
+            // The Google wire carries its model in the PATH, not the body
+            // (prepared.google.model) — without the fallback the model tier
+            // could never match a Gemini-native request.
+            const firstContentDeadline = resolveFirstContentDeadlines(opts.routes, loopBillingUpstream, (parsedReq as { model?: string }).model ?? prepared.google?.model, loadConfigFile().network);
             const loop = runCompressLoop(
                 responseBody,
                 { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` }, firstContentDeadline },
