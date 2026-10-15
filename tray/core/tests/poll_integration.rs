@@ -12,6 +12,28 @@ struct Canned {
     path: &'static str,
     status_code: u16,
     body: String,
+    /// Answer with Transfer-Encoding: chunked, the way Node's http stack
+    /// responds when no Content-Length is set (what a real bili does).
+    chunked: bool,
+}
+
+impl Canned {
+    fn plain(path: &'static str, status_code: u16, body: &str) -> Self {
+        Canned {
+            path,
+            status_code,
+            body: body.into(),
+            chunked: false,
+        }
+    }
+    fn chunked(path: &'static str, body: &str) -> Self {
+        Canned {
+            path,
+            status_code: 200,
+            body: body.into(),
+            chunked: true,
+        }
+    }
 }
 
 fn start_mock(canned: Vec<Canned>) -> (u16, Arc<AtomicBool>) {
@@ -57,10 +79,18 @@ fn handle_conn(stream: Option<TcpStream>, canned: &[Canned]) {
         Some(e) => (e.status_code, e.body.clone()),
         None => (404, "{}".into()),
     };
-    let resp = format!(
-        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
+    let resp = if entry.map(|e| e.chunked).unwrap_or(false) {
+        // hex(size) CRLF data CRLF ... 0 CRLF CRLF — no Content-Length
+        let payload = format!("{:X}\r\n{body}\r\n0\r\n\r\n", body.len());
+        format!(
+            "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{payload}"
+        )
+    } else {
+        format!(
+            "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
     let _ = stream.write_all(resp.as_bytes());
     let _ = stream.flush();
 }
@@ -78,16 +108,8 @@ const STATS_OK: &str = r#"{
 #[test]
 fn online_round_trip_parses_both_endpoints() {
     let (port, running) = start_mock(vec![
-        Canned {
-            path: "/__bili/status",
-            status_code: 200,
-            body: STATUS_OK.into(),
-        },
-        Canned {
-            path: "/__bili/stats",
-            status_code: 200,
-            body: STATS_OK.into(),
-        },
+        Canned::plain("/__bili/status", 200, STATUS_OK),
+        Canned::plain("/__bili/stats", 200, STATS_OK),
     ]);
     let cfg = bili_tray_core::config::Config {
         port,
@@ -132,11 +154,7 @@ fn closed_port_is_offline_unreachable() {
 
 #[test]
 fn http_error_surfaces_as_offline() {
-    let (port, running) = start_mock(vec![Canned {
-        path: "/__bili/status",
-        status_code: 500,
-        body: "boom".into(),
-    }]);
+    let (port, running) = start_mock(vec![Canned::plain("/__bili/status", 500, "boom")]);
     let cfg = bili_tray_core::config::Config {
         port,
         poll_ms: 5000,
@@ -151,11 +169,11 @@ fn http_error_surfaces_as_offline() {
 
 #[test]
 fn non_json_status_is_offline_bad_json() {
-    let (port, running) = start_mock(vec![Canned {
-        path: "/__bili/status",
-        status_code: 200,
-        body: "<html>not json</html>".into(),
-    }]);
+    let (port, running) = start_mock(vec![Canned::plain(
+        "/__bili/status",
+        200,
+        "<html>not json</html>",
+    )]);
     let cfg = bili_tray_core::config::Config {
         port,
         poll_ms: 5000,
@@ -195,4 +213,29 @@ fn unresponsive_server_times_out() {
         other => panic!("expected Offline, got {other:?}"),
     }
     running.store(false, Ordering::Relaxed);
+}
+
+#[test]
+fn online_round_trip_parses_chunked_endpoints_like_real_bili() {
+    // Node answers these endpoints without Content-Length (chunked); this is
+    // the wire shape a real bili actually produces — pinned after the tray
+    // shipped reading every response as a plain body and going "offline".
+    let (port, running) = start_mock(vec![
+        Canned::chunked("/__bili/status", STATUS_OK),
+        Canned::chunked("/__bili/stats", STATS_OK),
+    ]);
+    let cfg = bili_tray_core::config::Config {
+        port,
+        poll_ms: 5000,
+        timeout_ms: 2000,
+    };
+    let state = bili_tray_core::stats::poll_once(&cfg);
+    running.store(false, Ordering::Relaxed);
+    match state {
+        bili_tray_core::TrayState::Online { status, stats } => {
+            assert_eq!(status.version, "0.1.197");
+            assert_eq!(stats.sessions.len(), 2);
+        }
+        other => panic!("expected Online against chunked responses, got {other:?}"),
+    }
 }
