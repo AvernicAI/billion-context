@@ -8,7 +8,8 @@ import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createAnthropicAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
-import { loadRoutes, parseDeadlineMs, resolveFirstContentDeadlines, type ProviderRoutes } from "../src/config.ts";
+import { adaptiveDeadlineMs, FC_ADAPTIVE_MIN_SAMPLES, FC_ADAPTIVE_WINDOW, fcP95, loadRoutes, parseDeadlineMs, resolveFirstContentDeadlines, type ProviderRoutes } from "../src/config.ts";
+import { readFcSamples, recordFcSample } from "../src/loop/index.ts";
 
 // #3254: in-request summarization had no bili-side wait bound of its own. The
 // upstream idle timer is byte-level — SSE keep-alive comments/pings keep it
@@ -22,7 +23,10 @@ import { loadRoutes, parseDeadlineMs, resolveFirstContentDeadlines, type Provide
 // first content; (C) live content re-arms the deadline and never false-fires;
 // (D) absent config stays byte-identical legacy (no timers, no early exit);
 // (E-H) the three-level cascade (model > route > global network.*) incl.
-// explicit-0-wins-at-level, gap-inherits-initial, and strict validation.
+// explicit-0-wins-at-level, gap-inherits-initial, and strict validation;
+// (I-L) route-adaptive refinement (owner point 5): clamp(3×p95(healthy
+// first-content durations), 120s, 600s) capped by the explicit config value,
+// samples stored per route in session metadata, healthy attempts only.
 
 const ANTHROPIC_BODY = { model: "claude", messages: [], stream: true, max_tokens: 10 };
 const enc = new TextEncoder();
@@ -120,7 +124,8 @@ async function drainAnthropic(
     deadline: { initialMs?: number; gapMs?: number } | undefined,
     id: string,
     timeoutMs: number,
-): Promise<{ out: string; fetchCalls: number; logs: string[] }> {
+    fcRouteKey?: string,
+): Promise<{ out: string; fetchCalls: number; logs: string[]; session: Session }> {
     let n = 0;
     const orig = globalThis.fetch;
     // Any fetch here means the loop REFETCHED — the #3254 decision pins that a
@@ -130,6 +135,7 @@ async function drainAnthropic(
     const ctx = makeCtx(id, logs);
     (ctx as Record<string, unknown>).protocol = "anthropic";
     if (deadline !== undefined) (ctx as Record<string, unknown>).firstContentDeadline = deadline;
+    if (fcRouteKey !== undefined) (ctx as Record<string, unknown>).fcRouteKey = fcRouteKey;
     const chunks: Buffer[] = [];
     try {
         const gen = runCompressLoop(
@@ -144,7 +150,7 @@ async function drainAnthropic(
     } finally {
         globalThis.fetch = orig;
     }
-    return { out: Buffer.concat(chunks).toString("utf8"), fetchCalls: n, logs };
+    return { out: Buffer.concat(chunks).toString("utf8"), fetchCalls: n, logs, session: ctx.session };
 }
 
 const sseBlocks = (s: string): string[] => s.split("\n\n").map((b) => b.trim()).filter(Boolean);
@@ -241,20 +247,20 @@ test("#3254 F: cascade — model > route > global, 0 wins at its level, gap inhe
     // all absent → feature off
     assert.equal(resolveFirstContentDeadlines({}, undefined, undefined, undefined), undefined);
     // global tier alone; gap inherits the resolved initial
-    assert.deepEqual(resolveFirstContentDeadlines({}, "https://any.example", undefined, { firstContentTimeoutMs: 180000 }), { initialMs: 180000, gapMs: 180000 });
+    assert.deepEqual(resolveFirstContentDeadlines({}, "https://any.example", undefined, { firstContentTimeoutMs: 180000 }), { initialMs: 180000, initialSource: "config", gapMs: 180000, gapSource: "config" });
     // global gap-only (valid: initial stays off)
-    assert.deepEqual(resolveFirstContentDeadlines({}, "https://any.example", undefined, { contentGapTimeoutMs: 300000 }), { gapMs: 300000 });
+    assert.deepEqual(resolveFirstContentDeadlines({}, "https://any.example", undefined, { contentGapTimeoutMs: 300000 }), { gapMs: 300000, gapSource: "config" });
     // route beats global
-    assert.deepEqual(resolveFirstContentDeadlines(ROUTES, "https://relay-a.example/v1/messages", undefined, { firstContentTimeoutMs: 180000 }), { initialMs: 600000, gapMs: 600000 });
+    assert.deepEqual(resolveFirstContentDeadlines(ROUTES, "https://relay-a.example/v1/messages", undefined, { firstContentTimeoutMs: 180000 }), { initialMs: 600000, initialSource: "config", gapMs: 600000, gapSource: "config" });
     // model beats route
-    assert.deepEqual(resolveFirstContentDeadlines(ROUTES, "https://relay-a.example/v1/messages", "gpt-x", { firstContentTimeoutMs: 180000 }), { initialMs: 90000, gapMs: 90000 });
+    assert.deepEqual(resolveFirstContentDeadlines(ROUTES, "https://relay-a.example/v1/messages", "gpt-x", { firstContentTimeoutMs: 180000 }), { initialMs: 90000, initialSource: "config", gapMs: 90000, gapSource: "config" });
     // model ignored when the URL matches no route
-    assert.deepEqual(resolveFirstContentDeadlines(ROUTES, "https://other.example", "gpt-x", { firstContentTimeoutMs: 180000 }), { initialMs: 180000, gapMs: 180000 });
+    assert.deepEqual(resolveFirstContentDeadlines(ROUTES, "https://other.example", "gpt-x", { firstContentTimeoutMs: 180000 }), { initialMs: 180000, initialSource: "config", gapMs: 180000, gapSource: "config" });
     // explicit 0 at route level disables the phase (no fall-through to global);
     // gap then inherits nothing → feature fully off
     assert.equal(resolveFirstContentDeadlines(ROUTES, "https://relay-b.example", undefined, { firstContentTimeoutMs: 180000 }), undefined);
     // explicit 0 for gap only → initial survives, gap phase off
-    assert.deepEqual(resolveFirstContentDeadlines(ROUTES, "https://relay-c.example", undefined, undefined), { initialMs: 180000 });
+    assert.deepEqual(resolveFirstContentDeadlines(ROUTES, "https://relay-c.example", undefined, undefined), { initialMs: 180000, initialSource: "config" });
     // garbage at ANY tier rejects loudly (the global tier bypasses load-time parsing)
     assert.throws(() => resolveFirstContentDeadlines({}, "https://any.example", undefined, { firstContentTimeoutMs: "fast" }), /firstContentTimeoutMs must be a non-negative integer/);
 });
@@ -273,4 +279,79 @@ test("#3254 G: loadRoutes rejects malformed deadline values at provider and mode
     const ok = load({ "https://relay-a.example": { firstContentTimeoutMs: 0, models: { m: { contentGapTimeoutMs: 120000 } } } });
     assert.equal(ok["https://relay-a.example"]?.firstContentTimeoutMs, 0);
     assert.equal(ok["https://relay-a.example"]?.models?.["m"]?.contentGapTimeoutMs, 120000);
+});
+
+// --- I: adaptive deadline math ----------------------------------------------
+
+test("#3254 I: fcP95 + adaptiveDeadlineMs — cold undefined, clamp band, explicit ceiling", () => {
+    assert.equal(fcP95([42]), 42);
+    // nearest-rank: at n=8 the rank is ceil(0.95×8)=8 → the max; at n=20 it is 19 → second-highest
+    assert.equal(fcP95([5, 10, 15, 20, 25, 30, 35, 40]), 40);
+    assert.equal(fcP95(Array.from({ length: 20 }, (_, i) => (i + 1) * 5)), 95);
+    assert.equal(adaptiveDeadlineMs(undefined, 180000), undefined);
+    assert.equal(adaptiveDeadlineMs(Array.from({ length: FC_ADAPTIVE_MIN_SAMPLES - 1 }, () => 20000), 180000), undefined, "one below MIN_SAMPLES is still cold");
+    // p95=20000 → 3×=60000 → clamped UP to the 120s floor
+    assert.equal(adaptiveDeadlineMs(Array.from({ length: FC_ADAPTIVE_MIN_SAMPLES }, () => 20000), 180000), 120000);
+    // p95=200000 → 3×=600000 → the cap
+    assert.equal(adaptiveDeadlineMs(Array.from({ length: FC_ADAPTIVE_MIN_SAMPLES }, () => 200000), 600000), 600000);
+    // mid-band: p95=50000 → 150000, below the explicit value
+    assert.equal(adaptiveDeadlineMs(Array.from({ length: FC_ADAPTIVE_MIN_SAMPLES }, () => 50000), 180000), 150000);
+    // explicit ceiling: a user-pinned tighter value never gets relaxed
+    assert.equal(adaptiveDeadlineMs(Array.from({ length: FC_ADAPTIVE_MIN_SAMPLES }, () => 20000), 60000), 60000);
+});
+
+// --- J: resolver with adaptive samples --------------------------------------
+
+test("#3254 J: warm routes adapt (source=adaptive) under their configured ceiling; cold stay on config", () => {
+    const globals = { firstContentTimeoutMs: 180000 };
+    const warm = Array.from({ length: FC_ADAPTIVE_MIN_SAMPLES }, () => 20000);
+    // warm initial, no gap samples yet: initial adapts to the floor; the
+    // INHERITED gap has no gap samples of its own and stays on config
+    assert.deepEqual(resolveFirstContentDeadlines({}, "https://any.example", undefined, globals, { init: warm, gap: [] }), {
+        initialMs: 120000, initialSource: "adaptive", gapMs: 120000, gapSource: "config",
+    });
+    // both phases warm in-band: p95=50000 → 150000 each
+    const mid = Array.from({ length: FC_ADAPTIVE_MIN_SAMPLES }, () => 50000);
+    assert.deepEqual(resolveFirstContentDeadlines({}, "https://any.example", undefined, globals, { init: mid, gap: mid }), {
+        initialMs: 150000, initialSource: "adaptive", gapMs: 150000, gapSource: "adaptive",
+    });
+    // explicit ceiling tighter than the adaptive floor: adaptation engages but
+    // the user's pinned value wins as the ceiling
+    assert.deepEqual(resolveFirstContentDeadlines({}, "https://any.example", undefined, { firstContentTimeoutMs: 60000 }, { init: warm, gap: [] }), {
+        initialMs: 60000, initialSource: "adaptive", gapMs: 60000, gapSource: "config",
+    });
+});
+
+// --- K: sample ring storage in session metadata ------------------------------
+
+test("#3254 K: recordFcSample/readFcSamples — window cap, per-phase rows, sanitizing read", () => {
+    const s = makeCtx("s3254k", []).session;
+    assert.equal(readFcSamples(s, "r"), undefined);
+    recordFcSample(s, "r", 1234, 567);
+    recordFcSample(s, "r", 2222);
+    let got = readFcSamples(s, "r");
+    assert.deepEqual(got, { init: [1234, 2222], gap: [567] });
+    const s2 = makeCtx("s3254k2", []).session;
+    for (let i = 0; i < FC_ADAPTIVE_WINDOW + 5; i++) recordFcSample(s2, "r", i);
+    got = readFcSamples(s2, "r");
+    assert.equal(got?.init.length, FC_ADAPTIVE_WINDOW, "oldest samples must be evicted past the window");
+    assert.equal(got?.init[0], 5, "the first five records must have been evicted");
+    assert.equal(got?.gap.length, 0);
+    (s.metadata as Record<string, unknown>)["firstContentSamples"] = { r: { init: [1, Number.NaN, -5, "x"], gap: null } };
+    assert.deepEqual(readFcSamples(s, "r"), { init: [1], gap: [] }, "reads must sanitize hand-corrupted metadata");
+});
+
+// --- L: end-to-end sampling — healthy attempts only --------------------------
+
+test("#3254 L: a cleanly completed attempt records one healthy sample per phase; a killed attempt records none", async () => {
+    const text = MESSAGE_START + textStart(0) + textDelta(0, "a") + textDelta(0, "b") + blockStop(0) + MESSAGE_DELTA() + MESSAGE_STOP;
+    const healthy = await drainAnthropic(completeStream(text), { initialMs: 100000 }, "s3254l", 3000, "route-l");
+    const sample = readFcSamples(healthy.session, "route-l");
+    assert.ok(sample !== undefined && sample.init.length === 1 && sample.gap.length === 1, `expected one init + one gap sample: ${JSON.stringify(sample)}`);
+    // the stream is synchronous, so both measured durations are legitimately 0ms
+    assert.ok(sample!.init[0] >= 0 && sample!.init[0] < 10000, `first-content duration implausible: ${sample?.init[0]}ms`);
+    const sink = { cancelled: false };
+    const killed = await drainAnthropic(holdStream(MESSAGE_START + PING, sink), { initialMs: 150 }, "s3254l2", 3000, "route-l2");
+    assert.match(killed.out, /model content deadline exceeded/);
+    assert.equal(readFcSamples(killed.session, "route-l2"), undefined, "a deadline-killed attempt must not poison the route's samples");
 });

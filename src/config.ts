@@ -2433,20 +2433,70 @@ export function parseDeadlineMs(fieldPath: string, value: unknown): number | und
 // phase, no fall-through); an absent field inherits the next level down.
 // contentGapTimeoutMs inherits the resolved initial deadline when left absent.
 // Returns undefined when every phase is off or absent (feature fully off).
+/** #3254 follow-up (owner point 5): per-route adaptive refinement of the
+ *  configured deadlines. Each route's HEALTHY first-content durations are
+ *  sampled into session metadata as requests complete cleanly; once a route
+ *  accumulates enough samples its deadline stops being a guess and hugs its
+ *  own normal water level. */
+export const FC_ADAPTIVE_MIN_SAMPLES = 8;
+/** Per-route sample window (oldest evicted past this). */
+export const FC_ADAPTIVE_WINDOW = 32;
+/** Owner-specified clamp band for the adaptive value. */
+export const FC_ADAPTIVE_FLOOR_MS = 120_000;
+export const FC_ADAPTIVE_CAP_MS = 600_000;
+
+export function fcP95(values: number[]): number {
+    const sorted = [...values].sort((a, b) => a - b);
+    return sorted[Math.max(0, Math.min(sorted.length - 1, Math.ceil(0.95 * sorted.length) - 1))];
+}
+
+/** clamp(3 × p95(samples), FLOOR, CAP), then capped by the EXPLICIT config
+ *  value: explicit config is always the ceiling — adaptation only tightens
+ *  toward measured reality, never relaxes a value the user pinned. Returns
+ *  undefined while the route is still cold (fewer than MIN_SAMPLES). */
+export function adaptiveDeadlineMs(samples: number[] | undefined, explicitMs: number): number | undefined {
+    if (!samples || samples.length < FC_ADAPTIVE_MIN_SAMPLES) return undefined;
+    const clamped = Math.max(FC_ADAPTIVE_FLOOR_MS, Math.min(FC_ADAPTIVE_CAP_MS, 3 * fcP95(samples)));
+    return Math.min(explicitMs, clamped);
+}
+
+export interface FirstContentDeadlines {
+    initialMs?: number;
+    gapMs?: number;
+    /** Which source produced each phase's value — lands in the fire log so
+     *  config→adaptive cutover never changes the log format (#3254 point 5). */
+    initialSource?: "config" | "adaptive";
+    gapSource?: "config" | "adaptive";
+}
+
 export function resolveFirstContentDeadlines(
     routes: ProviderRoutes,
     upstreamUrl: string | undefined,
     model: string | undefined,
     globals: { firstContentTimeoutMs?: unknown; contentGapTimeoutMs?: unknown } | undefined,
-): { initialMs?: number; gapMs?: number } | undefined {
+    samples?: { init: number[]; gap: number[] },
+): FirstContentDeadlines | undefined {
     const route = findRoute(routes, upstreamUrl);
     const entry = model ? route?.models?.[model] : undefined;
-    const initialMs = parseDeadlineMs("firstContentTimeoutMs", entry?.firstContentTimeoutMs ?? route?.firstContentTimeoutMs ?? globals?.firstContentTimeoutMs);
-    const gapMs = parseDeadlineMs("contentGapTimeoutMs", entry?.contentGapTimeoutMs ?? route?.contentGapTimeoutMs ?? globals?.contentGapTimeoutMs);
-    const out: { initialMs?: number; gapMs?: number } = {};
-    if (initialMs !== undefined && initialMs > 0) out.initialMs = initialMs;
-    if (gapMs !== undefined && gapMs > 0) out.gapMs = gapMs;
-    else if (gapMs === undefined && out.initialMs !== undefined) out.gapMs = out.initialMs;
+    const initialExplicit = parseDeadlineMs("firstContentTimeoutMs", entry?.firstContentTimeoutMs ?? route?.firstContentTimeoutMs ?? globals?.firstContentTimeoutMs);
+    const gapExplicit = parseDeadlineMs("contentGapTimeoutMs", entry?.contentGapTimeoutMs ?? route?.contentGapTimeoutMs ?? globals?.contentGapTimeoutMs);
+    const out: FirstContentDeadlines = {};
+    if (initialExplicit !== undefined && initialExplicit > 0) {
+        const adaptive = adaptiveDeadlineMs(samples?.init, initialExplicit);
+        out.initialMs = adaptive !== undefined ? adaptive : initialExplicit;
+        out.initialSource = adaptive !== undefined ? "adaptive" : "config";
+    }
+    // Explicit 0 disables the phase at its level (no fall-through); an ABSENT
+    // gap inherits the resolved initial value and adapts on gap samples.
+    if (gapExplicit !== undefined && gapExplicit > 0) {
+        const adaptive = adaptiveDeadlineMs(samples?.gap, gapExplicit);
+        out.gapMs = adaptive !== undefined ? adaptive : gapExplicit;
+        out.gapSource = adaptive !== undefined ? "adaptive" : "config";
+    } else if (gapExplicit === undefined && out.initialMs !== undefined) {
+        const adaptive = adaptiveDeadlineMs(samples?.gap, out.initialMs);
+        out.gapMs = adaptive !== undefined ? adaptive : out.initialMs;
+        out.gapSource = adaptive !== undefined ? "adaptive" : "config";
+    }
     return out.initialMs !== undefined || out.gapMs !== undefined ? out : undefined;
 }
 

@@ -38,6 +38,7 @@ import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
 import { endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
+import { FC_ADAPTIVE_WINDOW } from "../config.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
 
 export const MAX_LOOP_ROUNDS = 10;
@@ -209,10 +210,20 @@ export interface LoopCtx {
      *  present, each sent round captures its image facts alongside the body. */
     imageLearn?: { host: string; fp: string };
     /** #3254: model-content deadlines resolved per request (three-level
-     *  cascade via resolveFirstContentDeadlines). Present iff at least one
-     *  phase is enabled; undefined keeps the legacy path byte-identical
-     *  (no timers armed, zero overhead). */
-    firstContentDeadline?: { initialMs?: number; gapMs?: number };
+     *  cascade via resolveFirstContentDeadlines, optionally refined by the
+     *  route's adaptive samples). Present iff at least one phase is enabled;
+     *  undefined keeps the legacy path byte-identical (no timers armed, zero
+     *  overhead). */
+    firstContentDeadline?: {
+        initialMs?: number;
+        gapMs?: number;
+        initialSource?: "config" | "adaptive";
+        gapSource?: "config" | "adaptive";
+    };
+    /** #3254 follow-up: route key (providers URL prefix, else host) under
+     *  which this session's healthy first-content durations are sampled in
+     *  metadata — feeds the route's adaptive deadline on later requests. */
+    fcRouteKey?: string;
 }
 
 export interface RequestOptions {
@@ -444,6 +455,34 @@ function interruptibleBody(src: ReadableStream<Uint8Array>): { stream: ReadableS
     };
 }
 
+// #3254 follow-up: per-route healthy-latency samples live in session
+// metadata (persisted with the session record) so adaptive deadlines
+// survive restarts. One row per route key; each phase keeps its own window.
+const FC_SAMPLES_META_KEY = "firstContentSamples";
+
+export function readFcSamples(session: Session, routeKey: string): { init: number[]; gap: number[] } | undefined {
+    const table = session.metadata[FC_SAMPLES_META_KEY] as Record<string, { init?: unknown; gap?: unknown }> | undefined;
+    const row = table?.[routeKey];
+    if (!row) return undefined;
+    const clean = (v: unknown): number[] => Array.isArray(v) ? v.filter((x): x is number => typeof x === "number" && Number.isFinite(x) && x >= 0) : [];
+    return { init: clean(row.init), gap: clean(row.gap) };
+}
+
+export function recordFcSample(session: Session, routeKey: string, initMs: number, gapMs?: number): void {
+    const table = (session.metadata[FC_SAMPLES_META_KEY] ?? {}) as Record<string, { init: number[]; gap: number[] }>;
+    const row = table[routeKey] ?? { init: [], gap: [] };
+    if (initMs >= 0) {
+        row.init.push(initMs);
+        if (row.init.length > FC_ADAPTIVE_WINDOW) row.init.shift();
+    }
+    if (gapMs !== undefined && gapMs >= 0) {
+        row.gap.push(gapMs);
+        if (row.gap.length > FC_ADAPTIVE_WINDOW) row.gap.shift();
+    }
+    table[routeKey] = row;
+    session.metadata[FC_SAMPLES_META_KEY] = table;
+}
+
 export async function* runCompressLoop(
     upstream: ReadableStream<Uint8Array>,
     ctx: LoopCtx,
@@ -485,10 +524,17 @@ export async function* runCompressLoop(
     let activeKill: (() => void) | null = null;
     let contentDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
     let contentDeadlineArmedAt = 0;
-    let contentDeadlineInfo: { ms: number; phase: "initial" | "gap"; round: number } | null = null;
+    let contentDeadlineInfo: { ms: number; phase: "initial" | "gap"; round: number; source: "config" | "adaptive" } | null = null;
     let contentDeadlineKilled = false;
     let contentDeadlineSettled = true;
     let upstreamAttemptNo = 0;
+    // #3254 follow-up: per-attempt healthy-latency sampling for the route's
+    // adaptive deadline (recorded only when a request completes cleanly).
+    let fcAttemptStartAt = 0;
+    let fcFirstContentAt = 0;
+    let fcLastContentAt = 0;
+    let fcWorstGapMs = 0;
+    let fcGapMeasured = false;
     const deadlineHost = (() => { try { return new URL(requestOptions.url).host; } catch { return requestOptions.url; } })();
     const clearContentDeadline = () => {
         if (contentDeadlineTimer) {
@@ -502,14 +548,14 @@ export async function* runCompressLoop(
         contentDeadlineKilled = true;
         const info = contentDeadlineInfo;
         const waitedMs = Date.now() - contentDeadlineArmedAt;
-        const line = `content-deadline fired: no model content for ${waitedMs}ms (limit ${info.ms}ms, phase=${info.phase}, source=config, upstream attempt ${upstreamAttemptNo}, round ${info.round}) — aborting stalled upstream stream (#3254)`;
+        const line = `content-deadline fired: no model content for ${waitedMs}ms (limit ${info.ms}ms, phase=${info.phase}, source=${info.source}, upstream attempt ${upstreamAttemptNo}, round ${info.round}) — aborting stalled upstream stream (#3254)`;
         ctx.log(`[acp-proxy: ${line}]`);
         loggerLog("warn", `[acp-loop] session ${ctx.session.id} ${line}`);
         activeKill?.();
     };
-    const armContentDeadline = (ms: number, phase: "initial" | "gap", roundNo: number) => {
+    const armContentDeadline = (ms: number, phase: "initial" | "gap", roundNo: number, source: "config" | "adaptive") => {
         clearContentDeadline();
-        contentDeadlineInfo = { ms, phase, round: roundNo };
+        contentDeadlineInfo = { ms, phase, round: roundNo, source };
         contentDeadlineArmedAt = Date.now();
         contentDeadlineSettled = false;
         contentDeadlineTimer = setTimeout(fireContentDeadline, ms);
@@ -787,8 +833,13 @@ export async function* runCompressLoop(
                 // (gap-only configs arm nothing until first content arrives).
                 upstreamAttemptNo += 1;
                 contentDeadlineKilled = false;
+                fcAttemptStartAt = Date.now();
+                fcFirstContentAt = 0;
+                fcLastContentAt = 0;
+                fcWorstGapMs = 0;
+                fcGapMeasured = false;
                 if (ctx.firstContentDeadline?.initialMs !== undefined && ctx.firstContentDeadline.initialMs > 0) {
-                    armContentDeadline(ctx.firstContentDeadline.initialMs, "initial", round);
+                    armContentDeadline(ctx.firstContentDeadline.initialMs, "initial", round, ctx.firstContentDeadline.initialSource ?? "config");
                 } else {
                     clearContentDeadline();
                 }
@@ -797,10 +848,19 @@ export async function* runCompressLoop(
                     // #3254: any MODEL CONTENT event re-arms the inter-content
                     // deadline (owner-tiered like the client's own watchdog);
                     // pings/comments/meta/usage/diag never count as content.
-                    if (ctx.firstContentDeadline?.gapMs !== undefined && ctx.firstContentDeadline.gapMs > 0
-                        && ((ev.kind === "text" || ev.kind === "reasoning") ? ev.delta.length > 0
-                            : ev.kind === "tool_call" || ev.kind === "redacted_thinking" || ev.kind === "standalone_signature")) {
-                        armContentDeadline(ctx.firstContentDeadline.gapMs, "gap", round);
+                    const fcHasContent = (ev.kind === "text" || ev.kind === "reasoning") ? ev.delta.length > 0
+                        : ev.kind === "tool_call" || ev.kind === "redacted_thinking" || ev.kind === "standalone_signature";
+                    if (fcHasContent && ctx.firstContentDeadline !== undefined) {
+                        const now = Date.now();
+                        if (fcFirstContentAt === 0) fcFirstContentAt = now;
+                        else {
+                            fcWorstGapMs = Math.max(fcWorstGapMs, now - fcLastContentAt);
+                            fcGapMeasured = true;
+                        }
+                        fcLastContentAt = now;
+                    }
+                    if (fcHasContent && ctx.firstContentDeadline?.gapMs !== undefined && ctx.firstContentDeadline.gapMs > 0) {
+                        armContentDeadline(ctx.firstContentDeadline.gapMs, "gap", round, ctx.firstContentDeadline.gapSource ?? "config");
                     }
                     if (ev.kind === "text") {
                         assistantText += ev.delta;
@@ -901,6 +961,16 @@ export async function* runCompressLoop(
                     loggerLog("warn", `[acp-loop] session ${ctx.session.id} content-deadline reached (upstream attempt ${upstreamAttemptNo}, round ${info?.round ?? "?"}); ending turn in-band instead of stalling the client's watchdog (#3254)`);
                     yield adapter.emitError(msg);
                     return;
+                }
+                // #3254 follow-up: a cleanly completed attempt (done, not
+                // truncated, not deadline-killed, produced content) is a
+                // HEALTHY sample of this route's normal latency — feed the
+                // per-route ring that drives adaptive deadlines later.
+                if (ctx.fcRouteKey !== undefined && ctx.firstContentDeadline !== undefined
+                    && sawDone && !truncatedDone && fcFirstContentAt > 0) {
+                    // A measured sub-millisecond duration is a legitimate fast
+                    // sample — record it; only unmeasured phases are omitted.
+                    recordFcSample(ctx.session, ctx.fcRouteKey, fcFirstContentAt - fcAttemptStartAt, fcGapMeasured ? fcWorstGapMs : undefined);
                 }
 
                 // #2701: threads acceptance. This round's response started ⇔
