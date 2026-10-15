@@ -17,7 +17,7 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 // records a synthetic "unsupported call" entry in its own resent history — so an
 // armed CCR on that host would declare acp_retrieve (unroutable by the host) AND
 // placeholderize oversized tool results the model can never retrieve back (silent
-// loss). Same mechanism as image_full (#3266/#3270). These tests pin the gate at
+// loss). Same mechanism as the removed image_full restore channel (#3266/#3270). These tests pin the gate at
 // the policy-stamping site on the native-tool responses wire: a codex client gets
 // CCR disarmed (no acp_retrieve declaration, oversized tool result stays verbatim);
 // a non-codex client on the same wire keeps CCR armed (regression guard against
