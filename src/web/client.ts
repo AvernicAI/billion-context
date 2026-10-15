@@ -1,8 +1,11 @@
 import { MESSAGES } from "./i18n.js";
+import { safeSuffix } from "../text-safe.js";
 
 export const WEB_CLIENT = `(function () {
     "use strict";
     const MESSAGES=${JSON.stringify(MESSAGES)};
+    // #816 family: id tails must not cut surrogate pairs — inline the shared clamp (IIFE has no module access).
+    const safeSuffix=${safeSuffix.toString()};
     let locale = "zh-CN";
     try {
         // #2321: an embedding host may pin the locale explicitly (?lang=zh|en) —
@@ -1947,7 +1950,7 @@ export const WEB_CLIENT = `(function () {
             try { host = d.upstreamOrigin ? new URL(d.upstreamOrigin).host : ""; } catch (e) { host = String(d.upstreamOrigin || ""); }
             const hit = d.inputTokens ? Math.round((d.cachedTokens || 0) * 100 / d.inputTokens) + "%" : "?";
             openReportModal(t("rpt.session_prefill", {
-                id: String(d.id).slice(-12),
+                id: safeSuffix(String(d.id), 12),
                 protocol: d.protocol || "?",
                 host: host || "?",
                 reqs: d.requests != null ? String(d.requests) : "?",
