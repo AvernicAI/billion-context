@@ -33,6 +33,32 @@ interface AcpStatusCtx {
     session: Session;
 }
 
+// #3192: the submit gate rejects any range that still cites a ref recorded DEAD
+// (the client rewrote/dropped those messages), but the eligibility view
+// (buildCompressibleRanges) never reads state.deadRefs — so without this filter
+// the hint/acp_status advertise exactly the doomed ranges the gate then refuses,
+// contradicting the "recorded as DEAD" receipt in the same message. Drop any
+// advertised range whose [startRef..endRef] span contains a dead ref. No-op when
+// deadRefs is empty; conservative — drops the whole span rather than splitting
+// around the dead cell (the kernel-level split is the more fundamental home).
+export function excludeDeadRefRanges<T extends { startRef: string; endRef: string }>(ranges: T[], deadRefs?: string[]): T[] {
+    if (!deadRefs || deadRefs.length === 0) return ranges;
+    const deadNumbers: number[] = [];
+    for (const ref of deadRefs) {
+        const m = /^m(\d+)$/i.exec(ref);
+        if (m) deadNumbers.push(Number(m[1]));
+    }
+    if (deadNumbers.length === 0) return ranges;
+    return ranges.filter((range) => {
+        const s = /^m(\d+)$/i.exec(range.startRef);
+        const e = /^m(\d+)$/i.exec(range.endRef);
+        if (!s || !e) return true;
+        const start = Number(s[1]);
+        const end = Number(e[1]);
+        return !deadNumbers.some((n) => n >= start && n <= end);
+    });
+}
+
 export function liveCompressionRanges(ctx: AcpStatusCtx): { nudge: NudgeDecision; ranges: CompressibleRange[] } | undefined {
     const turn = ctx.core.processTurn({
         messages: ctx.messages,
@@ -46,7 +72,7 @@ export function liveCompressionRanges(ctx: AcpStatusCtx): { nudge: NudgeDecision
     const minChars = ctx.config.compress.minCompressRange;
     return {
         nudge: turn.nudge,
-        ranges: viableRanges(turn.nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars),
+        ranges: excludeDeadRefRanges(viableRanges(turn.nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars), ctx.session.state.deadRefs),
     };
 }
 

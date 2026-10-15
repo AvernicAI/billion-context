@@ -56,6 +56,7 @@ function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): 
 }
 import { degenerateTurnWarning, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
+import { excludeDeadRefRanges } from "./acp-status.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
@@ -1463,6 +1464,13 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         }
     } catch {
         nudge = undefined;
+    }
+    // #3204: the submit gate rejects any span that brackets a ref recorded DEAD
+    // (the client rewrote/dropped those messages) — the same self-contradiction
+    // as the #3192 receipt/acp_status surfaces. Filter at the source so the
+    // panel text and the compressibleRanges field below cannot drift apart.
+    if (nudge) {
+        nudge = { ...nudge, compressibleRanges: excludeDeadRefRanges(nudge.compressibleRanges ?? [], session.state.deadRefs) };
     }
     let panel: string | undefined;
     try {

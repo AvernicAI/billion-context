@@ -55,7 +55,9 @@ import {
 } from "./instance.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
 import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
+import { logHostEvent } from "./agent/host-log.js";
 import { log as teeLog } from "./logger.js";
+import { VERSION } from "./version.js";
 import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
@@ -3689,6 +3691,24 @@ async function waitForStarterInstance(
     return inst ?? (await probe());
 }
 
+/** #3200: default sink for attach-decision diagnostics (#1623). Normal
+ *  candidate filtering — probe drops, fingerprint/lane/port skips — is not
+ *  user-actionable, so it goes to the durable log file ONLY, never to the
+ *  interactive terminal: in host processes (pi/omp/dsh/… native lanes) stderr
+ *  IS the TUI screen (#2827/#2831), and those processes never call
+ *  configureLogger, so the old teeLog default was terminal-only with NO file
+ *  record at all. Explicit debug=true adds one controlled stderr copy for CLI
+ *  contexts (host lanes hard-code debug:false and stay silent). Message text
+ *  is unchanged — the `native-attach:` prefix keeps grep continuity and the
+ *  #1623 traceability contract. User-actionable output (gate refusals, spawn
+ *  failures) keeps its own visible channels (#3200 requirement). */
+function defaultAttachDiag(debug: boolean): (msg: string) => void {
+    return (msg: string): void => {
+        logHostEvent("info", "", msg);
+        if (debug) process.stderr.write(`${new Date().toISOString()} [info] [v=${VERSION}] ${msg}\n`);
+    };
+}
+
 /** #1623: the probe-only half of ensureProxyRunning's attach decision — a
  *  live, compatible, gate-passing instance WITHOUT spawning, waiting for
  *  starters, or registering a watcher. For zcode exit-handoff and watchdog
@@ -3703,8 +3723,9 @@ export async function findLiveAttachableInstance(
     const attachPolicy = (deps.resolveAttachPolicy ?? resolveNativeAttachPolicy)();
     const attachUrl = (deps.resolveAttachUrl ?? resolveNativeAttachUrl)();
     const foreignLanes = (deps.attachLanePriority ?? resolveNativeAttachLanePriority)();
-    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, deps.attachDiag);
-    return pickAttachable(probed, opts, entryScriptFingerprint(deps.scriptPath ?? process.argv[1]), attachExternal, attachPolicy, attachUrl, new Set(), deps.attachDiag, foreignLanes);
+    const attachDiag = deps.attachDiag ?? defaultAttachDiag(opts.debug);
+    const probed = await probeLiveInstances(readInstance, fetchHealthInfo, attachDiag);
+    return pickAttachable(probed, opts, entryScriptFingerprint(deps.scriptPath ?? process.argv[1]), attachExternal, attachPolicy, attachUrl, new Set(), attachDiag, foreignLanes);
 }
 
 export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): Promise<number> {
@@ -3945,7 +3966,7 @@ export async function ensureProxyRunning(
     // Refusal log dedup: pickAttachable runs again on every starter-poll tick,
     // so each refused origin is announced exactly once per bring-up.
     const refusedLog = new Set<string>();
-    const attachDiag = deps.attachDiag ?? ((msg: string) => teeLog("info", msg));
+    const attachDiag = deps.attachDiag ?? defaultAttachDiag(opts.debug);
     // Same expression as the spawn path's BILI_PARENT_PID: one owner-pid
     // semantic for spawned AND attached proxies (#1190).
     const watchPid = opts.parentPid ?? process.pid;

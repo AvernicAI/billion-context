@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { activeBlockSpans, collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
-import { handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
+import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
@@ -503,7 +503,7 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
     if (ctx.lastNudge) {
         // Baseline = this request's prepare-time offer (already viable-filtered
         // by the prepare step), NOT a post-fold recompute (#2404).
-        base = viableRanges(ctx.lastNudge.compressibleRanges).filter(submitGate);
+        base = excludeDeadRefRanges(viableRanges(ctx.lastNudge.compressibleRanges).filter(submitGate), ctx.session.state.deadRefs);
         tier = ctx.lastNudge.tier ?? null;
     } else {
         // Internal lanes (preflight overflow-compress) capture no prepare-time
@@ -532,7 +532,7 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
         // #1387 (pi #521) fixed. shouldInject=false ⇒ nothing actionable ⇒ fall
         // through to the stop-signal logic below (never list the ranges).
         if (nudge.shouldInject) {
-            base = viableRanges(nudge.compressibleRanges).filter(submitGate);
+            base = excludeDeadRefRanges(viableRanges(nudge.compressibleRanges).filter(submitGate), ctx.session.state.deadRefs);
         } else {
             base = [];
         }

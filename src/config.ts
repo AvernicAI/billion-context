@@ -120,6 +120,21 @@ export type ProviderRoute = {
      *  store (`billion-context.json.summary-credentials.json`) — same
      *  semantics as apiKeyEnv, for keys kept out of the environment. */
     credentialRef?: string;
+    /** #3211: per-route estimator-calibration (k̂) policy. The learned k̂ is
+     *  this route's billing reports ÷ local estimates — on a route that
+     *  INFLATES its usage reports (relay markup, non-token accounting), the
+     *  learned ratio is the inflation mark itself, and applying it to the
+     *  decision meter pins usage into the pressure band (`nudge.maxContextLimitPct`)
+     *  permanently, which bypasses growth-gate + cadence → high-frequency
+     *  small-yield fold churn (#3211). Opt-in escape hatch applied at k̂
+     *  PUBLICATION time — the learned ring stays raw and visible for audit:
+     *  - `disabled: true` — never apply a learned factor on this route
+     *    (decision meters run on the raw local estimate);
+     *  - `max: <number>` — clamp the applied factor to ≤ max (e.g. `1` =
+     *    allow deflation learning only, never inflation). Must be > 0 and ≤ 4
+     *    (higher is inert anyway — the publication clamp already caps at 4).
+     *  Invalid values reject the config load loudly (strict #1909 discipline). */
+    calibration?: { disabled?: boolean; max?: number };
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -184,11 +199,23 @@ export type CompressSettings = {
      *  be >= maxContextLimit. Maps to kernel `nudge.emergencyThresholdPct` +
      *  `truncate.threshold`. */
     emergencyThresholdPercent?: number | string;
-     /** Nudge growth magnitude in tokens — a compression nudge fires roughly
-      *  every time this many tokens become compressible. Flattens the kernel's
-      *  adaptive band to a fixed step (sets both `nudge.growthFloor` and
-      *  `nudge.growthCap`). */
+    /** Nudge growth magnitude in tokens — a compression nudge fires roughly
+     *  every time this many tokens become compressible. Flattens the kernel's
+     *  adaptive band to a fixed step (sets both `nudge.growthFloor` and
+     *  `nudge.growthCap`). */
     nudgeGrowthTokens?: number;
+    /** #3211: minimum reclaimable tokens a pressure-band nudge must have to
+     *  fire (usage already ≥ `maxContextLimit`). Default when unset at every
+     *  level: `max(5000, context limit × 1%)`. On routes whose decision meter
+     *  runs inflated (k̂ amplification, #3211), raising this (e.g. 50000) stops
+     *  the "fold a little each time we hit the line" churn: sub-floor pending
+     *  batches suppress the nudge (logged; truncate.threshold remains the
+     *  safety valve) so growth accumulates until one batch big enough to push
+     *  usage out of the band. An explicit 0 restores the legacy any-pending
+     *  behavior. Maps to kernel `nudge.minPressureBenefitTokens`. Deepest
+     *  level wins PER FIELD across global → provider → model, like every
+     *  other compress field. */
+    minPressureBenefitTokens?: number;
     /** Per-tier nudge growth thresholds in tokens (#2376): independent token
       *  trigger sizes for the T1/T2/T3 mass paths, e.g. keep T1 aggressive for
       *  long tasks while letting T2 distill earlier/later. Each UNSET tier
@@ -1925,7 +1952,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 // level down under "compress". Keep in sync with parseCompressSettings.
 const COMPRESS_SETTING_FIELDS = new Set([
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
-    "nudgeGrowthTokens", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
+    "nudgeGrowthTokens", "minPressureBenefitTokens", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
     "preserveRecentMessages", "preserveRecentTokens",
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
@@ -2288,7 +2315,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; protocol?: unknown; compress?: CompressSettings; compat?: { roles?: unknown; dropFields?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown; imageTokenCap?: unknown; calibration?: unknown; baseUrl?: unknown; api?: unknown; apiKeyEnv?: unknown; credentialRef?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
@@ -2307,6 +2334,8 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
         if (imageBilling) route.imageBilling = imageBilling;
         const imageTokenCap = parseImageTokenCap(obj.imageTokenCap);
         if (imageTokenCap !== undefined) route.imageTokenCap = imageTokenCap;
+        const calibration = parseCalibrationPolicy(obj.calibration);
+        if (calibration) route.calibration = calibration;
         // #2336 lane credential override. Only parsed for NON-recipe-shaped
         // entries: a dialing recipe (baseUrl/api present) validates its own
         // credential fields in parseNamedProviderRecipe, and letting this
@@ -2353,6 +2382,37 @@ function parseDeclaredWireProtocol(v: unknown): WireProtocol | undefined {
  *  parseImageBilling: anything else is dropped, never a throw). */
 export function parseImageTokenCap(value: unknown): number | undefined {
     return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+// #3211: same strict-#1909 stance as parseDeclaredWireProtocol — an invalid
+// calibration policy THROWS instead of being silently dropped, because a
+// dropped escape hatch leaves the user staring at pressure-band churn with no
+// signal that their config had no effect. `max` above the publication clamp
+// (4) is rejected as provably inert rather than accepted dead weight.
+export function parseCalibrationPolicy(value: unknown): { disabled?: boolean; max?: number } | undefined {
+    if (value === undefined) return undefined;
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        throw new Error(`[acp-config] providers entry calibration must be an object with "disabled" and/or "max" (got ${JSON.stringify(value)})`);
+    const vo = value as Record<string, unknown>;
+    for (const key of Object.keys(vo)) {
+        if (key !== "disabled" && key !== "max")
+            throw new Error(`[acp-config] providers entry calibration has unknown key "${key}" (allowed: disabled, max)`);
+    }
+    const out: { disabled?: boolean; max?: number } = {};
+    if ("disabled" in vo) {
+        if (typeof vo.disabled !== "boolean")
+            throw new Error(`[acp-config] providers entry calibration.disabled must be a boolean (got ${JSON.stringify(vo.disabled)})`);
+        out.disabled = vo.disabled;
+    }
+    if ("max" in vo) {
+        const m = vo.max;
+        if (typeof m !== "number" || !Number.isFinite(m) || m <= 0 || m > 4)
+            throw new Error(`[acp-config] providers entry calibration.max must be a number > 0 and <= 4 (got ${JSON.stringify(m)})`);
+        out.max = m;
+    }
+    if (out.disabled === undefined && out.max === undefined)
+        throw new Error('[acp-config] providers entry calibration requires at least one of "disabled" or "max"');
+    return out;
 }
 
 function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
@@ -2441,6 +2501,13 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("nudgeModelDecided" in obj) {
         if (typeof obj.nudgeModelDecided !== "boolean") ok = false;
         else out.nudgeModelDecided = obj.nudgeModelDecided;
+    }
+    // #3211: an explicit 0 is meaningful (legacy any-pending), so validate
+    // >= 0 instead of takeNumber's plain finite check.
+    if ("minPressureBenefitTokens" in obj) {
+        const v = obj.minPressureBenefitTokens;
+        if (typeof v !== "number" || !Number.isFinite(v) || v < 0) ok = false;
+        else out.minPressureBenefitTokens = Math.floor(v);
     }
     for (const key of ["protectedLatestTools", "protectedTools"] as const) {
         if (!(key in obj) || obj[key] === undefined) continue;

@@ -222,6 +222,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.outputHeadroomMaxPct` | number \| % | 0.25 | — | Cap on the share of the window reserved for output via max_tokens. |
 | `compress.nudgeGrowthTokens` | number | 50000 (kernel flat cadence) | — | Growth gate: nudges fire only when a foldable range exceeds baseline growth by this many tokens (flat by design, independent of window size). |
 | `compress.tierNudgeTokens` | object {t1?, t2?, t3?} | derived (T1 = nudgeGrowthTokens, T2/T3 = ×1.5) | — | Per-tier token-mass trigger thresholds; each unset tier falls back to its derived default, so absent/empty = legacy unified behavior (#2376). |
+| `compress.minPressureBenefitTokens` | number (≥ 0) | max(5000, limit × 1%) | — | Minimum reclaimable tokens a pressure-band nudge must have to fire; on inflated-meter routes raise it so folds batch into big events instead of high-frequency small-yield churn (#3211). Explicit 0 = legacy any-pending. |
 | `compress.nudgeModelDecided` | boolean | off (unset) | — | Model-decided nudge timing (#2228): an armed tier-1 nudge first asks the model — via a short side call over the session's cached prefix — whether compressing NOW helps the current task. A strict-JSON "yes" injects an explicit directive with a program-finalized span; "no", a malformed answer, or a timeout injects nothing this round. EMERGENCY arms and tier≥2 distillation always keep the legacy advisory. Off unless explicitly enabled. |
 | `compress.nudgeDecisionMaxTokens` | number | 200 | — | Output budget (tokens) of the model-decision side call used by nudgeModelDecided. Must be > 0. |
 | `compress.streamSummary` | boolean | false (unset) | — | Force preflight summarization to run as a streaming (SSE) call from the first attempt. The error-driven self-learn handles stream-mandating upstreams on its own (any 400 on a non-streaming summary triggers a one-shot SSE probe, #2494) but NEVER arms on gateway timeouts (e.g. Cloudflare HTTP 524): set this where such a gateway sits between bili and the origin, or simply to skip the one probe round-trip. |
@@ -308,6 +309,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `bind` | string (named entries only) | unset | — | Deep-merge a named (non-URL) entry onto the bound URL lane as an alias; without bind a named entry stays routing-inert. |
 | `apiKeyEnv` | string (env var name) | unset | — | Lane credential override (#2336): replace the client's credential with this env variable's value for this lane. Exactly one of apiKeyEnv/credentialRef; see [Lane credentials](#lane-credentials-apikeyenv--credentialref). |
 | `credentialRef` | string (store name) | unset | — | Lane credential override via the private summary-credential store (secret:NAME semantics). |
+| `calibration` | { disabled?: boolean, max?: number } | unset (learned k̂ applies) | — | Per-route k̂ calibration policy (#3211): opt-out or clamp for routes whose usage reports inflate; see [Route-level k̂ calibration policy](#route-level-k-calibration-policy). |
 | `compactionOptIn` | boolean | false | BILI_NON_HTTP_PROVIDERS | Named entries only: opt a non-http(s)-baseUrl provider into compaction ownership (pi/omp lanes); unions with env BILI_NON_HTTP_PROVIDERS. |
 
 **Environment-only variables**
@@ -992,6 +994,17 @@ A URL-keyed lane (or a named entry with `bind`) can send **its own** credential 
 - **Failure posture:** if the env var is unset or the secret is absent, bili keeps the client's own headers and warns once per lane+reference (visible, never silently degrading to a guaranteed 401). The warning re-arms after a successful resolution.
 - Applied once to the shared forward-header set, so every egress of the request — initial send, role-ladder retry, overflow refold, compress-loop rounds, continuation refetch — carries the lane credential.
 
+### Route-level k̂ calibration policy
+
+- **Type:** `object` — `{ "disabled"?: boolean, "max"?: number }`; at least one key required
+- **Default:** *(unset — the learned k̂ applies unmodified)*
+- **Status:** ACTIVE
+- **Description:** Per-route escape hatch for upstreams whose usage reports inflate beyond any honest tokenizer scale (#3211: relay markup / non-token accounting learns k̂ ≈ 1.86–1.97, which pins the decision meter into the pressure band permanently — the band bypasses growth-gate + cadence, so every few thousand tokens of pending triggers another fold that recovers just enough to dip back below the line: high-frequency small-yield churn). bili cannot distinguish a genuinely denser tokenizer from an inflated report using the usage stream alone, so this policy is OPT-IN per route and applied at k̂ PUBLICATION time — the learned ring stays raw in `stats.calibrationRing` for audit; only the applied factor (`stats.calibratedEstimate`) changes:
+  - `"disabled": true` — never apply a learned factor on this route; decision meters run on the raw local estimate.
+  - `"max": <number>` (0 < max ≤ 4) — clamp the applied factor to ≤ max. `1` = allow deflation learning only (never inflation): a route that honestly bills slightly UNDER local estimates still benefits from that correction.
+  - Both may be set; `disabled` wins.
+  Matching follows the same longest-URL-prefix rule as every other provider field (path-scoped keys included). The effect takes hold on the next k̂ publication for that route (≤ 3 settled turns); removing the policy restores the learned value on the next publication. Invalid values (wrong types, empty object, `max` outside (0, 4]) reject the config load loudly.
+
 ### `models`
 
 - **Type:** `Record<string, { context?: number; output?: number; compress?: CompressSettings; benefit?: boolean }>`
@@ -1204,6 +1217,13 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Default:** `50000`
 - **Status:** ACTIVE
 - **Description:** Token-growth step for soft compression nudges. A nudge fires roughly every time this many tokens become compressible. Lower values produce more frequent nudges. Maps to the kernel fields `nudge.growthFloor` and `nudge.growthCap` (it flattens the engine's adaptive band to this fixed step). **Keep this proportional to your smallest model window:** the T1 mass trigger needs one full step of compressible content, so a step larger than the window (e.g. `1500000` against a ~1M window) makes the mass trigger unreachable for that entire window — usage-percentage pressure bands and preflight remain as backstops, but incremental folding goes silent and an over-window request (typical after a mid-session fork onto a smaller-window model) falls straight into the multi-round preflight summarization marathon instead of folding early.
+
+#### `minPressureBenefitTokens`
+
+- **Type:** `number` (tokens, ≥ 0)
+- **Default:** *(unset — kernel default `max(5000, context limit × 1%)`)*
+- **Status:** ACTIVE
+- **Description:** Minimum reclaimable token mass a pressure-band nudge (usage already ≥ `maxContextLimit`) must have before it fires. The pressure band bypasses growth-gate + cadence by design, so on a route whose decision meter runs inflated (k̂ amplification, #3211) even a few thousand tokens of pending triggers another fold — each recovering just enough to dip below the band, then immediately re-entering it: high-frequency small-yield churn ("fold a little each time we hit the line"). Raising this floor (e.g. `50000` against a ~200k window) suppresses sub-floor pressure nudges (they log as suppressed; `truncate.threshold` remains the safety valve) until growth accumulates ONE batch big enough to push usage out of the band — the rhythm honest routes get from the growth gate for free. An explicit `0` restores the legacy any-pending behavior. Merged per field across global → provider → model like every other compress field. Maps to the kernel field `nudge.minPressureBenefitTokens`.
 
 #### `tierNudgeTokens`
 
