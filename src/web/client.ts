@@ -1081,6 +1081,7 @@ export const WEB_CLIENT = `(function () {
             providerTtl: { count: (raw.providerTtl && Number(raw.providerTtl.count)) || 0, missed: (raw.providerTtl && Number(raw.providerTtl.missed)) || 0 },
             rewinds: { count: (raw.rewinds && Number(raw.rewinds.count)) || 0, missed: (raw.rewinds && Number(raw.rewinds.missed)) || 0 },
             client: { count: (raw.client && Number(raw.client.count)) || 0, missed: (raw.client && Number(raw.client.missed)) || 0 },
+            reasoningDrop: { count: (raw.reasoningDrop && Number(raw.reasoningDrop.count)) || 0, missed: (raw.reasoningDrop && Number(raw.reasoningDrop.missed)) || 0 },
             abortCorrelated: Number(raw.abortCorrelated) || 0,
         };
     }
