@@ -376,7 +376,7 @@ interface FoldReconcileResult {
     byImage: number;
     /** #2695: fold blocks reaped this pass (removed from state.blocks after
      *  a majority-loss zombie streak). */
-     reaped: number;
+    reaped: number;
     unmatched: number;
     /** #3248 phase 1: this pass used the verified-incremental prefix fast
      *  path (plugin lanes only) instead of full reconciliation. */
