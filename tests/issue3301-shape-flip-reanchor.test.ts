@@ -9,13 +9,38 @@ import {
     type FoldAnchor,
     type ReconcileOptions,
 } from "../src/fold-reconcile.ts";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { resolveStoredDecompositions, type StoredRow } from "../src/fold-decomposition-lookup.ts";
 import { planIngest, planIngestDelta, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { UnifiedStore } from "../src/storage/store.ts";
 import type { CoreMessage } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 
 function msg(id: string, role: string, text: string, extra?: Partial<CoreMessage>): CoreMessage {
     return { id, role, contentType: "text", text, ...extra } as CoreMessage;
+}
+
+function mkLegacy(id: string, lastMessages: CoreMessage[], decompositionLog?: CoreMessage[]): LegacySessionLike {
+    return {
+        id,
+        createdAt: 1_000,
+        lastSeen: 2_000,
+        meta: { protocol: "openai" },
+        stats: { requests: 1 },
+        metadata: {},
+        state: {
+            blocks: [],
+            messageRefs: { byRaw: {}, byRef: {} },
+            nextBlockId: 1,
+            nextRunId: 1,
+        },
+        blockContents: new Map(),
+        lastMessages,
+        lastMessagesFolded: false,
+        decompositionLog,
+    };
 }
 
 const THINK_OPEN = "\x3cthink\x3e\n";
@@ -299,27 +324,6 @@ describe("resolveStoredDecompositions (#3301)", () => {
 });
 
 describe("decompositionLog ingest (#3301)", () => {
-    function mkLegacy(id: string, lastMessages: CoreMessage[], decompositionLog?: CoreMessage[]): LegacySessionLike {
-        return {
-            id,
-            createdAt: 1_000,
-            lastSeen: 2_000,
-            meta: { protocol: "openai" },
-            stats: { requests: 1 },
-            metadata: {},
-            state: {
-                blocks: [],
-                messageRefs: { byRaw: {}, byRef: {} },
-                nextBlockId: 1,
-                nextRunId: 1,
-            },
-            blockContents: new Map(),
-            lastMessages,
-            lastMessagesFolded: false,
-            decompositionLog,
-        };
-    }
-
     test("import payload rows sit below tail seqs and dedup against the tail", () => {
         const r1 = msg("r1", "assistant", "R words", { contentType: "reasoning" });
         const t1 = msg("t1", "assistant", "T words");
@@ -336,5 +340,34 @@ describe("decompositionLog ingest (#3301)", () => {
         const legacy = mkLegacy("imp2", [r1], [msg("d0", "user", "older evidence")]);
         const out = planIngestDelta(legacy, 0, [], { msgId: "x", contentHash: "y" }, true);
         assert.equal(out, null, "payload must not be skipped as trusted prefix");
+    });
+});
+
+describe("UnifiedStore.messagesForIds (#3301)", () => {
+    test("returns id rows plus seq±1 neighbors, sorted by seq, CAS-resolved content", () => {
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3301-mfi-"));
+        let store: UnifiedStore | null = null;
+        try {
+            const r1 = msg("r1", "assistant", "R words here", { contentType: "reasoning" });
+            const t1 = msg("t1", "assistant", "T reply words");
+            const u2 = msg("u2", "user", "hello user");
+            store = UnifiedStore.open(path.join(tmp, "index.db"));
+            store.ingestSession(planIngest(mkLegacy("s-mfi", [r1, t1, u2])));
+            // one rc member with neighbors → the adjacent core lands too, so
+            // turn-key derivation keeps split-form pairs adjacent.
+            const rows = store.messagesForIds("s-mfi", ["r1"], true);
+            assert.deepEqual(rows.map((r) => r.msgId), ["r1", "t1"], "rc pair stays adjacent");
+            assert.equal(rows[1].seq - rows[0].seq, 1, "neighbor is the very next row");
+            assert.equal(rows[0].content, JSON.stringify(r1), "content resolved through the CAS blob");
+            // without neighbors: exactly the requested ids, nothing more
+            const bare = store.messagesForIds("s-mfi", ["u2"], false);
+            assert.deepEqual(bare.map((r) => r.msgId), ["u2"]);
+            // ids absent from the index → empty list (null is the persist-layer
+            // signal for "no index at all"; [] means the index has none)
+            assert.deepEqual(store.messagesForIds("s-mfi", ["missing"], true), []);
+        } finally {
+            store?.close();
+            try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
+        }
     });
 });
