@@ -124,20 +124,24 @@ export async function prepareResponses(
     const renderTags: "text-only" | "none" = knobRenderNone() || isCompactionTrigger ? "none" : "text-only";
 
     try {
-        // [#1638] Plugin mode: position-preserve mid-history system/developer
-        // items. Clients like OMP append custom_message-derived developer
-        // notifications mid-history and re-send them every turn; the kernel
-        // hoists system/developer content from ANY position into
+        // [#1638/#3227] Plugin mode and Codex-proxy clients: position-preserve
+        // mid-history system/developer items. Such clients append developer
+        // notifications/updates mid-history and re-send them every turn; the
+        // kernel hoists system/developer content from ANY position into
         // projection.systemParts, so the merged developer block injected at
         // the front of the rebuilt input churns every turn and breaks the
-        // upstream prefix cache (sawtooth down to the instructions-only
-        // residual). Marking the non-head items with an unknown type just for
-        // the duration of responsesToCore keeps them out of systemParts and
-        // puts them in the projection layout as coreId-less slots, which
+        // upstream prefix cache (#1638 sawtooth down to the instructions-only
+        // residual; #3227 the same churn for native codex, whose #1085 anchor
+        // only stabilizes the client's own head text, not the appended items).
+        // Marking the non-head items with an unknown type just for the
+        // duration of responsesToCore keeps them out of systemParts and puts
+        // them in the projection layout as coreId-less slots, which
         // patchResponsesInput re-emits verbatim in their original position —
         // the position-preserved semantics the openai-chat wire already has
-        // (head-only hoist, kernel src/wire/openai.ts). Proxy mode (native
-        // codex) keeps the hoist-and-anchor behavior (#1085).
+        // (head-only hoist, kernel src/wire/openai.ts). The head run keeps the
+        // hoist (stable system prompt), so the front developer block stays
+        // byte-identical across turns. Other proxy clients keep the hoist
+        // (#1085 anchor path owns their stability).
         // #2867: canonical incoming system/developer view — computed BEFORE the
         // in-place marking below re-types the mid items, and independent of
         // pluginMode by construction (kernel systemParts order mirrored:
@@ -158,7 +162,7 @@ export async function prepareResponses(
             log("info", `[${sessionId}] [responses] compression mode switched ${prevMode}→${curMode} (${reason}) — the forwarded system projection changes shape with it; any resulting prefix invalidation is attributed to this projection switch, not a host rewrite (#2867)`);
         }
         const inplaceSysDev: { item: { type?: string; role?: unknown }; type: string | undefined }[] = [];
-        if (pluginMode && Array.isArray(parsed.input)) {
+        if ((pluginMode || isCodexClient(req.headers)) && Array.isArray(parsed.input)) {
             let head = true;
             for (const rawItem of parsed.input) {
                 const item = rawItem as { type?: string; role?: unknown };

@@ -28,9 +28,13 @@
 //   T3 head-neutral: a leading additional_tools item does not break the
 //       head run — the head developer item is still hoisted, front block
 //       injected right after it, stable;
-//   T4 proxy pin (negative): native/proxy mode keeps the hoist semantics
-//       (#1085 anchor path) — notifications are NOT re-emitted as
-//       in-place developer items.
+//   T4 proxy pin (negative): generic native/proxy clients keep the hoist
+//       semantics (#1085 anchor path) — notifications are NOT re-emitted as
+//       in-place developer items;
+//   T5/T6 codex proxy (#3227): a Codex client (UA-detected) in native proxy
+//       mode gets the SAME position-preserved projection as plugin mode —
+//       mid-history developer items ride in place, front block byte-stable,
+//       append-only bodies; a LEADING developer item still hoists to the head.
 
 import { test } from "node:test";
 import assert from "node:assert";
@@ -57,16 +61,17 @@ const NUDGE_PREFIX = "This is an efficiency nudge";
 interface FoldSpec { startId: string; endId: string; topic: string; summary: string }
 interface Pair { id: string; args: FoldSpec; result: string }
 type CItem = { role: "user" | "assistant"; text: string } | { dev: string } | { pair: Pair } | { raw: Record<string, unknown> };
-interface Step { send: CItem[]; fold?: FoldSpec; pairId?: string }
+interface Step { send: CItem[]; fold?: FoldSpec; pairId?: string; instructions?: string }
 
 const FILLER = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ".repeat(28);
 const T = (i: number, pad = false): CItem => ({ role: "user", text: `q${i} devpos question ${i}${pad ? " " + FILLER : ""}` });
 const A = (i: number, pad = false): CItem => ({ role: "assistant", text: `a${i} devpos answer ${i}${pad ? " " + FILLER : ""}` });
 const D = (text: string): CItem => ({ dev: text });
 
-function buildBody(hist: CItem[]): Record<string, unknown> {
+function buildBody(hist: CItem[], instructions?: string): Record<string, unknown> {
     return {
         model: "gpt-test", stream: true,
+        ...(instructions !== undefined ? { instructions } : {}),
         input: hist.flatMap((it): Record<string, unknown>[] => {
             if ("dev" in it) return [{ role: "developer", content: it.dev }];
             if ("raw" in it) return [it.raw];
@@ -93,7 +98,7 @@ function sseText(text: string): string[] {
 
 interface Captured { raw: string; input: Record<string, unknown>[] }
 
-async function driveResponses(steps: Step[], mode: "plugin" | "proxy"): Promise<Captured[]> {
+async function driveResponses(steps: Step[], mode: "plugin" | "proxy" | "codex"): Promise<Captured[]> {
     const conv = `devpos-${mode}-${Date.now().toString(36)}`;
     const capturedRaw: string[] = [];
 
@@ -149,13 +154,17 @@ async function driveResponses(steps: Step[], mode: "plugin" | "proxy"): Promise<
                 hist.push({ pair: { args: step.fold, result: j.result!, id: step.pairId ?? "devpos_cmp" } });
             }
             const headers: Record<string, string> = { "content-type": "application/json" };
+            const bodyExtra: Record<string, unknown> = {};
             if (mode === "plugin") {
                 headers["x-bili-plugin"] = "omp-plugin/0.0.1";
                 headers["x-bili-plugin-conversation"] = conv;
+            } else if (mode === "codex") {
+                headers["user-agent"] = "codex_cli_rs/99.0.0-devpos-test";
+                bodyExtra.session_id = conv;
             } else {
                 headers["x-acp-session"] = conv;
             }
-            const resp = await fetch(base, { method: "POST", headers, body: JSON.stringify(buildBody(hist)) });
+            const resp = await fetch(base, { method: "POST", headers, body: JSON.stringify({ ...buildBody(hist, step.instructions), ...bodyExtra }) });
             if (resp.status !== 200) {
                 const detail = (await resp.text()).slice(0, 300);
                 assert.fail(`[${mode}] request failed: ${resp.status} ${detail}`);
@@ -336,4 +345,81 @@ test("responses proxy mode: hoist semantics unchanged — notifications are not 
     // Front block exists and carries the head system text.
     const f = frontDev(t2);
     assert.ok(f.content.includes(SYS), `${L(1)}: front block lost the head system text`);
+});
+
+test("responses codex proxy mode: mid-history developer items are position-preserved; front block byte-stable (#3227)", async () => {
+    const steps: Step[] = [
+        { send: [T(1)], instructions: SYS },
+        { send: [A(1), D(NOTIF1), T(2)], instructions: SYS },
+        { send: [A(2), D(NOTIF2), T(3)], instructions: SYS },
+    ];
+    const caps = await driveResponses(steps, "codex");
+    assert.equal(caps.length, 3, "expected 3 outbound bodies");
+    const L = (i: number) => `devpos/codex t${i + 1}`;
+
+    // Front developer block: carries the instructions text, never absorbs a
+    // mid-history notification, byte-identical across ALL turns — the prefix
+    // cache property the hoist broke for codex (#3227).
+    const fronts = caps.map((c) => frontDev(c));
+    for (const f of fronts) {
+        assert.ok(f.content.includes(SYS), `${L(0)}: front block lost the instructions text`);
+        assert.ok(!f.content.includes(NOTIF1), `front block must not absorb ${JSON.stringify(NOTIF1)}`);
+        assert.ok(!f.content.includes(NOTIF2), `front block must not absorb ${JSON.stringify(NOTIF2)}`);
+    }
+    assert.equal(JSON.stringify(fronts[1]!.content), JSON.stringify(fronts[0]!.content), "t2 front block bytes differ from t1 (prefix cache would miss)");
+    assert.equal(JSON.stringify(fronts[2]!.content), JSON.stringify(fronts[0]!.content), "t3 front block bytes differ from t1 (prefix cache would miss)");
+
+    // Notifications ride in place: exactly once, easy-form intact, between
+    // the prior assistant answer and the next user question.
+    const n1 = notifItems(caps[1]!, NOTIF1);
+    assert.equal(n1.length, 1, `${L(1)}: NOTIF1 in-place occurrences ${n1.length} != 1`);
+    const a1 = indexOfText(caps[1]!, "a1 devpos answer 1");
+    const q2 = indexOfText(caps[1]!, "q2 devpos question 2");
+    assert.ok(a1 >= 0 && q2 >= 0, `${L(1)}: anchor items missing (a1@${a1}, q2@${q2})`);
+    const n1Idx = caps[1]!.input.indexOf(n1[0]!);
+    assert.ok(n1Idx > a1 && n1Idx < q2, `${L(1)}: NOTIF1 at index ${n1Idx} not between a1@${a1} and q2@${q2}`);
+    assert.equal(notifItems(caps[1]!, NOTIF2).length, 0, `${L(1)}: NOTIF2 must not exist yet`);
+    assert.equal(notifItems(caps[2]!, NOTIF1).length, 1, `${L(2)}: NOTIF1 dropped from history`);
+    const n2 = notifItems(caps[2]!, NOTIF2);
+    assert.equal(n2.length, 1, `${L(2)}: NOTIF2 in-place occurrences != 1`);
+    const a2 = indexOfText(caps[2]!, "a2 devpos answer 2");
+    const q3 = indexOfText(caps[2]!, "q3 devpos question 3");
+    assert.ok(a2 >= 0 && q3 >= 0, `${L(2)}: anchor items missing (a2@${a2}, q3@${q3})`);
+    const n2Idx = caps[2]!.input.indexOf(n2[0]!);
+    assert.ok(n2Idx > a2 && n2Idx < q3, `${L(2)}: NOTIF2 at index ${n2Idx} not between a2@${a2} and q3@${q3}`);
+
+    // Append-only bodies: after stripping volatile tail items, the previous
+    // outbound input is an exact byte-prefix of the next.
+    for (let i = 1; i < caps.length; i++) {
+        const prev = stripVolatileTail(caps[i - 1]!.input);
+        const cur = stripVolatileTail(caps[i]!.input);
+        assert.equal(JSON.stringify(cur.slice(0, prev.length)), JSON.stringify(prev), `${L(i)}: previous input is not a byte-prefix of the next (mid-history mutation)`);
+    }
+
+    for (const c of caps) assert.ok(!c.raw.includes("__bili_inplace_sysdev"), "sentinel type leaked into forwarded body");
+});
+
+test("responses codex proxy mode: leading developer item still hoists to the head, stable across turns (#3227)", async () => {
+    const LEAD = "codex env context: cwd=/workspace, profile=default";
+    const steps: Step[] = [
+        { send: [D(LEAD), T(1)] },
+        { send: [A(1), D(NOTIF1), T(2)] },
+    ];
+    const caps = await driveResponses(steps, "codex");
+    assert.equal(caps.length, 2, "expected 2 outbound bodies");
+    const L = (i: number) => `devpos/codex-lead t${i + 1}`;
+
+    // The leading developer item is part of the head run: it stays hoisted
+    // into the front block (byte-stable), while mid-history items ride in place.
+    for (const c of caps) {
+        const f = frontDev(c);
+        assert.equal(f.index, 0, `${L(0)}: front block not at input[0]`);
+        assert.ok(f.content.includes(LEAD), `${L(0)}: leading developer item not hoisted to the head`);
+        assert.ok(!f.content.includes(NOTIF1), `${L(0)}: notification leaked into front block`);
+    }
+    assert.equal(JSON.stringify(frontDev(caps[1]!).content), JSON.stringify(frontDev(caps[0]!).content), "front block bytes differ across turns");
+    const n1 = notifItems(caps[1]!, NOTIF1);
+    assert.equal(n1.length, 1, `${L(1)}: NOTIF1 in-place occurrences != 1`);
+    const q2 = indexOfText(caps[1]!, "q2 devpos question 2");
+    assert.ok(q2 >= 0 && caps[1]!.input.indexOf(n1[0]!) < q2, `${L(1)}: NOTIF1 must precede q2@${q2}`);
 });

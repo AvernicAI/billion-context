@@ -242,8 +242,10 @@ and the injected prompt state explicitly that markers are proxy-emitted only.
 
 On the Responses lane the two modes also project mid-history `system`/`developer`
 items differently: plugin mode keeps them in place (`__bili_inplace_sysdev`,
-#1638 prefix-cache churn fix), proxy mode hoists them into the head developer
-block (#1085 hoist-and-anchor). A self-heal degrade-to-proxy (#2155) therefore
+#1638 prefix-cache churn fix) — as of #3227 so do Codex clients in native proxy
+mode (UA-detected via `isCodexClient`); other proxy clients keep the hoist into
+the head developer block (#1085 hoist-and-anchor). A self-heal degrade-to-proxy
+(#2155) therefore
 re-projects the SAME incoming history into different forwarded bytes — the
 forwarded-system fingerprint (#2350) flips even though the host changed nothing,
 and a naive ledger would book that under "host rewrote the system prompt".
