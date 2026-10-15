@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseCompressArgs } from "../src/parse-compress-input.js";
+import { COMPRESS_PARAMETERS, COMPRESS_TOOL_GOOGLE } from "../src/compress-tools.js";
 import { rebuildCompressionState } from "../src/rebuild.js";
 import { createInitialState } from "../src/state.js";
 import { defaultConfig } from "../src/config.js";
@@ -1321,4 +1322,50 @@ test("line-form header-only entries are accepted under dryRun only", () => {
   const real = parseCompressArgs({ content: ["m00001-m00005"] });
   assert.equal(real.ranges.length, 0);
   assert.equal(real.diagnostics.invalidItems, 1);
+});
+
+// ---------------------------------------------------------------------------
+// #3193 review: schema-shape guards (byte goldens alone missed these)
+// ---------------------------------------------------------------------------
+
+const SCHEMA_TOP_KEYS = new Set(["type", "properties", "required"]);
+
+test("compress schemas keep every declared field INSIDE properties (both wire shapes)", () => {
+  for (const [label, schema] of [
+    ["COMPRESS_PARAMETERS", COMPRESS_PARAMETERS],
+    ["COMPRESS_TOOL_GOOGLE.parameters", COMPRESS_TOOL_GOOGLE.parameters],
+  ] as const) {
+    const strays = Object.keys(schema).filter((k) => !SCHEMA_TOP_KEYS.has(k));
+    assert.deepEqual(strays, [], `${label} has keys outside type/properties/required: ${strays.join(", ")}`);
+    assert.ok(
+      schema.properties["dryRun"] !== undefined,
+      `${label}: dryRun must be a declared property`,
+    );
+  }
+});
+
+test("batch object branches do not force summary (dryRun previews omit it; parser enforces it on commits)", () => {
+  const content = COMPRESS_PARAMETERS.properties["content"] as { anyOf: Array<{ items?: unknown }> };
+  const arrayBranch = content.anyOf.find((b) => b.items !== undefined) as { items: { anyOf: Array<{ required?: string[] }> } };
+  const objectBranches = arrayBranch.items.anyOf.filter((b) => Array.isArray(b.required));
+  assert.ok(objectBranches.length >= 2, "both bound spellings present");
+  for (const branch of objectBranches) {
+    assert.ok(!branch.required!.includes("summary"), `"summary" must not be required in a batch object branch`);
+  }
+});
+
+test("batch dryRun without summaries parses to summary-less ranges", () => {
+  const parsed = parseCompressArgs({
+    dryRun: true,
+    content: [
+      { startId: "m00001", endId: "m00005" },
+      { startId: "m00006", endId: "m00010" },
+    ],
+  });
+  assert.equal(parsed.dryRun, true);
+  assert.equal(parsed.ranges.length, 2);
+  assert.deepEqual(
+    parsed.ranges.map((r) => r.summary),
+    ["", ""],
+  );
 });

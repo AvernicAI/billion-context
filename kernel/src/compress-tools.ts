@@ -107,13 +107,15 @@ export const COMPRESS_PARAMETERS = {
                 description:
                   "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line",
               },
+              // #3193 review: no "summary" in required — dryRun previews omit
+              // it; parseCompressArgs still enforces it for real commits.
               {
                 ...COMPRESS_RANGE_OBJECT,
-                required: ["startId", "endId", "summary"],
+                required: ["startId", "endId"],
               },
               {
                 ...COMPRESS_RANGE_OBJECT,
-                required: ["startRef", "endRef", "summary"],
+                required: ["startRef", "endRef"],
               },
             ],
           },
@@ -147,7 +149,7 @@ export const COMPRESS_PARAMETERS = {
     dryRun: {
       type: "boolean",
       description:
-        "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true; re-issue the same ranges with your summary to commit.",
+        "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true.",
     },
   },
 };
@@ -273,7 +275,7 @@ Each message in the conversation is annotated with a <acp tokens="2.1K" type="to
 
 You have five context-management tools:
 
-- compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\\nsummary…\\nm00300–m00350 Deploy\\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary (a valid JSON string: \\\" and \\n). A single range is the same shape with one block. Object entries {startId,endId,summary,topic?} in the content array are also accepted. Never split a batch into one call per range. Pass dryRun:true (omit summary) to preview a range without committing — the receipt reports validity, exclusions, withdrawals, and estimated savings; re-issue with your summary to commit.
+- compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\\nsummary…\\nm00300–m00350 Deploy\\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary (a valid JSON string: \\\" and \\n). A single range is the same shape with one block. Object entries {startId,endId,summary,topic?} in the content array are also accepted. Never split a batch into one call per range. For model-selected ranges, preview the whole batch first with dryRun:true (omit summaries): evaluate estimatedTokensSaved and exclusions, adjust or discard poor ranges, then write one summary per selected range and commit the whole batch in ONE call. Skip the preview only when committing fresh acp_status-recommended ranges verbatim.
 - decompress — Restore a previously compressed block's content. By default restores one tier up (T2→T1 summaries, not raw messages). Use full: true to restore all the way to original messages. Use toFile to write to file instead of inflating context. Example: decompress({ blockId: "b5" }) or decompress({ blockId: "b5", toFile: "path" }) or decompress({ blockId: "b5", full: true }).
 - search_context — Search compressed block summaries (and optionally visible messages) by keyword. Use BEFORE decompressing to find the right block. Example: search_context({ query: "auth token refresh" }).
 - acp_status — Context status with compressible ranges. No args = overview + ranges. Use to find what to compress next.`,
@@ -724,11 +726,11 @@ export const COMPRESS_TOOL_GOOGLE = {
           required: ["startId", "endId"],
         },
       },
-    },
-    dryRun: {
-      type: "boolean",
-      description:
-        "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true; re-issue the same ranges with your summary to commit.",
+      dryRun: {
+        type: "boolean",
+        description:
+          "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true.",
+      },
     },
     required: ["content"],
   },
