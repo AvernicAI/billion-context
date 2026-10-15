@@ -195,7 +195,7 @@ test("refreshDshProfileCopy: up-to-date copy never spawns dsh", async () => {
     }
 });
 
-test("refreshDshProfileCopy: an inflated out-of-band copy (local > registry) converges back + warns, never freezes (#3160)", async () => {
+test("refreshDshProfileCopy: an inflated out-of-band copy (local > registry) is left untouched + warned, never auto-downgraded (#3160)", async () => {
     const fx = makeFixture("1.2.9"); // profile a declares ^1.2.9 and reports 1.2.9 on disk
     const calls: string[] = [];
     const { log, entries } = makeLog();
@@ -204,8 +204,8 @@ test("refreshDshProfileCopy: an inflated out-of-band copy (local > registry) con
         await withRegistry("0.1.197", async () => {
             await refreshDshProfileCopy(fx.installDir, OPTS, fx.env, log);
         });
-        assert.deepEqual(calls, ["plugin --profile a add billion-context@0.1.197"]);
-        assert.ok(entries.some((l) => l.startsWith("warn") && l.includes("#3160")), `expected an out-of-band warn, got: ${entries.join(" | ")}`);
+        assert.deepEqual(calls, [], "an ahead copy must NOT be auto-downgraded (may be a deliberate local build)");
+        assert.ok(entries.some((l) => l.startsWith("warn") && l.includes("#3160") && l.includes("NOT auto-downgrade")), `expected a defer hint, got: ${entries.join(" | ")}`);
         assert.ok(!entries.some((l) => l.includes("up to date")), "an ahead copy must not be reported as up to date");
     } finally {
         _setDshRunnersForTest(undefined);

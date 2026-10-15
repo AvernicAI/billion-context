@@ -232,7 +232,7 @@ test("refreshDshDesktopCopy: absent desktop profile returns silently (#1575)", a
     assert.deepEqual(lines, []);
 });
 
-test("refreshDshDesktopCopy: an inflated out-of-band desktop copy (local > target) converges back + warns, never frozen (#3160)", { timeout: 30_000 }, async (t) => {
+test("refreshDshDesktopCopy: an inflated out-of-band desktop copy (local > target) is left untouched + warned, never auto-downgraded (#3160)", { timeout: 30_000 }, async (t) => {
     const root = mkdtempSync(path.join(tmpdir(), "bc-desktop-oob-"));
     const prevDshHome = process.env.DSH_HOME;
     const prevXdgCacheHome = process.env.XDG_CACHE_HOME;
@@ -252,9 +252,9 @@ test("refreshDshDesktopCopy: an inflated out-of-band desktop copy (local > targe
         const { lines, log } = captureLog();
         await refreshDshDesktopCopy("0.1.197", log, process.env);
 
-        assert.equal(await readDiskVersion(fx.flat), "0.1.197", "the inflated copy must be converged back to the verified registry version");
-        assert.equal(lstatSync(fx.flat).isDirectory(), true, "the pnpm link must be replaced by the real directory");
-        assert.ok(lines.some((l) => l.startsWith("warn:") && l.includes("#3160")), `expected an out-of-band warn, got: ${lines.join(" | ")}`);
+        assert.equal(await readDiskVersion(fx.flat), "1.2.9", "an ahead copy must NOT be auto-downgraded (may be a deliberate local build)");
+        assert.equal(lstatSync(fx.flat).isSymbolicLink(), true, "the pnpm link must be left exactly as found");
+        assert.ok(lines.some((l) => l.startsWith("warn:") && l.includes("#3160") && l.includes("NOT auto-downgrade")), `expected a defer hint, got: ${lines.join(" | ")}`);
     } catch (e) {
         if (String(e).includes("EPERM")) {
             t.skip("creating directory symlinks requires elevated privileges on this platform");

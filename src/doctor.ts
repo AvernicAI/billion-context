@@ -132,8 +132,9 @@ export function dshBundleShadowWarning(args: {
  *  and froze the #1196 self-heal forever. Pure decision (no fs, so publication
  *  status is NOT asserted here). Deliberate local pins and in-step / behind copies
  *  are not flagged. Advisory only — never changes the verdict, mirroring
- *  dshBundleShadowWarning; the self-heal converges back ONLY the provably-
- *  unpublished kind (see fetchPublishedVersions), this warning surfaces both. */
+ *  dshBundleShadowWarning; the self-heal never auto-downgrades an ahead copy
+ *  (#3160 owner follow-up), so this warning is the operator's signal to pin or
+ *  remove it (auto-quarantine of provably-unexplained copies lands in #3224). */
 export function dshOutOfBandCopyWarning(args: {
     packageName: string;
     profileName: string;
@@ -144,7 +145,7 @@ export function dshOutOfBandCopyWarning(args: {
     if (args.pinned) return undefined;
     if (args.copyVersion === undefined || args.registryVersion === undefined) return undefined;
     if (!isVersionNewer(args.copyVersion, args.registryVersion)) return undefined; // in step or behind
-    return `out-of-band copy: this profile's ${args.packageName} reports v${args.copyVersion}, AHEAD of the registry's tracked latest v${args.registryVersion}. Either a deliberate build from another tag (set updateTag or pin it) or a hand-placed/tampered copy (#3160); bili auto-converges only the provably-unpublished kind and leaves the rest for you to decide`;
+    return `out-of-band copy: this profile's ${args.packageName} reports v${args.copyVersion}, AHEAD of the registry's tracked latest v${args.registryVersion}. Either a deliberate build from another tag or a hand-placed/tampered copy (#3160); bili will NOT auto-downgrade it — pin it (profile dep \u2192 link:/file:, or point at your private registry) if deliberate, otherwise remove it`;
 }
 
 export async function runDoctor(opts: DoctorOpts): Promise<DoctorReport> {
