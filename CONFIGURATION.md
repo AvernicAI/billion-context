@@ -833,8 +833,8 @@ Since #2030 every pure-behavior knob has a config-file key alongside its env var
   "fakeCompletion": { "retries": 0, "bufCapBytes": 16777216 },
 
   // Scalars
-   "codexCompact": "intercept",            // or "pass"
-   "ccrRetrievalTtlMs": 600000,            // queued acp_retrieve expiry; 0 disables
+  "codexCompact": "intercept",            // or "pass"
+  "ccrRetrievalTtlMs": 600000,            // queued acp_retrieve expiry; 0 disables
   "decompressTmpCap": 50                  // max concurrent decompress temp files
 }
 ```
@@ -890,8 +890,8 @@ Since #2030 every pure-behavior knob has a config-file key alongside its env var
 
 ### `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap`
 
-- **Type:** `string` ("intercept" | "pass") / `string` ("intercept" | "pass") / `number` / `number`
-- **Default:** `"intercept"` / `"intercept"` / `600000` / `50`
+- **Type:** `string` ("intercept" | "pass") / `number` / `number`
+- **Default:** `"intercept"` / `600000` / `50`
 - **Status:** ACTIVE
 - **Description:** Top-level scalars. `codexCompact`: whether bili intercepts codex native-compaction requests and forges a local ACP handoff, or passes them upstream (twin `BILI_CODEX_COMPACT`; read per request, so either tier flips without restart). Scope (#3008): interception covers the explicit forms (the `/compact` trigger item and `POST /responses/compact`) and the inline auto-compact that transits as an ordinary turn, detected by its SUMMARIZATION_PROMPT template; a user-overridden compact_prompt falls out of detection and transits verbatim. Compaction bili only observed (pass mode / gate refusal) is rebased post-hoc onto the compacted history (#2372). `ccrRetrievalTtlMs`: expiry for queued-but-undelivered `acp_retrieve` injections, dropped loudly on expiry (twin `BILI_CCR_RETRIEVAL_TTL_MS`; `0` disables). `decompressTmpCap`: max concurrent decompress temp files (twin `BILI_DECOMPRESS_TMP_CAP`).
 
