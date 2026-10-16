@@ -320,7 +320,7 @@ function round1(n: number): number {
  *  sum of first-render token counts of all refs chronologically before it.
  *  Refs are assigned in message order and never reused (kernel contract),
  *  so numeric order IS view order. */
-function prefixTokensBeforeRef(session: Session, ref: string): number {
+export function prefixTokensBeforeRef(session: Session, ref: string): number {
     const byRef = session.state?.messageRefs?.byRef;
     const snap = session.state?.tokenSnapshot;
     if (!byRef || !snap || refNum(ref) === 0) return 0;
