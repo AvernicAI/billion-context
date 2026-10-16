@@ -344,6 +344,17 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             const url = e.request?.url;
             if (typeof url !== "string") return;
             if (options.route !== undefined) {
+                // #3308: prime the window map BEFORE the route decides — its
+                // degrade branch needs the model's context window to refuse a
+                // provably-oversized body locally instead of sending it direct
+                // into a guaranteed upstream 400. The harvest commits on
+                // microtasks, so with a slow catalog the first request still
+                // sees an empty map and keeps the documented fail-open; from
+                // the second request on the guard is armed even when bootstrap
+                // never landed. Launcher mode keeps today's ordering: harvesting
+                // without a detected proxy would only warn about headers bili
+                // never stamps there.
+                refreshWindows(ctx, state);
                 // Native mode: route owns discovery + rewriting (it is called
                 // per request even once state.proxyBase is known, because the
                 // URL rewrite must happen per request and env detection alone

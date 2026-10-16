@@ -28,10 +28,16 @@
 // and re-probe only after HEALTH_PROBE_TTL_MS, so a healthy proxy costs no
 // per-request RTT and a dead one is found within at most one TTL. If no origin
 // can be made healthy the request goes DIRECT (uncompressed) and a one-time
-// stderr warning fires — recovery is automatic once a proxy is healthy again
-// (no permanent latch; re-checked at least every TTL). Bootstrap retries are
-// rate-limited to one attempt per RESPAWN_COOLDOWN_MS so a persistently
-// failing spawn does not become a per-request spawn storm.
+// diagnostic lands in bili.log — EXCEPT when the body provably exceeds the
+// model's context window: per the #2924 ruling (always compress OR always
+// refuse) such a request is refused locally with a host-visible retryable
+// error instead of riding the direct fallback into a guaranteed upstream 400
+// (#3308 — on an over-window session history that 400 then repeats on every
+// later turn until restart). Unknown window/body keeps the fail-open.
+// Recovery is automatic once a proxy is healthy again (no permanent latch;
+// re-checked at least every TTL). Bootstrap retries are rate-limited to one
+// attempt per RESPAWN_COOLDOWN_MS so a persistently failing spawn does not
+// become a per-request spawn storm.
 //
 // Skipped when opted out (BILI_NATIVE_OPENCODE=0 / BILLION_CONTEXT_PLUGIN=0)
 // or when a `bili` /bili/ launch owns routing (BILI_PROVIDER_REWRITES). A
@@ -102,6 +108,35 @@ export function planNativeOpencode(env: NodeJS.ProcessEnv): { mode: "off" | "att
 
 export type OpencodeNativeRouteDeps = LiveOriginResolverDeps;
 
+/** #3308: client-side mirror of #2924's refuse-oversized arm for this lane
+ *  (the V2 route has no takeover gate to carry it). Returns a host-visible
+ *  refusal when the proxy is unavailable AND the body provably cannot fit the
+ *  model's context window — the FLOOR estimate (bytes/4) already exceeds the
+ *  window, and #2924's ledger evidence says real bodies run ABOVE the floor
+ *  (calibratedEstimate ~1.14), so the comparison cannot false-refuse. Unknown
+ *  model, unknown window, unreadable or absent body all return undefined and
+ *  keep the documented fail-open direct send. The size is measured through a
+ *  CLONE — the original Request must stay sendable (#2496 discipline). */
+async function oversizeDirectRefusal(e: V2HttpRequestEvent, s: V2State): Promise<Error | undefined> {
+    const model = e.model;
+    if (model === undefined || typeof model.providerID !== "string" || typeof model.id !== "string") return undefined;
+    const window = s.windows?.get(`${model.providerID}/${model.id}`);
+    if (window === undefined || !Number.isFinite(window) || window <= 0) return undefined;
+    const req = e.request as Request | undefined;
+    if (req === null || typeof req !== "object" || typeof req.clone !== "function") return undefined;
+    let bytes: number;
+    try {
+        bytes = (await req.clone().arrayBuffer()).byteLength;
+    } catch {
+        return undefined;
+    }
+    const floorTokens = Math.ceil(bytes / 4);
+    if (floorTokens <= window) return undefined;
+    return new Error(
+        `bili: proxy unavailable and this request cannot be sent uncompressed — body ~${floorTokens} tok (floor estimate ${bytes}B/4) exceeds the ${model.providerID}/${model.id} context window (${window}); upstream would reject it. Recovery is automatic (#3308); retry shortly, or start a fresh session if the local history has outgrown the window.`,
+    );
+}
+
 /** Build the native-mode route callback consumed by createOpencodeV2Setup.
  *  #1135: spawn and attach share ONE liveness gate — attach arms
  *  state.respawn (verifyAttachAndRecover), so a dead external proxy is
@@ -110,6 +145,7 @@ export type OpencodeNativeRouteDeps = LiveOriginResolverDeps;
 export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNativeRouteDeps = {}): (e: V2HttpRequestEvent, s: V2State) => Promise<void> {
     const resolveLive = createLiveOriginResolver(state, deps);
     let warned = false;
+    let refusedNoticed = false;
     // #1958: conflicting pre-routed config is exposed once per (session, origin).
     const conflictWarned = new Set<string>();
     return async (e, s) => {
@@ -151,6 +187,18 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
 
         const target = await resolveLive();
         if (target === undefined) {
+            // #3308: a direct send that provably cannot fit the window is not
+            // "availability" — refuse it locally (#2924 ruling) instead of
+            // handing upstream a request that can only 400.
+            const refusal = await oversizeDirectRefusal(e, s);
+            if (refusal !== undefined) {
+                if (!refusedNoticed) {
+                    refusedNoticed = true;
+                    logHostEvent("error", "[native-client]", `bili-native-opencode: proxy unavailable — model request refused locally instead of going direct into a guaranteed upstream 400 (#3308): ${refusal.message}`);
+                }
+                s.proxyBase = undefined;
+                throw refusal;
+            }
             if (!warned) {
                 warned = true;
                 logHostEvent("error", "[native-client]", "bili-native-opencode: proxy unavailable — model requests go direct (uncompressed)");
