@@ -1824,6 +1824,22 @@ export class SessionStore {
         this.dropResidentMetadata(session);
     }
 
+    /** #3050's folds assume the store can re-materialize what they drop —
+     *  true in every file-writing mode (the envelope is the fallback). Under
+     *  writerOff no file exists, so a session the sidecar has never ingested
+     *  (fresh index + failing ingest) would fold into a view no loader can
+     *  ever restore, and every later save would die on the refusal before the
+     *  3-strike self-disable could complete (#3135① interaction). Keep plain
+     *  maps until the index actually holds the session. */
+    private residentFoldAllowed(session: Session): boolean {
+        if (!this.writerOffActive()) return true;
+        try {
+            return this.shadow!.sessionUpdatedAt(session.id) !== null;
+        } catch {
+            return false;
+        }
+    }
+
     /** #3050 R3 ②a: once a save has captured the raw tail (envelope + the
      *  unified messages table via the ⑤ rawTail override), an idle session
      *  keeps only the bounded folded view resident — the exact shape a
@@ -1831,7 +1847,7 @@ export class SessionStore {
      *  saves (inFlight > 0) keep the raw tail: the live turn may still read
      *  it, and snapshotMessages re-arms the raw copy on the next request. */
     private foldResidentTail(session: Session): void {
-        if (session.inFlight > 0) return;
+        if (session.inFlight > 0 || !this.residentFoldAllowed(session)) return;
         const raw = session.lastMessages;
         if (!raw || raw.length === 0) return;
         session.lastMessages = boundedFoldedSnapshot(session);
@@ -1845,7 +1861,7 @@ export class SessionStore {
      *  exact record a restart would restore). Same refusal semantics as
      *  ②b: an unrecoverable drop throws instead of going empty. */
     private dropResidentMetadata(session: Session): void {
-        if (session.inFlight > 0 || !this.enabled) return;
+        if (session.inFlight > 0 || !this.enabled || !this.residentFoldAllowed(session)) return;
         if (isDroppedMetadata(session.metadata)) return;
         if (Object.keys(session.metadata).length === 0) return;
         // Hand-built sessions (tests, seeds) may carry no meta — the lazy
@@ -1863,7 +1879,7 @@ export class SessionStore {
      *  store-bound loader (one disk read per burst). Mid-turn saves keep the
      *  resident set; sessions that never persisted keep their plain map. */
     private dropResidentBlockContents(session: Session): void {
-        if (session.inFlight > 0 || !this.enabled) return;
+        if (session.inFlight > 0 || !this.enabled || !this.residentFoldAllowed(session)) return;
         const existing = session.blockContents;
         if (existing instanceof LazyBlockContents) {
             existing.drop();
