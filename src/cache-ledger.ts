@@ -1974,11 +1974,17 @@ function formatSeam(r: BiliCacheReport): string {
     if (r.seam.suspects > 0) {
         out.push("⚠ CACHE SEAM (suspected mid-history prefix breaks)");
         out.push(`  ${r.seam.suspects} sample(s) · ${fmtTok(r.seam.missed)} tok re-billed with no fold/switch/restart attribution`);
-        for (const e of r.seam.events) {
+        // #3307: seamEvents holds BOTH suspect and #3023 client-side events
+        // (one shared capped ring), so listing every event here echoed host-owned
+        // rewrites under the "suspected bili rebuild" header — the ✎ CLIENT
+        // section below already owns those. List only suspects here so the two
+        // sections stay disjoint and a client insert is never misread as a seam.
+        const suspectEvents = r.seam.events.filter((e) => !e.client);
+        for (const e of suspectEvents) {
             out.push(`    #${e.seq} ${fmtTime(e.at)} hit ${e.hitPct.toFixed(1)}% · input ${fmtTok(e.input)} · divergence ≥${fmtTok(e.lcpBytes)}B at message[${e.msgIndex ?? "?"}] of ${e.prevMsgs}→${e.curMsgs}`);
         }
-        if (r.seam.events.length === 0) {
-            out.push("    (no body-pair forensics on this lane — aggregate flag only; report the session + log if this persists)");
+        if (suspectEvents.length === 0) {
+            out.push("    (no body-pair forensics retained for the suspect samples on this lane — aggregate flag only; client-side rewrites are listed separately below)");
         }
         out.push("  if reproducible: /acp-cache detail:\"full\" + bili.log around the timestamps above (likely a #1548-family round-2/steady render seam)");
     }
