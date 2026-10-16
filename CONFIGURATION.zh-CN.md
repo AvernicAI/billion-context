@@ -123,6 +123,7 @@
 | `native.attachUrl` | string | unset (discover per lane) | BILI_MCP_PROXY | native hook 附着的显式目标源（任意 URL）。设置后，hook 只附着到该精确 origin 而不是自动发现，若其不在线则自行派生；仍需代码兼容并通过生命周期门禁。BILI_MCP_PROXY 环境变量（CLI --origin 亦会设置它）优先于此文件值；空/空白视为未设置。 |
 | `claude.nativePort` | number | unset (lane sticky zone port) | BILI_CLAUDE_NATIVE_PORT | claude 原生车道钩子派生代理的精确端口钉死（严格端口：被占用时响亮拒绝而非跳端口）。 |
 | `pi.subagents` | object \| boolean | {} (acp_delegate enabled with package defaults) | PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT | 内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 CONFIGURATION.md 的 pi 段。 |
+| `pi.inline` | boolean | false | BILI_PI_INLINE | pi 内联压缩通道（#3278）：pi 扩展在进程内直接压缩——不派生代理进程、无临时端口；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务。解析顺序 env > 文件 > 默认(off)：BILI_PI_INLINE=1/true 开启，BILI_PI_INLINE=0/false 显式关闭且优先于本文件值。 |
 
 **MITM 通道**
 
@@ -347,6 +348,7 @@
 | `BILI_NATIVE_OMP` | boolean-ish | off | — | 宿主姿态：标记 omp 原生插件进程。 |
 | `BILI_NATIVE_OPENCODE` | boolean-ish | off | — | 宿主姿态：标记 opencode 原生插件进程。 |
 | `BILI_NATIVE_PI` | boolean-ish | off | — | 宿主姿态：标记 pi 原生插件进程。 |
+| `BILI_PI_INLINE` | boolean-ish | off | — | 宿主姿态：pi 内联压缩通道（#3278）——pi 扩展在进程内通过伪源站直接压缩，不再另起代理进程；优先于预置的 BILLION_CONTEXT_PROXY 附着目标。 |
 | `BILI_NATIVE_ZCODE` | boolean-ish | off | — | 宿主姿态：标记 zcode 原生插件进程。 |
 | `BILI_PI_BIN` | string | pi (PATH lookup) | — | 宿主姿态：pi 客户端二进制的显式路径。 |
 | `BILI_DSH_BIN` | string | dsh (PATH lookup) | — | 宿主姿态：dsh 客户端二进制的显式路径。 |
@@ -1669,6 +1671,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | `persist.epermAlertThreshold` | 5 |
 | `BILI_PERSIST_TAIL_TOKENS` | `persist.tailTokens` | 16384 (0 disables message persistence) |
 | `BILI_PERSIST_ZSTD` | `persist.zstd` | false |
+| `BILI_PI_INLINE` | `pi.inline` | false |
 | `BILI_POST_RESPONSE_LINGER_MS` | `network.postResponseLingerMs` | 5000 |
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | 300000 |
 | `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | 30000 |

@@ -436,7 +436,28 @@ export function restartForceCloseOf(server: http.Server): (() => number) | undef
     return (server as RestartCapableServer)[RESTART_FORCE_CLOSE_KEY];
 }
 
-export async function startServer(opts: ProxyOptions): Promise<http.Server> {
+/** #3278: the pre-traffic half of startServer() — everything that runs before
+ *  a socket exists (tee logger, kernel core, instance identity, watcher seed,
+ *  session reload / lineage reconcile / GC timer, registry prefetch, admin ctx).
+ *  The HTTP listener is ONE consumer of this context; the in-process inline
+ *  engine (#3278) builds the SAME context without a socket, so both lanes share
+ *  identical session/persist/logger setup. */
+export interface EngineContext {
+    opts: ProxyOptions;
+    core: CompressionCore;
+    config: Config;
+    log: (level: string, msg: string) => void;
+    instanceId: string;
+    instanceStartedAt: number;
+    proxyWatchers: Set<number>;
+    initialWatcherPid: number | null;
+    /** #2941 health gate — the owning lane flips this once ITS announce step is done. */
+    markBootReady(): void;
+    bootReady(): boolean;
+    adminCtx: Parameters<typeof handleAdminRoute>[2];
+}
+
+export async function createEngineContext(opts: ProxyOptions): Promise<EngineContext> {
     // Configure the tee logger (file + stderr) BEFORE any logging so the very
     // first line (persist status) lands in the file too.
     const filePath = configureLogger(opts.logFile ?? defaultLogFile());
@@ -525,6 +546,24 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // per-model config. A miss falls back to the prefix table + default.
     void loadRegistry();
     const adminCtx = { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, bootReady: () => bootReady };
+    return {
+        opts,
+        core,
+        config,
+        log,
+        instanceId,
+        instanceStartedAt,
+        proxyWatchers,
+        initialWatcherPid,
+        markBootReady: () => { bootReady = true; },
+        bootReady: () => bootReady,
+        adminCtx,
+    };
+}
+
+export async function startServer(opts: ProxyOptions): Promise<http.Server> {
+    const engine = await createEngineContext(opts);
+    const { core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx } = engine;
 
     const dispatch = async (req: http.IncomingMessage, res: http.ServerResponse): Promise<void> => {
         armRequestWatchdog(req, res, log);
@@ -1118,7 +1157,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
         // #2941: LAST statement — registration above is done; degraded boots
         // (best-effort write failed) still flip ready, serving as before.
-        bootReady = true;
+        engine.markBootReady();
     };
     // #2941: after a successful bind, verify we are the SOLE owner of the
     // port before registering. Where socket semantics tolerate a concurrent
