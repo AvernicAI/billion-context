@@ -175,13 +175,13 @@ test("#3185 switch: served schema + prompt toggle with the knob (one gate serves
         const off = withDryRunCompress(BILI_ACP_TOOLS_OPENAI, COMPRESS_TOOL_OPENAI_DRYRUN);
         assert.deepEqual(off, BILI_ACP_TOOLS_OPENAI, "off -> base array served untouched");
         const compOff = off.find((t) => t.function.name === "compress")!;
-        assert.ok(!("dryRun" in compOff.function.parameters.properties), "off -> no dryRun field in schema");
+        assert.ok(!("dryRun" in (compOff.function.parameters.properties ?? {})), "off -> no dryRun field in schema");
         assert.ok(!buildCompressSystemPrompt().includes("dryRun"), "off -> no strategy sentence in prompt");
 
         process.env.BILI_COMPRESS_DRYRUN = "1";
         const on = withDryRunCompress(BILI_ACP_TOOLS_OPENAI, COMPRESS_TOOL_OPENAI_DRYRUN);
         const compOn = on.find((t) => t.function.name === "compress")!;
-        assert.ok("dryRun" in compOn.function.parameters.properties, "on -> dryRun field served");
+        assert.ok("dryRun" in (compOn.function.parameters.properties ?? {}), "on -> dryRun field served");
         assert.ok(buildCompressSystemPrompt().includes("preview the whole batch first with dryRun:true"), "on -> strategy sentence present");
     } finally {
         if (saved === undefined) delete process.env.BILI_COMPRESS_DRYRUN;
