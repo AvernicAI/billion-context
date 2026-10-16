@@ -96,6 +96,8 @@ function degradeReason(): string {
                 return `SQLite self-download blocked (${b.detail ?? "unknown"}), retrying after cooldown`;
             case "unsupported-platform":
                 return `unsupported platform for SQLite self-download (${b.detail ?? "?"})`;
+            case "unsupported-node":
+                return `Node too old for SQLite self-download (${b.detail ?? "?"}); legacy JSON storage remains`;
             case "disabled":
                 return "SQLite self-download disabled by configuration";
             case "failed":

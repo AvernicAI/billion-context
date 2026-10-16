@@ -14,8 +14,13 @@
  *
  * Artifact: better-sqlite3 v13 ships N-API prebuilds for all eight
  * platform/arch combinations INSIDE its npm tarball (no install script, no
- * per-ABI split — N-API is ABI-stable across Node versions). We pin version +
- * sha512 in-repo; bumping either is a human-visible PR. Download egress honors
+ * per-ABI split). N-API keeps the LOAD ABI stable across Node versions, but
+ * it does not make an addon safe outside its declared range: the v13 line
+ * declares engines.node ">=22", and under Node 20 the prebuilt loads fine yet
+ * SIGSEGVs at Database construction (#3341) — so each spec carries its own
+ * minNodeMajor floor and runBootstrap enforces it for BOTH the download and
+ * the cached-copy registration paths. We pin version + sha512 (+ floor)
+ * in-repo; bumping any of them is a human-visible PR. Download egress honors
  * the same proxy decision chain as model traffic (#609) and the configured
  * registry mirror (BILI_UPDATE_REGISTRY / update.registry).
  *
@@ -39,16 +44,25 @@ import { fileStorageAutoDownload, fileStorageUnified, resolveStorageMode, resolv
 import { normalizeRegistryBase } from "../update.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 
-interface EngineBootstrapSpec {
+export interface EngineBootstrapSpec {
     version: string;
     /** sha512 base64 digest of the registry tarball — pinned in-repo, verified on every download. */
     sha512Base64: string;
+    /** Minimum Node major this artifact line supports (its own engines.node floor).
+     *  Absent = no known floor. Loading below the floor is undefined behavior —
+     *  better-sqlite3 v13 loads yet SIGSEGVs at Database construction on Node 20
+     *  (#3341) — so the floor gates download AND cache registration. */
+    minNodeMajor?: number;
 }
 
-/** Pinned engine artifact (#2833). Bump version AND digest together in one PR. */
+/** Pinned engine artifact (#2833). Bump version AND digest (+ floor when the
+ *  line's engine range moves) together in one PR. */
 const DEFAULT_ENGINE_SPEC: Readonly<EngineBootstrapSpec> = Object.freeze({
     version: "13.0.3",
     sha512Base64: "RbOBxmLBG8uvFUc15X9+9SFemKcQ0WBuISBVkpuiaUB2qblC8UWlHEjdWVoZ8AdhSwmoEgsiXKfopX0CQxaACQ==",
+    // better-sqlite3 v13 line declares engines.node ">=22" (first N-API line;
+    // v12.x was the last to support Node 20). Enforced by specRunsOnNode (#3341).
+    minNodeMajor: 22,
 });
 
 const SUPPORTED_TARGETS = [
@@ -61,12 +75,13 @@ const SUPPORTED_TARGETS = [
 const BOOTSTRAP_TIMEOUT_MS = 10_000;
 export const COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
-type BootstrapStatus =
+export type BootstrapStatus =
     | "not-needed"
     | "cache-hit"
     | "downloaded"
     | "disabled"
     | "unsupported-platform"
+    | "unsupported-node"
     | "cooldown"
     | "failed";
 
@@ -77,6 +92,7 @@ export interface BootstrapOutcome {
 
 let specOverride: EngineBootstrapSpec | null = null;
 let platformOverride: string | null = null;
+let nodeVersionOverride: string | null = null;
 let inFlight: Promise<BootstrapOutcome> | null = null;
 
 /** Test seam: swap the pinned artifact (version/sha) for a hermetic fixture. */
@@ -89,9 +105,25 @@ export function setPlatformKeyForTests(key: string | null): void {
     platformOverride = key;
 }
 
+/** Test seam: pretend the process runs a different Node version (null = real). */
+export function setNodeVersionForTests(v: string | null): void {
+    nodeVersionOverride = v;
+}
+
 /** Test seam: drop the process-dedup promise so the next call re-runs. */
 export function resetEngineBootstrapForTests(): void {
     inFlight = null;
+    nodeVersionOverride = null;
+}
+
+/** True iff the artifact's declared Node floor is met by `nodeVersion`
+ *  ("v20.20.2" / "22"). Unparseable versions fail closed — an unknown runtime
+ *  must not receive a native module it may crash on (#3341). */
+export function specRunsOnNode(spec: EngineBootstrapSpec, nodeVersion: string): boolean {
+    const floor = spec.minNodeMajor ?? 0;
+    const m = /^v?(\d+)/.exec(nodeVersion.trim());
+    if (!m) return false;
+    return parseInt(m[1], 10) >= floor;
 }
 
 function activeSpec(): EngineBootstrapSpec {
@@ -206,6 +238,14 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
     }
     const spec = activeSpec();
     const target = platformOverride ?? platformTargetKey();
+    const nodeVersion = nodeVersionOverride ?? process.version;
+    if (!specRunsOnNode(spec, nodeVersion)) {
+        // Below the artifact's declared floor the prebuilt loads yet crashes at
+        // Database construction (#3341) — refuse BOTH download and cached-copy
+        // registration; builtin/host engines or legacy JSON storage remain.
+        loggerLog("info", `[storage] sqlite engine self-bootstrap skipped: pinned better-sqlite3@${spec.version} requires Node >= ${spec.minNodeMajor} (running ${nodeVersion}) — no self-downloaded engine on this runtime`);
+        return { status: "unsupported-node", detail: `${nodeVersion} < v${spec.minNodeMajor}` };
+    }
     if (cacheUsable(finalDir(spec.version), target)) {
         if (!tryRegisterFromCache(finalDir(spec.version))) {
             // Bytes were sha-verified when cached, so an unloadable copy means

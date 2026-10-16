@@ -46,7 +46,9 @@ import {
     platformTargetKey,
     resetEngineBootstrapForTests,
     setEngineBootstrapSpecForTests,
+    setNodeVersionForTests,
     setPlatformKeyForTests,
+    specRunsOnNode,
     type BootstrapOutcome,
 } from "../src/storage/engine-bootstrap.ts";
 import { resolveSqliteAutoDownload } from "../src/knobs.ts";
@@ -188,6 +190,7 @@ function resetAllSeams(): void {
     clearSelfDownloadedEngineForTests();
     setEngineBootstrapSpecForTests(null);
     setPlatformKeyForTests(null);
+    setNodeVersionForTests(null);
     resetEngineBootstrapForTests();
 }
 
@@ -558,6 +561,144 @@ test("bootstrap: unsupported platform key -> no download attempt", async () => {
             const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
             assert.equal(out.status, "unsupported-platform");
             assert.equal(out.detail, "freebsd-arm64");
+            assert.equal(reg!.requests(), 0);
+        });
+    } finally {
+        await reg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// NODE FLOOR GATE (#3341): the pinned artifact's own engines.node floor must
+// gate BOTH the download and the cached-copy registration — below it the
+// prebuilt loads yet SIGSEGVs at Database construction on Node 20.
+// ---------------------------------------------------------------------------
+
+/** Pre-populate a COMPLETE usable cache dir so cacheUsable() passes without
+ *  any network traffic. */
+function populateCache(cachePrev: string): string {
+    const dir = path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-13.0.3");
+    fs.mkdirSync(path.join(dir, "lib"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "prebuilds"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "better-sqlite3", version: "13.0.3" }));
+    fs.writeFileSync(path.join(dir, "lib", "index.js"), FAKE_LIB_INDEX);
+    fs.writeFileSync(path.join(dir, "prebuilds", `${platformTargetKey()}.node`), Buffer.from("FAKE-NODE-BINARY"));
+    return dir;
+}
+
+test("specRunsOnNode: enforces the artifact's declared Node floor (#3341)", () => {
+    const spec = { version: "13.0.3", sha512Base64: "x", minNodeMajor: 22 };
+    assert.equal(specRunsOnNode(spec, "v20.20.2"), false, "Node 20 is below the v13 line's floor");
+    assert.equal(specRunsOnNode(spec, "20.19.5"), false);
+    assert.equal(specRunsOnNode(spec, "v21.7.3"), false);
+    assert.equal(specRunsOnNode(spec, "v22.0.0"), true);
+    assert.equal(specRunsOnNode(spec, "v22.11.0"), true);
+    assert.equal(specRunsOnNode(spec, "v24.22.0"), true);
+    assert.equal(specRunsOnNode(spec, ""), false, "unparseable fails closed");
+    assert.equal(specRunsOnNode(spec, "garbage"), false, "unparseable fails closed");
+    assert.equal(specRunsOnNode({ version: "1", sha512Base64: "x" }, "v20.20.2"), true, "absent floor = no gate");
+});
+
+test("bootstrap: Node below the artifact floor -> unsupported-node, no fetch, no registration (#3341)", async () => {
+    const cachePrev = isolateCache();
+    let reg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 22 });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        setNodeVersionForTests("v20.20.2");
+        reg = await startMockRegistry(tgz);
+        await withRegistry(reg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "unsupported-node");
+            assert.match(out.detail ?? "", /v20\.20\.2 < v22/);
+            assert.equal(reg!.requests(), 0, "floor gate must not touch the network");
+            assert.ok(!fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-13.0.3")), "no cache dir created");
+            assert.ok(!fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", ".bootstrap-failed.json")), "deterministic condition must not arm the cooldown");
+            // The loader must NOT be registered: opening hits the no-engine contract.
+            assert.throws(() => openSqliteDatabase(":memory:"), (err: Error) => err.message.includes("no SQLite engine available"));
+        });
+    } finally {
+        await reg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+test("bootstrap: stale cached copy is NOT registered below the floor (#3341)", async () => {
+    const cachePrev = isolateCache();
+    let reg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 22 });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        setNodeVersionForTests("v20.20.2");
+        const dir = populateCache(cachePrev);
+        reg = await startMockRegistry(tgz);
+        await withRegistry(reg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "unsupported-node");
+            assert.equal(reg!.requests(), 0, "stale cache must not trigger a re-download either");
+            // Loading this cached copy is exactly what segfaulted (#3341) — prove
+            // the registration path was refused, and that the copy stays intact.
+            assert.throws(() => openSqliteDatabase(":memory:"), (err: Error) => err.message.includes("no SQLite engine available"));
+            assert.ok(fs.existsSync(path.join(dir, "lib", "index.js")), "cache untouched");
+        });
+    } finally {
+        await reg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+test("bootstrap: at/above the floor the cached copy still registers (gate does not over-block)", async () => {
+    const cachePrev = isolateCache();
+    let reg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 22 });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        setNodeVersionForTests("v22.11.0");
+        populateCache(cachePrev);
+        reg = await startMockRegistry(tgz);
+        await withRegistry(reg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "cache-hit");
+            assert.equal(reg!.requests(), 0);
+            const o = openSqliteDatabase(":memory:");
+            assert.equal(o.engine, "better-sqlite3");
+            assert.equal(o.source, "self-downloaded");
+            o.db.close();
+        });
+    } finally {
+        await reg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+test("bootstrap: unparseable process version fails closed (skip, no fetch)", async () => {
+    const cachePrev = isolateCache();
+    let reg: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz), minNodeMajor: 22 });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        setNodeVersionForTests("??unknown??");
+        reg = await startMockRegistry(tgz);
+        await withRegistry(reg.base, async () => {
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "unsupported-node");
             assert.equal(reg!.requests(), 0);
         });
     } finally {
