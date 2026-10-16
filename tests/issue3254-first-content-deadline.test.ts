@@ -243,13 +243,15 @@ const ROUTES: ProviderRoutes = {
     },
 };
 
-test("#3254 F: cascade — model > route > global, 0 wins at its level, gap inherits initial", () => {
-    // all absent → feature off
-    assert.equal(resolveFirstContentDeadlines({}, undefined, undefined, undefined), undefined);
-    // global tier alone; gap inherits the resolved initial
+test("#3254 F: cascade — model > route > global, 0 wins at its level, absent falls to built-in, gap inherits initial", () => {
+    // all absent → OUT-OF-THE-BOX built-in default (feature ON by default, #3254 round-3)
+    assert.deepEqual(resolveFirstContentDeadlines({}, undefined, undefined, undefined), { initialMs: 720000, initialSource: "builtin", gapMs: 720000, gapSource: "builtin" });
+    // global tier alone; gap inherits the resolved initial ceiling
     assert.deepEqual(resolveFirstContentDeadlines({}, "https://any.example", undefined, { firstContentTimeoutMs: 180000 }), { initialMs: 180000, initialSource: "config", gapMs: 180000, gapSource: "config" });
-    // global gap-only (valid: initial stays off)
-    assert.deepEqual(resolveFirstContentDeadlines({}, "https://any.example", undefined, { contentGapTimeoutMs: 300000 }), { gapMs: 300000, gapSource: "config" });
+    // global gap-only: initial is ABSENT so it falls to the built-in default; gap takes the explicit value
+    assert.deepEqual(resolveFirstContentDeadlines({}, "https://any.example", undefined, { contentGapTimeoutMs: 300000 }), { initialMs: 720000, initialSource: "builtin", gapMs: 300000, gapSource: "config" });
+    // explicit 0 at the GLOBAL tier disables every phase (opt-out escape hatch overrides the built-in)
+    assert.equal(resolveFirstContentDeadlines({}, "https://any.example", undefined, { firstContentTimeoutMs: 0 }), undefined);
     // route beats global
     assert.deepEqual(resolveFirstContentDeadlines(ROUTES, "https://relay-a.example/v1/messages", undefined, { firstContentTimeoutMs: 180000 }), { initialMs: 600000, initialSource: "config", gapMs: 600000, gapSource: "config" });
     // model beats route
@@ -283,7 +285,7 @@ test("#3254 G: loadRoutes rejects malformed deadline values at provider and mode
 
 // --- I: adaptive deadline math ----------------------------------------------
 
-test("#3254 I: fcP95 + adaptiveDeadlineMs — cold undefined, clamp band, explicit ceiling", () => {
+test("#3254 I: fcP95 + adaptiveDeadlineMs — cold undefined, [floor, ceiling] clamp, ceiling follows resolved value", () => {
     assert.equal(fcP95([42]), 42);
     // nearest-rank: at n=8 the rank is ceil(0.95×8)=8 → the max; at n=20 it is 19 → second-highest
     assert.equal(fcP95([5, 10, 15, 20, 25, 30, 35, 40]), 40);
@@ -292,12 +294,16 @@ test("#3254 I: fcP95 + adaptiveDeadlineMs — cold undefined, clamp band, explic
     assert.equal(adaptiveDeadlineMs(Array.from({ length: FC_ADAPTIVE_MIN_SAMPLES - 1 }, () => 20000), 180000), undefined, "one below MIN_SAMPLES is still cold");
     // p95=20000 → 3×=60000 → clamped UP to the 120s floor
     assert.equal(adaptiveDeadlineMs(Array.from({ length: FC_ADAPTIVE_MIN_SAMPLES }, () => 20000), 180000), 120000);
-    // p95=200000 → 3×=600000 → the cap
+    // p95=200000 → 3×=600000 → exactly the 600000 ceiling passed here
     assert.equal(adaptiveDeadlineMs(Array.from({ length: FC_ADAPTIVE_MIN_SAMPLES }, () => 200000), 600000), 600000);
-    // mid-band: p95=50000 → 150000, below the explicit value
+    // mid-band: p95=50000 → 150000, below the ceiling
     assert.equal(adaptiveDeadlineMs(Array.from({ length: FC_ADAPTIVE_MIN_SAMPLES }, () => 50000), 180000), 150000);
-    // explicit ceiling: a user-pinned tighter value never gets relaxed
+    // a user-pinned tighter ceiling is never relaxed upward (floor yields to it)
     assert.equal(adaptiveDeadlineMs(Array.from({ length: FC_ADAPTIVE_MIN_SAMPLES }, () => 20000), 60000), 60000);
+    // ceiling FOLLOWS the resolved value (no hardcoded 600s cap): a slow route
+    // (p95=300s → 3×=900s) under a 720s ceiling keeps its full 720s instead of
+    // discontinuously dropping to ≤600s once warm (#3254 round-3 point ③)
+    assert.equal(adaptiveDeadlineMs(Array.from({ length: FC_ADAPTIVE_MIN_SAMPLES }, () => 300000), 720000), 720000);
 });
 
 // --- J: resolver with adaptive samples --------------------------------------
@@ -306,9 +312,10 @@ test("#3254 J: warm routes adapt (source=adaptive) under their configured ceilin
     const globals = { firstContentTimeoutMs: 180000 };
     const warm = Array.from({ length: FC_ADAPTIVE_MIN_SAMPLES }, () => 20000);
     // warm initial, no gap samples yet: initial adapts to the floor; the
-    // INHERITED gap has no gap samples of its own and stays on config
+    // INHERITED gap has no gap samples of its own and sits at the inherited
+    // initial CEILING (the configured bound, not the tightened value)
     assert.deepEqual(resolveFirstContentDeadlines({}, "https://any.example", undefined, globals, { init: warm, gap: [] }), {
-        initialMs: 120000, initialSource: "adaptive", gapMs: 120000, gapSource: "config",
+        initialMs: 120000, initialSource: "adaptive", gapMs: 180000, gapSource: "config",
     });
     // both phases warm in-band: p95=50000 → 150000 each
     const mid = Array.from({ length: FC_ADAPTIVE_MIN_SAMPLES }, () => 50000);

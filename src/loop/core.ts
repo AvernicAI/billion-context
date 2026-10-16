@@ -217,8 +217,8 @@ export interface LoopCtx {
     firstContentDeadline?: {
         initialMs?: number;
         gapMs?: number;
-        initialSource?: "config" | "adaptive";
-        gapSource?: "config" | "adaptive";
+        initialSource?: "config" | "adaptive" | "builtin";
+        gapSource?: "config" | "adaptive" | "builtin";
     };
     /** #3254 follow-up: route key (providers URL prefix, else host) under
      *  which this session's healthy first-content durations are sampled in
@@ -519,12 +519,13 @@ export async function* runCompressLoop(
     // every adapter's SSE iterator swallows that rejection as EOF, so the
     // consumption loop below exits cleanly) and the turn ends
     // with ONE clean in-band error — deliberately NO internal refetch
-    // (#3254 decision C-rejected: the client's retry ladder re-arms with
-    // backoff, which beats hammering the same stalled slot).
+    // (#3254 decision C-rejected: an in-band error fails the turn cleanly and
+    // lets clients that HAVE a retry ladder back off and retry, instead of
+    // hammering the same stalled slot; clients without one simply stop).
     let activeKill: (() => void) | null = null;
     let contentDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
     let contentDeadlineArmedAt = 0;
-    let contentDeadlineInfo: { ms: number; phase: "initial" | "gap"; round: number; source: "config" | "adaptive" } | null = null;
+    let contentDeadlineInfo: { ms: number; phase: "initial" | "gap"; round: number; source: "config" | "adaptive" | "builtin" } | null = null;
     let contentDeadlineKilled = false;
     let contentDeadlineSettled = true;
     let upstreamAttemptNo = 0;
@@ -553,7 +554,7 @@ export async function* runCompressLoop(
         loggerLog("warn", `[acp-loop] session ${ctx.session.id} ${line}`);
         activeKill?.();
     };
-    const armContentDeadline = (ms: number, phase: "initial" | "gap", roundNo: number, source: "config" | "adaptive") => {
+    const armContentDeadline = (ms: number, phase: "initial" | "gap", roundNo: number, source: "config" | "adaptive" | "builtin") => {
         clearContentDeadline();
         contentDeadlineInfo = { ms, phase, round: roundNo, source };
         contentDeadlineArmedAt = Date.now();

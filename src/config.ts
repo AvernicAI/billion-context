@@ -2430,43 +2430,54 @@ export function parseDeadlineMs(fieldPath: string, value: unknown): number | und
 
 // #3254: three-level cascade (model > provider route > global network.*) for
 // the model-content deadlines. An explicit 0 wins AT ITS LEVEL (disables that
-// phase, no fall-through); an absent field inherits the next level down.
-// contentGapTimeoutMs inherits the resolved initial deadline when left absent.
-// Returns undefined when every phase is off or absent (feature fully off).
+// phase, no fall-through) AND overrides the built-in default — it is the opt-out
+// escape hatch for legitimately-slow routes. An ABSENT field falls back to the
+// built-in out-of-the-box default below (the feature is ON by default, #3254
+// round-3 "开箱即用"). contentGapTimeoutMs inherits the resolved initial ceiling
+// when left absent.
+/** #3254 round-3 out-of-the-box default (owner directive): when no tier sets a
+ *  value, each phase defaults to this bound instead of staying off. Chosen at
+ *  the conservative end of the candidate band — high enough not to false-kill
+ *  legitimate long prefills, still under the codex-webui client's ~780s content
+ *  watchdog so bili acts first with a clean logged error rather than the client
+ *  killing opaquely. SINGLE named constant: retuning the default is one line. */
+export const FC_BUILTIN_DEFAULT_MS = 720_000;
 /** #3254 follow-up (owner point 5): per-route adaptive refinement of the
- *  configured deadlines. Each route's HEALTHY first-content durations are
- *  sampled into session metadata as requests complete cleanly; once a route
- *  accumulates enough samples its deadline stops being a guess and hugs its
- *  own normal water level. */
+ *  deadlines. Each route's HEALTHY first-content durations are sampled into
+ *  session metadata as requests complete cleanly; once a route accumulates
+ *  enough samples its deadline stops being a guess and hugs its own normal
+ *  water level. */
 export const FC_ADAPTIVE_MIN_SAMPLES = 8;
 /** Per-route sample window (oldest evicted past this). */
 export const FC_ADAPTIVE_WINDOW = 32;
-/** Owner-specified clamp band for the adaptive value. */
+/** Adaptive floor: a warm route's deadline is never tightened below this, so a
+ *  fast route doesn't get an absurdly tight bound. */
 export const FC_ADAPTIVE_FLOOR_MS = 120_000;
-export const FC_ADAPTIVE_CAP_MS = 600_000;
 
 export function fcP95(values: number[]): number {
     const sorted = [...values].sort((a, b) => a - b);
     return sorted[Math.max(0, Math.min(sorted.length - 1, Math.ceil(0.95 * sorted.length) - 1))];
 }
 
-/** clamp(3 × p95(samples), FLOOR, CAP), then capped by the EXPLICIT config
- *  value: explicit config is always the ceiling — adaptation only tightens
- *  toward measured reality, never relaxes a value the user pinned. Returns
- *  undefined while the route is still cold (fewer than MIN_SAMPLES). */
-export function adaptiveDeadlineMs(samples: number[] | undefined, explicitMs: number): number | undefined {
+/** Clamp 3 × p95(samples) into [FLOOR, ceiling]: never tighter than FLOOR on a
+ *  warm route, never looser than the effective ceiling (built-in or explicit).
+ *  The ceiling FOLLOWS the resolved value instead of a hardcoded cap — otherwise
+ *  a cold route running at e.g. 720s would discontinuously drop to ≤600s once it
+ *  warms up (#3254 round-3 point ③). Returns undefined while the route is still
+ *  cold (fewer than MIN_SAMPLES). */
+export function adaptiveDeadlineMs(samples: number[] | undefined, ceilingMs: number): number | undefined {
     if (!samples || samples.length < FC_ADAPTIVE_MIN_SAMPLES) return undefined;
-    const clamped = Math.max(FC_ADAPTIVE_FLOOR_MS, Math.min(FC_ADAPTIVE_CAP_MS, 3 * fcP95(samples)));
-    return Math.min(explicitMs, clamped);
+    return Math.min(Math.max(3 * fcP95(samples), FC_ADAPTIVE_FLOOR_MS), ceilingMs);
 }
 
 export interface FirstContentDeadlines {
     initialMs?: number;
     gapMs?: number;
     /** Which source produced each phase's value — lands in the fire log so
-     *  config→adaptive cutover never changes the log format (#3254 point 5). */
-    initialSource?: "config" | "adaptive";
-    gapSource?: "config" | "adaptive";
+     *  config→adaptive cutover never changes the log format (#3254 point 5).
+     *  "builtin" = the out-of-the-box default (no tier set a value). */
+    initialSource?: "config" | "adaptive" | "builtin";
+    gapSource?: "config" | "adaptive" | "builtin";
 }
 
 export function resolveFirstContentDeadlines(
@@ -2478,24 +2489,24 @@ export function resolveFirstContentDeadlines(
 ): FirstContentDeadlines | undefined {
     const route = findRoute(routes, upstreamUrl);
     const entry = model ? route?.models?.[model] : undefined;
-    const initialExplicit = parseDeadlineMs("firstContentTimeoutMs", entry?.firstContentTimeoutMs ?? route?.firstContentTimeoutMs ?? globals?.firstContentTimeoutMs);
-    const gapExplicit = parseDeadlineMs("contentGapTimeoutMs", entry?.contentGapTimeoutMs ?? route?.contentGapTimeoutMs ?? globals?.contentGapTimeoutMs);
+    const initialRaw = parseDeadlineMs("firstContentTimeoutMs", entry?.firstContentTimeoutMs ?? route?.firstContentTimeoutMs ?? globals?.firstContentTimeoutMs);
+    const gapRaw = parseDeadlineMs("contentGapTimeoutMs", entry?.contentGapTimeoutMs ?? route?.contentGapTimeoutMs ?? globals?.contentGapTimeoutMs);
+    // ABSENT → built-in default (feature ON by default, #3254 round-3); EXPLICIT
+    // 0 → phase off, overriding the built-in (opt-out escape hatch). A gap left
+    // absent inherits the initial ceiling and adapts on its own gap samples.
+    const initialCeiling = initialRaw === undefined ? FC_BUILTIN_DEFAULT_MS : initialRaw;
+    const gapCeiling = gapRaw === undefined ? initialCeiling : gapRaw;
     const out: FirstContentDeadlines = {};
-    if (initialExplicit !== undefined && initialExplicit > 0) {
-        const adaptive = adaptiveDeadlineMs(samples?.init, initialExplicit);
-        out.initialMs = adaptive !== undefined ? adaptive : initialExplicit;
-        out.initialSource = adaptive !== undefined ? "adaptive" : "config";
+    if (initialCeiling > 0) {
+        const adaptive = adaptiveDeadlineMs(samples?.init, initialCeiling);
+        out.initialMs = adaptive !== undefined ? adaptive : initialCeiling;
+        out.initialSource = adaptive !== undefined ? "adaptive" : (initialRaw === undefined ? "builtin" : "config");
     }
-    // Explicit 0 disables the phase at its level (no fall-through); an ABSENT
-    // gap inherits the resolved initial value and adapts on gap samples.
-    if (gapExplicit !== undefined && gapExplicit > 0) {
-        const adaptive = adaptiveDeadlineMs(samples?.gap, gapExplicit);
-        out.gapMs = adaptive !== undefined ? adaptive : gapExplicit;
-        out.gapSource = adaptive !== undefined ? "adaptive" : "config";
-    } else if (gapExplicit === undefined && out.initialMs !== undefined) {
-        const adaptive = adaptiveDeadlineMs(samples?.gap, out.initialMs);
-        out.gapMs = adaptive !== undefined ? adaptive : out.initialMs;
-        out.gapSource = adaptive !== undefined ? "adaptive" : "config";
+    if (gapCeiling > 0) {
+        const adaptive = adaptiveDeadlineMs(samples?.gap, gapCeiling);
+        out.gapMs = adaptive !== undefined ? adaptive : gapCeiling;
+        const baseSource = gapRaw === undefined ? (initialRaw === undefined ? "builtin" : "config") : "config";
+        out.gapSource = adaptive !== undefined ? "adaptive" : baseSource;
     }
     return out.initialMs !== undefined || out.gapMs !== undefined ? out : undefined;
 }
