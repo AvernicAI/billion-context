@@ -475,42 +475,6 @@ function turnKeyOfSeamless(reasoning: string | undefined, text: string | undefin
     return h.digest("hex").slice(0, 16);
 }
 
-/** #3301: split tagged thinking-merge text (host metadata refresh re-serializes
- *  split-form turns as tagged reasoning spliced into content). MIRRORS
- *  kernel/src/wire/demoted-thinking.ts FORMS + splitDemotedThinking in lockstep
- *  (not exported from the kernel root) — keep both lists in sync. Offset-0 tag
- *  start is the only position demotion renderers produce. Auxiliary evidence
- *  for turn-key derivation ONLY — never identity minting. */
-const THINKING_MERGE_FORMS: readonly { open: string; close: string }[] = [
-    { open: "\x3cthink\x3e\n", close: "\n\x3c/think\x3e" },
-    { open: "\x3cthinking\x3e\n", close: "\n\x3c/thinking\x3e" },
-    { open: "```thinking\n", close: "\n```" },
-];
-
-export function extractThinkingMerge(text: string | undefined): { reasoning: string; text: string } | null {
-    if (text === undefined || text === "") return null;
-    let rest = text;
-    const parts: string[] = [];
-    for (;;) {
-        let matched = false;
-        for (const form of THINKING_MERGE_FORMS) {
-            if (!rest.startsWith(form.open)) continue;
-            const end = rest.indexOf(form.close, form.open.length);
-            if (end < 0) continue;
-            const inner = rest.slice(form.open.length, end);
-            if (inner.length === 0) continue;
-            parts.push(inner);
-            rest = rest.slice(end + form.close.length);
-            if (rest.startsWith("\n")) rest = rest.slice(1);
-            matched = true;
-            break;
-        }
-        if (!matched) break;
-    }
-    if (parts.length === 0) return null;
-    return { reasoning: parts.join("\n"), text: rest };
-}
-
 /** Turn context for the anchor seed loop: per assistant-core id, the turn
  *  key(s) and (for split-form turns) the sibling core id. Built lazily — a
  *  steady-state pass reuses stored anchors and never pays this. */
@@ -535,18 +499,7 @@ export function turnContexts(msgs: CoreMessage[]): Map<string, TurnCtx> {
             const prev = msgs[i - 1];
             if (prev === undefined || prev.id === undefined || prev.role !== "assistant" || prev.contentType !== "reasoning" ||
                 (prev.toolCallId !== undefined && prev.toolCallId !== "")) {
-                // #3301: merged-form core — its text may be tagged reasoning + reply.
-                // The extracted pair key bridges anchors seeded from the split form
-                // (same turn, different wire shape); the raw full-text key stays for
-                // identical resends of this exact form.
-                const ex = extractThinkingMerge(m.text);
-                if (ex !== null) {
-                    const key = turnKeyOf(ex.reasoning, ex.text);
-                    const seamless = turnKeyOfSeamless(ex.reasoning, ex.text);
-                    ctx.set(m.id, seamless !== key ? { p: key, p2: seamless } : { p: key });
-                } else {
-                    ctx.set(m.id, { p: turnKeyOf(undefined, m.text) });
-                }
+                ctx.set(m.id, { p: turnKeyOf(undefined, m.text) });
             }
         }
     }
@@ -994,20 +947,10 @@ export function planReconciliation(
             if (claimedCandidates.has(cand.id)) continue;
             if (!isBareAssistantCore(cand.message)) continue;
             if (cand.message.contentType === "text") {
-                // #3301: a merged-form core stands in for the whole turn —
-                // register the raw full-text key AND the extracted pair key(s)
-                // so anchors seeded from either wire form match.
-                const keys = new Set<string>([turnKeyOf(undefined, cand.message.text)]);
-                const ex = extractThinkingMerge(cand.message.text);
-                if (ex !== null) {
-                    keys.add(turnKeyOf(ex.reasoning, ex.text));
-                    keys.add(turnKeyOfSeamless(ex.reasoning, ex.text));
-                }
-                for (const key of keys) {
-                    const bucket = singleTurnKeys.get(key);
-                    if (bucket === undefined) singleTurnKeys.set(key, [cand.id]);
-                    else bucket.push(cand.id);
-                }
+                const key = turnKeyOf(undefined, cand.message.text);
+                const bucket = singleTurnKeys.get(key);
+                if (bucket === undefined) singleTurnKeys.set(key, [cand.id]);
+                else bucket.push(cand.id);
             } else if (cand.message.contentType === "reasoning") {
                 const next = byPos.get(cand.pos + 1);
                 if (next !== undefined && !claimedCandidates.has(next.id) && isBareAssistantCore(next.message) && next.message.contentType === "text") {
