@@ -289,6 +289,29 @@ export class UnifiedStore {
         this.db.close();
     }
 
+    /** #3049: O(1) ownership probe for the persist stale-guard. Reads only
+     *  the two monotonic counters the rollback guard compares (stats.requests,
+     *  state.nextBlockId) — never the payload columns — so the guard can skip
+     *  its full envelope read+parse when nothing else has committed since this
+     *  process's last save. next_block_id is a dedicated column; requests is
+     *  the one small stats_json parse. Null = no row yet (organic import
+     *  pending / foreign id). */
+    sessionCounters(sessionId: string): { requests: number; nextBlockId: number } | null {
+        const row = this.db
+            .prepare("SELECT next_block_id, stats_json FROM sessions WHERE session_id = ?")
+            .get(sessionId) as { next_block_id: number; stats_json: string } | undefined;
+        if (!row) return null;
+        try {
+            const stats = JSON.parse(row.stats_json) as { requests?: unknown };
+            return {
+                requests: typeof stats.requests === "number" ? stats.requests : 0,
+                nextBlockId: row.next_block_id,
+            };
+        } catch {
+            return null;
+        }
+    }
+
     /** Content CAS: insert-if-absent + refcount bump; returns hash. */
     private putContent(content: string | Buffer, precomputedHash?: string): string {
         const bytes = typeof content === "string" ? Buffer.from(content, "utf8") : content;

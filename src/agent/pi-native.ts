@@ -327,6 +327,12 @@ export function _resetNativeStateForTest(): void {
     delete process.env.BILI_PI_INLINE;
 }
 
+// The extension factory is agent="pi" — the SAME code pi/extension mode
+// runs — so the incremental-turn wiring (marker stamp in
+// before_provider_headers + payload swap in before_provider_request + ack in
+// after_provider_response) is inherited unchanged; pi-native only changes
+// HOW the proxy base is found (self-spawned handle vs external lane). No
+// incremental-specific code lives here by design (#3248 phase 2).
 export default createBiliPlugin();
 
 export { fetchStatus } from "./pi.js";

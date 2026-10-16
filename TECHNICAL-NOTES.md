@@ -345,7 +345,7 @@ bypass and side lanes never earn credit):
   compression reduction. Remedy: **degrade to proxy mode** — the single
   `pluginMode` flip (`pluginAgent !== undefined && !pluginLaneDegraded(session)`)
   re-injects the ACP tools wire-side, re-arms the compress rewriter, CCR
-  stamping and absorb, and **keeps the nudge** (the tools are back). When wire
+  stamping, and **keeps the nudge** (the tools are back). When wire
   injection is unavailable (`compress.injectTool=false` → `degradeAvailable`
   false) the remedy falls back to **suppress-nudge**. Recovery: the live
   plugin header (`pluginLaneRestore`, hoisted BEFORE the `pluginMode` flip so
@@ -403,7 +403,7 @@ functions, exit audits):
    reasoning-echo strip — the thinking channel is no longer cleaned.
 2. **Model prose is manageable.** Render-tag echoes, marker lines,
    bili-internal text, degenerate open/close residue, and (when
-   absorb-instructed) whole tool-call emissions are stripped from the visible
+   instructed) whole tool-call emissions are stripped from the visible
    text channel only.
 3. **Model output bound for files is byte-identical (#1039).** Tool-call
    arguments never enter any filter, whatever bytes they carry.

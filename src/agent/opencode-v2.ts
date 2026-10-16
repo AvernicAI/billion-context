@@ -48,7 +48,7 @@
 // openai tool list, src/compress-tool.ts) because reload-based refresh is not
 // available on all observed surfaces.
 
-import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
+import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
@@ -140,7 +140,7 @@ const TOOL_DELTA_RETRY_MS = 15000;
 // Kill switch = fully inert (same semantics as detectProxyBase): gates header stamping, tool forwarding, compaction reporting.
 const pluginDisabled = (): boolean => process.env.BILLION_CONTEXT_PLUGIN === "0";
 
-const V2_BILI_TOOLS = [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map((t) => ({
+const V2_BILI_TOOLS = ACP_TOOLS_OPENAI.map((t) => ({
     name: t.function.name,
     description: t.function.description,
     input: t.function.parameters,
@@ -253,6 +253,12 @@ interface OpencodeV2SetupOptions {
      *  proxy (idempotent on already-routed URLs) and sets state.proxyBase
      *  when traffic is routed. Absent in launcher mode (no routing). */
     route?: (e: V2HttpRequestEvent, state: V2State) => void | Promise<void>;
+    /** Native mode only (#3248 phase 2): called LAST in the http.request hook
+     *  (after header stamping and fork adoption) so the incremental-turn
+     *  adapters can swap the body for an incremental payload and stamp the
+     *  marker header. Absent in launcher mode. Must never throw — the hook
+     *  itself wraps it, but adapters also guard internally. */
+    incremental?: (e: V2HttpRequestEvent, state: V2State) => void | Promise<void>;
     /** #1362: cooldown between failed derived-session register attempts (tests inject). */
     derivedRetryMs?: number;
 }
@@ -366,6 +372,16 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                     forkBody = undefined;
                 }
                 await forkAdopter.maybeAdopt({ base: state.proxyBase, parent: forkParent, child: forkChild, body: forkBody });
+            }
+            // #3248 phase 2: incremental-turn divert (native adapters only —
+            // the body swap must land after routing/stamping so the marker
+            // header rides the SAME request the host will send).
+            if (options.incremental !== undefined) {
+                try {
+                    await options.incremental(e, state);
+                } catch {
+                    // never break the host's request on adapter failure
+                }
             }
         };
 

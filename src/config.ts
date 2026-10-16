@@ -388,32 +388,6 @@ export type CompressSettings = {
      *  builtin (`default`, `lean`)]. Deepest-wins like every other field;
      *  unknown names fall back to the identity surface. Kernel >= 0.0.66. */
     promptPack?: string;
-    /** Instant tool-result absorption (kernel absorb API, acp-kernel >= 0.0.54).
-     *  When `enabled`, eligible large tool results carry a forced [ACP absorb]
-     *  instruction and the model distills them via the injected `absorb` tool;
-     *  the original output is then hidden from every wire view until the next
-     *  fold round (and its token cost is netted out of usage credits, like
-     *  compress). Maps to kernel `Config.absorb`. Off unless explicitly
-     *  enabled at some level. NOT supported on Responses marker/text-protocol
-     *  routes (no native tool surface there). */
-    absorb?: {
-        /** Enable absorb for this scope. Absent/false = off (kernel semantics). */
-        enabled?: boolean;
-        /** Tool results smaller than this many tokens never get the absorb
-         *  instruction (kernel default 1000). */
-        minToolTokens?: number;
-        /** Only emit instructions once context usage reaches this fraction of
-         *  the model window (kernel `contextThresholdPct`). Accepts a ratio
-         *  (0.5) or percent string ("50%"); 0 = size gate alone (kernel
-         *  default). */
-        contextThresholdPct?: number | string;
-        /** Tool names whose results are never absorbable (glob-suffix
-         *  patterns, e.g. "read"). Kernel default: none. */
-        excludeTools?: string[];
-        /** Rename the wire tool (default "absorb"). Must stay unique against
-         *  the client's own tool names or the agent will call its own tool. */
-        toolName?: string;
-    };
     /** [#1097] Kernel CCR content store (kernel `Config.ccr`, acp-kernel
      *  0.0.84). When `enabled`, oversized tool results (>= minToolTokens) are
      *  ID-referenced at arrival by the kernel's ccr-store node (prune →
@@ -423,7 +397,7 @@ export type CompressSettings = {
      *  Lossless by default — a retrieve not made costs one cheap tool call,
      *  whereas a distilled-away detail is gone for good. ID-reference wins
      *  over absorb (kernel ordering). Off unless explicitly enabled at some
-     *  level. Merged sub-field-wise across the three levels like `absorb`. */
+     *  level. Merged sub-field-wise across the three levels like `prompts`. */
     ccr?: {
         /** Enable CCR for this scope. Absent/false = off (kernel semantics). */
         enabled?: boolean;
@@ -449,7 +423,7 @@ export type CompressSettings = {
      *  are all reused unchanged. Disabled or no plan state in context ⇒
      *  byte-identical output to the plain lexical ranking. Off by default;
      *  measure before enabling in shared configs. Merged sub-field-wise across
-     *  the three levels like `absorb`/`ccr`. See src/decompress-shared.ts. */
+     *  the three levels like `ccr`. See src/decompress-shared.ts. */
     search?: {
         /** Enable plan-aware re-ranking + steering for search_context.
          *  Absent/false = off (byte-identical output). */
@@ -473,7 +447,7 @@ export type CompressSettings = {
      *  billion-context-pi #336/#339 and opencode-acp #377). Compress turns
      *  are hard-exempt from compression, so their reasoning is otherwise an
      *  unreclaimable context floor. Merged sub-field-wise across the three
-     *  config levels like `absorb`. */
+     *  config levels like `prompts`. */
     reasoning?: {
         /** Master switch (default true). Set `drop: false` per-provider for
          *  models whose reasoning must round-trip unmodified. */
@@ -488,7 +462,7 @@ export type CompressSettings = {
      *  hits the lattice AND carries an encrypted_content blob, bili buffers the
      *  response, replays its own reasoning plus a continue nudge (up to maxContinue
      *  rounds), and folds to ONE response with true summed usage. Merged sub-field-wise
-     *  across the three levels like `absorb`/`reasoning`; off unless enabled at some
+     *  across the three levels like `reasoning`; off unless enabled at some
      *  level. See src/reasoning-guard.ts. */
     reasoningGuard?: ReasoningGuardConfig;
     /** [#1093] Output-side compression levers — verbosity steering (a conciseness
@@ -510,7 +484,7 @@ export type CompressSettings = {
      *  unset profile yields byte-identical reports to pre-#1279 behavior. The
      *  last request's effective value is stamped onto the session and used by
      *  every report face. Merged sub-field-wise across the three levels like
-     *  `absorb`. */
+     *  `prompts`. */
     priceProfile?: { w?: number; r?: number; q?: number };
     /** [#1921] Fold-state reconciliation — how the proxy reacts when the
      *  resent history no longer contains a folded message's content-hash id
@@ -915,7 +889,7 @@ export interface DshFileSettings {
 const NAMED_PROVIDER_ROUTING_FIELDS = ["compress", "models", "proxy", "passthrough", "compressProtocol", "protocol", "compat", "imageBilling", "imageTokenCap"] as const;
 
 // Once-per-signature dedup so hot-reload / repeated launcher loads don't spam
-// the same named-provider warning (same pattern as the absorb warnings below).
+// the same named-provider warning.
 const seenNamedProviderWarnings = new Set<string>();
 
 function warnNamedProviderOnce(signature: string, message: string): void {
@@ -1171,45 +1145,6 @@ export function allowDshCompactionState(env: NodeJS.ProcessEnv): { enabled: bool
     return { enabled: fileAllow, source: fileAllow ? "file" : null };
 }
 
-// #1359: provider/model absorb.* overrides apply only to the proxy lane (plugin
-// lane follows the base block). Warn once per load so the divergence isn't silent.
-const ABSORB_DIVERGENCE_FIELDS = ["enabled", "toolName", "minToolTokens", "contextThresholdPct", "excludeTools"] as const;
-const seenAbsorbDivergenceWarnings = new Set<string>();
-
-function normAbsorbValue(field: string, v: unknown): unknown {
-    if (field === "contextThresholdPct" && typeof v === "string") {
-        const m = v.match(/^(-?\d+(?:\.\d+)?)\s*%$/);
-        if (m) return Number(m[1]) / 100;
-    }
-    return v;
-}
-
-export function findAbsorbPluginDivergences(routes: ProviderRoutes, baseAbsorb?: CompressSettings["absorb"]): string[] {
-    const out: string[] = [];
-    const check = (scope: string, level?: CompressSettings["absorb"]) => {
-        if (!level) return;
-        for (const field of ABSORB_DIVERGENCE_FIELDS) {
-            if (level[field] === undefined) continue;
-            if (JSON.stringify(normAbsorbValue(field, level[field])) !== JSON.stringify(normAbsorbValue(field, baseAbsorb?.[field]))) {
-                out.push(`${scope}.absorb.${field}=${JSON.stringify(level[field])} (base=${JSON.stringify(baseAbsorb?.[field])})`);
-            }
-        }
-    };
-    for (const [url, route] of Object.entries(routes)) {
-        check(url, route.compress?.absorb);
-        for (const [model, entry] of Object.entries(route.models ?? {})) check(`${url}/${model}`, entry.compress?.absorb);
-    }
-    return out;
-}
-
-function warnAbsorbPluginDivergences(routes: ProviderRoutes, baseAbsorb?: CompressSettings["absorb"]): void {
-    const divs = findAbsorbPluginDivergences(routes, baseAbsorb);
-    if (divs.length === 0) return;
-    const sig = divs.join("\u0000");
-    if (seenAbsorbDivergenceWarnings.has(sig)) return;
-    seenAbsorbDivergenceWarnings.add(sig);
-    loggerLog("warn", `[acp-config] provider/model absorb override diverges from base [${divs.join("; ")}] — plugin-mode sessions follow the base value, proxy-mode sessions honor the override (#1359)`);
-}
 
 
 /** [#1345] A provider/model-level `ccr` field that diverges from what plugin
@@ -1314,7 +1249,6 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const upstream = (env.ACP_UPSTREAM ?? fileConfig.upstream ?? "https://api.anthropic.com").replace(/\/$/, "");
     const routes = loadRoutes(env);
     const namedProviders = loadNamedProviders(env);
-    warnAbsorbPluginDivergences(routes, fileConfig.compress?.absorb);
     warnCcrPluginDivergences(routes, fileConfig.compress);
     const passthrough = passthroughState(env);
     const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
@@ -1829,6 +1763,14 @@ type FileConfig = {
          *  guards. Default false: plaintext stays loopback-only. Public IPs/domains and
          *  CGNAT (100.64/10) remain refused regardless. Env BILI_ALLOW_PRIVATE_HTTP_PROVIDERS wins. */
         allowPrivateHttpProviders?: boolean;
+        /** Per-request inbound wire byte budget (#3128; was hardcoded 100 MiB, now default 5 GiB).
+         *  Env BILI_RECEIVE_BODY_BYTES wins. Also the threshold above which a decoded request
+         *  consumes one of two shared large-decode admission slots. WebSocket lanes keep 100 MiB. */
+        receiveBodyBytes?: number;
+        /** Per-request DECODED byte budget after content-encoding expansion (#3128; default 10 GiB = 2x receive). Env BILI_DECODED_BODY_BYTES wins. */
+        decodedBodyBytes?: number;
+        /** Per-request rebuilt-outbound byte budget forwarded upstream (#3128; default 5 GiB). Env BILI_OUTBOUND_BODY_BYTES wins. */
+        outboundBodyBytes?: number;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
     persist?: {
@@ -1951,13 +1893,13 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
     "visibilityMarkers", "rules", "injectTool", "injectNudge",
-    "acknowledgePromptsRisk", "absorb", "ccr", "search",
+    "acknowledgePromptsRisk", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary",
 ]);
 
 // Deduped per unique key set per process (same pattern as
-// seenAbsorbDivergenceWarnings): loadConfigFile() runs on every config read,
+// seenNamedProviderWarnings): loadConfigFile() runs on every config read,
 // so without this one startup would log the same warning several times.
 const seenUnknownTopLevelKeySignatures = new Set<string>();
 
@@ -2549,36 +2491,6 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("acknowledgePromptsRisk" in obj) {
         if (typeof obj.acknowledgePromptsRisk !== "boolean") ok = false;
         else out.acknowledgePromptsRisk = obj.acknowledgePromptsRisk;
-    }
-    if ("absorb" in obj && obj.absorb !== undefined) {
-        const a = obj.absorb;
-        if (!a || typeof a !== "object" || Array.isArray(a)) {
-            ok = false;
-        } else {
-            const ao = a as Record<string, unknown>;
-            const cleaned: NonNullable<CompressSettings["absorb"]> = {};
-            for (const key of ["enabled", "minToolTokens", "contextThresholdPct", "excludeTools", "toolName"] as const) {
-                if (!(key in ao)) continue;
-                const v = ao[key];
-                if (key === "enabled") {
-                    if (typeof v !== "boolean") { ok = false; continue; }
-                    cleaned.enabled = v;
-                } else if (key === "minToolTokens") {
-                    if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
-                    cleaned.minToolTokens = v;
-                } else if (key === "contextThresholdPct") {
-                    if (!numberOrPercent(v)) { ok = false; continue; }
-                    cleaned.contextThresholdPct = typeof v === "string" ? v.trim() : v;
-                } else if (key === "excludeTools") {
-                    if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) { ok = false; continue; }
-                    cleaned.excludeTools = [...v] as string[];
-                } else {
-                    if (typeof v !== "string" || v.trim().length === 0) { ok = false; continue; }
-                    cleaned.toolName = v.trim();
-                }
-            }
-            if (ok) out.absorb = cleaned;
-        }
     }
     if ("ccr" in obj && obj.ccr !== undefined) {
         const c = obj.ccr;

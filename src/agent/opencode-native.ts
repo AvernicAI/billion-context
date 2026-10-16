@@ -70,7 +70,8 @@ import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
+import { INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalAck, markIncrementalDead, planIncrementalTurn, probeIncrementalTurns, clearIncrementalProbe, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
@@ -777,4 +778,84 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     return createV1ServerHooks(() => state.origin, ctx, { z, legacy });
 };
 
-export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state) }), server };
+export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state), incremental: maybeIncrementalOpencode }), server };
+
+/** #3248 phase 2: incremental-turn divert for opencode. Runs LAST in the
+ *  http.request hook (routing + header stamping already happened, so the
+ *  stamped plugin headers ride the SAME request object we replace). The
+ *  conversation id is opencode's own session id (x-bili-plugin-conversation
+ *  was just stamped with it — identity upgrades, never forks). One planned
+ *  in-flight request per URL: concurrent sessions on the same provider fall
+ *  back to full resend (ack attribution must stay unambiguous — onResponse
+ *  is keyed by URL). Exported for the native suites; wired above. */
+export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State): Promise<void> {
+    try {
+        const sid = typeof e.sessionID === "string" ? e.sessionID : "";
+        const base = s.proxyBase;
+        const req = e.request as Request | undefined;
+        if (!sid || !base || req === undefined || typeof req.clone !== "function") return;
+        const url = req.url;
+        const stale = incPendingOpencode.get(url);
+        if (stale !== undefined && Date.now() - stale.at < INC_PENDING_TTL_MS) return; // single in-flight per URL
+        incPendingOpencode.delete(url);
+        const body: unknown = await req.clone().json().catch(() => null);
+        if (body === null || typeof body !== "object") return;
+        const b = body as { messages?: unknown; model?: unknown; system?: unknown };
+        if (typeof b.model !== "string" || !wireMessagesLookAnthropic(b.messages)) return; // anthropic-wire only; OpenAI-tool shapes resend full
+        if (!(await probeIncrementalTurns(base))) return;
+        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown> });
+        if (plan.mode === "skip") return;
+        replaceRequestPayload(e, plan.body, { [INCREMENTAL_TURN_MARKER_HEADER]: "1" });
+        incPendingOpencode.set(url, { sid, messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, base, at: Date.now() });
+    } catch {
+        // never break the host's request on adapter failure
+    }
+}
+
+interface IncrementalPendingTurn {
+    sid: string;
+    messages: IncrementalWireMessage[];
+    system: unknown;
+    base: string;
+    at: number;
+}
+
+/** Planned turns age out: onResponse only fires on a SUCCESSFUL send, so a
+ *  request that died network-level would otherwise block incremental for its
+ *  URL forever (single in-flight guard). 30s covers any sane model round-trip
+ *  while keeping concurrent-request attribution unambiguous. */
+const INC_PENDING_TTL_MS = 30_000;
+
+const incPendingOpencode = new Map<string, IncrementalPendingTurn>();
+
+/** Test hook: drop all planned turns (the map is module state across suites). */
+export function __resetOpencodeIncrementalForTests(): void {
+    incPendingOpencode.clear();
+}
+
+/** Ack collector registered on the module's NativeInterceptState: the
+ *  model-API and routed branches both fire onResponse(url, resp) after a
+ *  successful send. Exported for the native suites; wired below. */
+export function opencodeIncrementalOnResponse(url: string, response: Response): void {
+    const pending = incPendingOpencode.get(url);
+    if (pending === undefined) return; // non-incremental responses just clear nothing
+    incPendingOpencode.delete(url);
+    try {
+        const seq = response.headers.get("x-bili-applied-seq");
+        if (response.status === 200 && seq !== null && Number.isFinite(Number(seq))) {
+            noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
+            return;
+        }
+        if (response.status === 409 || response.status === 503) {
+            // Lane rejected the plan (seq mismatch / disabled): this conversation
+            // falls back to full resend until the state machine revives it.
+            markIncrementalDead(pending.sid);
+            if (response.status === 503) clearIncrementalProbe(pending.base);
+            logHostEvent("warn", "[native-client]", `[opencode] incremental turn rejected (${response.status}) — conversation ${pending.sid} falls back to full resend (#3248)`);
+        }
+    } catch {
+        // observability only
+    }
+}
+
+state.onResponse = opencodeIncrementalOnResponse;
