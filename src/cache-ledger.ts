@@ -1913,6 +1913,12 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
         // #2867: proxy-side mode/projection switches get their own section only
         // when observed — a session that never switches modes stays byte-identical.
         const projText = report.projSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.projSwitches, detail, "PROJECTION SWITCHES (proxy mode/projection change — bili's own doing, e.g. self-heal degrade-to-proxy)") : "";
+        // #3307: wire/upstream/restart carry per-event data in the report (switchEvents /
+        // restartEvents) but only their aggregate counts reached CACHE INVALIDATION — no
+        // per-line timestamps, so cross-checks (e.g. seam-vs-restart) were impossible.
+        const wireText = report.wireSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.wireSwitches, detail, "WIRE SWITCHES (client switched protocol wire between requests)") : "";
+        const upstreamText = report.upstreamSwitches.count > 0 ? "\n\n" + formatModelSwitches(report.upstreamSwitches, detail, "UPSTREAM SWITCHES (relay/upstream origin changed between requests)") : "";
+        const restartText = report.restartDrops.count > 0 ? "\n\n" + formatModelSwitches(report.restartDrops, detail, "RESTART/REFORK (first bill under a fresh daemon boot — prefix re-billed once)") : "";
         if (detail === "full" && report.lines.length > FULL_DETAIL_LINES) {
             const dropped = report.lines.length - FULL_DETAIL_LINES;
             const capped = formatCacheReport(
@@ -1920,9 +1926,9 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
                 session.id,
                 { detail },
             );
-            return toolOk(tail(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + projText + "\n\n" + formatInvalidation(report)));
+            return toolOk(tail(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + projText + wireText + upstreamText + restartText + "\n\n" + formatInvalidation(report)));
         }
-        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + projText + "\n\n" + formatInvalidation(report)));
+        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + projText + wireText + upstreamText + restartText + "\n\n" + formatInvalidation(report)));
     } catch (err) {
         loggerLog("warn", `[${session.id}] [acp_cache] report failed: ${String(err)}`);
         return toolFail(`[acp_cache FAILED: ${String(err)}]`);
