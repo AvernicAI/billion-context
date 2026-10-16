@@ -4,7 +4,7 @@
 // into one module with four layers:
 //   A. kernel exports — every tool constant the pinned acp-kernel ships, per wire
 //   B. bili surfaces — everything bili itself builds/serves (BILI_* tools, synthesized
-//      variants, retrieveToolsFor, IMAGE_FULL_TOOL_GOOGLE)
+//      variants, retrieveToolsFor)
 //   C. plugin manifest — what handlePluginManifest advertises (default + opt-in configs)
 //   D. live forward matrix — scripted client request -> proxy -> validation-parity fake
 //      upstream, one lane per protocol (item 1 + item 4 phase (a)): the forwarded body
@@ -50,7 +50,6 @@ import {
     RULE_TOOL_RESPONSES,
     RULE_TOOL_GOOGLE,
     retrieveToolsFor,
-    IMAGE_FULL_TOOL_GOOGLE,
 } from "../src/compress-tool.ts";
 import { WIRE_RULES, WIRE_HEADER_RULES, VALIDATORS, startFakeUpstream, validateResponsesWsCreate, validateCodexResponsesWsCreate, validateGoSessionHeaders, type Wire } from "./wire-contract-fakes.ts";
 
@@ -239,7 +238,6 @@ const KERNEL_INDIVIDUALS: Array<[string, Wire]> = [
     ["ACP_CACHE_TOOL", "anthropic"], ["ACP_CACHE_TOOL_OPENAI", "openai-chat"], ["ACP_CACHE_TOOL_RESPONSES", "responses"],
     // opt-in tools the kernel ships individually (host-registered)
     ["ABSORB_TOOL", "anthropic"], ["ABSORB_TOOL_OPENAI", "openai-chat"], ["ABSORB_TOOL_GOOGLE", "google"],
-    ["IMAGE_FULL_TOOL", "anthropic"], ["IMAGE_FULL_TOOL_OPENAI", "openai-chat"], ["IMAGE_FULL_TOOL_RESPONSES", "responses"],
     ["RETRIEVE_TOOL", "anthropic"], ["RETRIEVE_TOOL_OPENAI", "openai-chat"], ["RETRIEVE_TOOL_RESPONSES", "responses"],
 ];
 
@@ -277,14 +275,13 @@ const BILI_INDIVIDUALS: Array<[string, Wire]> = [
     ["BILI_DECOMPRESS_TOOL", "anthropic"], ["BILI_DECOMPRESS_TOOL_OPENAI", "openai-chat"], ["BILI_DECOMPRESS_TOOL_RESPONSES", "responses"], ["BILI_DECOMPRESS_TOOL_GOOGLE", "google"],
     ["ABSORB_TOOL_RESPONSES", "responses"],
     ["RULE_TOOL", "anthropic"], ["RULE_TOOL_OPENAI", "openai-chat"], ["RULE_TOOL_RESPONSES", "responses"], ["RULE_TOOL_GOOGLE", "google"],
-    ["IMAGE_FULL_TOOL_GOOGLE", "google"],
 ];
 
 const BILI_CONSTANTS: Record<string, unknown> = {
     BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_READONLY_TOOLS_RESPONSES,
     BILI_SEARCH_CONTEXT_TOOL, BILI_SEARCH_CONTEXT_TOOL_OPENAI, BILI_SEARCH_CONTEXT_TOOL_RESPONSES, BILI_SEARCH_CONTEXT_TOOL_GOOGLE,
     BILI_DECOMPRESS_TOOL, BILI_DECOMPRESS_TOOL_OPENAI, BILI_DECOMPRESS_TOOL_RESPONSES, BILI_DECOMPRESS_TOOL_GOOGLE,
-    ABSORB_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, RULE_TOOL_GOOGLE, IMAGE_FULL_TOOL_GOOGLE,
+    ABSORB_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, RULE_TOOL_GOOGLE,
     RETRIEVE_TOOLS: retrieveToolsFor("acp_retrieve"),
 };
 

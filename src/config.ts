@@ -455,31 +455,6 @@ export type CompressSettings = {
          *  Absent/false = off (byte-identical output). */
         planAware?: boolean;
     };
-    /** [#1095] Image pre-compression (kernel `Config.imageCompression`,
-     *  acp-kernel >= 0.0.84). When `enabled`, screenshot-like images in tool
-     *  results are downscaled ONCE at arrival before entering the wire
-     *  (kernel routing decision + recipe, host executes with optional `sharp`);
-     *  non-screenshot originals pass through byte-identical. Lossy by nature —
-     *  backstopped by the injected `image_full` tool: the model requests the
-     *  original resolution for a ref and it applies for the rest of the
-     *  session (originals cached in memory). Off unless explicitly enabled at
-     *  some level; disabled ⇒ byte-identical pass-through. Merged sub-field-wise
-     *  across the three levels like `absorb`/`ccr`. */
-    imageCompression?: {
-        /** Enable image pre-compression for this scope. Absent/false = off
-         *  (byte-identical pass-through). */
-        enabled?: boolean;
-        /** Only route images whose token estimate >= this (kernel default
-         *  512). */
-        minTokens?: number;
-        /** Longest side (px) of the downsample recipe (kernel default 1280). */
-        maxDimension?: number;
-        /** Lossy encode quality 1-100 of the downsample recipe (kernel
-         *  default 80). */
-        quality?: number;
-        /** Encode format of the downsample recipe (kernel default "webp"). */
-        format?: "webp" | "jpeg" | "png";
-    };
     /** Persistent rule reminders (kernel `Config.rules`, acp-kernel >= 0.0.70).
      *  When `enabled`, an `acp_rule` tool is injected (or advertised in the
      *  plugin manifest): passing a short `rule` records a principle-level
@@ -1737,8 +1712,12 @@ type FileConfig = {
      *  collision with the top-level proxy `debug`). Boolean shorthand:
      *  `"pi": {"subagents": false}` disables the whole surface. The four
      *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
-     *  deprecated fallback, read only while this section is absent. */
-     pi?: { subagents?: PiSubagentsFileConfig | boolean };
+     *  deprecated fallback, read only while this section is absent.
+     *  `inline` (#3278): run the pi lane's compression IN-PROCESS (no spawned
+     *  proxy) — the config-file home of the BILI_PI_INLINE knob, resolved
+     *  env > file > default(off); BILI_PI_INLINE=0/false explicitly disables
+     *  it over the file. */
+     pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean };
     /** Feature rollout (canary) block (#3062, resolved by src/rollout.ts):
      *  per-feature overrides of the version's baked-in rollout plan
      *  (ROLLOUT_FEATURES). `installId` pins the bucketing identity instead of
@@ -1972,7 +1951,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
     "visibilityMarkers", "rules", "injectTool", "injectNudge",
-    "acknowledgePromptsRisk", "absorb", "ccr", "search", "imageCompression",
+    "acknowledgePromptsRisk", "absorb", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary",
 ]);
@@ -2642,30 +2621,6 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 cleaned.planAware = v;
             }
             if (ok) out.search = cleaned;
-        }
-    }
-    if ("imageCompression" in obj && obj.imageCompression !== undefined) {
-        const c = obj.imageCompression;
-        if (!c || typeof c !== "object" || Array.isArray(c)) {
-            ok = false;
-        } else {
-            const co = c as Record<string, unknown>;
-            const cleaned: NonNullable<CompressSettings["imageCompression"]> = {};
-            for (const key of ["enabled", "minTokens", "maxDimension", "quality", "format"] as const) {
-                if (!(key in co)) continue;
-                const v = co[key];
-                if (key === "enabled") {
-                    if (typeof v !== "boolean") { ok = false; continue; }
-                    cleaned.enabled = v;
-                } else if (key === "minTokens" || key === "maxDimension" || key === "quality") {
-                    if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
-                    cleaned[key] = v;
-                } else {
-                    if (v !== "webp" && v !== "jpeg" && v !== "png") { ok = false; continue; }
-                    cleaned.format = v;
-                }
-            }
-            if (ok) out.imageCompression = cleaned;
         }
     }
     if ("prompts" in obj && obj.prompts !== undefined) {

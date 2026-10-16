@@ -675,7 +675,7 @@ test("HTTP fork revision and originals survive a new proxy process", async () =>
         parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "CCR original retained independently after restart", kind: "original", tokens: 10, head: "CCR original" });
         parent.contentStoreDirty = true;
         assert(h.store.flushSync(parent));
-        assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), JSON.parse(JSON.stringify({ ...parent.state, imageFullRestored: parent.state.imageFullRestored ?? [], imageShrinks: parent.state.imageShrinks ?? [] })));
+        assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), JSON.parse(JSON.stringify(parent.state)));
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
         const req = forkRequest(snapshot);
         const fork = await h.request("/__bili/plugin/fork", req);

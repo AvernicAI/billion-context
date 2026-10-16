@@ -295,16 +295,6 @@ entries:
     desc_zh: "开启后 search_context 候选按当前计划状态重排；关闭时结果逐字节不变。"
     site_en: "<code>search.planAware</code> — off by default: when on, search_context candidates are re-ranked against current plan state (latest-wins todos + last user turn); off keeps byte-identical lexical results."
     site_zh: "<code>search.planAware</code> —— 默认关：开启后 search_context 候选按当前计划状态重排（todo 最新优先 + 上一轮用户消息）；关闭时结果逐字节不变。"
-  - key: compress.imageCompression
-    type: object
-    default: "opt-in (disabled)"
-    group: compress
-    id: co.img
-    render: obj-item
-    desc_en: "Opt-in lossy downscale via optional sharp before sending; image_full restores originals; proxy mode only."
-    desc_zh: "可选有损缩放（依赖可选 sharp）后再发送；image_full 取回原图；仅限代理模式。"
-    site_en: "<code>imageCompression</code> — opt-in lossy downscale via optional sharp before sending (<span class='mech'>enabled, minTokens 512, maxDimension 1280, quality 80, format \"webp\"</span>); <code>image_full</code> restores originals; proxy mode only."
-    site_zh: "<code>imageCompression</code> —— 可选有损缩放（依赖可选 sharp）后再发送（<span class='mech'>enabled, minTokens 512, maxDimension 1280, quality 80, format \"webp\"</span>）；<code>image_full</code> 取回原图；仅限代理模式。"
   - key: compress.prompts
     type: "Partial<Prompts>"
     default: "unset (kernel doctrine)"
@@ -415,36 +405,6 @@ entries:
     group: compress
     desc_en: "Maximum head-excerpt length left inline at the storage pointer."
     desc_zh: "存储指针处内联首段摘录的最大长度。"
-  - key: compress.imageCompression.enabled
-    type: boolean
-    default: "false"
-    group: compress
-    desc_en: "Enable lossy image downscaling (requires the optional sharp dependency)."
-    desc_zh: "启用有损图片缩放（需要可选依赖 sharp）。"
-  - key: compress.imageCompression.minTokens
-    type: number
-    default: "512"
-    group: compress
-    desc_en: "Only downscale images whose counted tokens exceed this."
-    desc_zh: "只对计得 token 超过该值的图片做缩放。"
-  - key: compress.imageCompression.maxDimension
-    type: number
-    default: "1280"
-    group: compress
-    desc_en: "Largest output dimension after downscaling."
-    desc_zh: "缩放后的最大输出边长。"
-  - key: compress.imageCompression.quality
-    type: number
-    default: "80"
-    group: compress
-    desc_en: "Encoder quality (1–100)."
-    desc_zh: "编码质量（1–100）。"
-  - key: compress.imageCompression.format
-    type: string
-    default: "\"webp\""
-    group: compress
-    desc_en: "Output image format."
-    desc_zh: "输出图片格式。"
   - key: compress.prompts.compressPhilosophy
     type: string
     default: "unset (kernel text)"

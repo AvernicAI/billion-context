@@ -123,6 +123,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `native.attachUrl` | string | unset (discover per lane) | BILI_MCP_PROXY | Explicit target origin for native-hook attach (any URL). When set, a hook attaches ONLY to that exact origin instead of auto-discovering, and spawns its own if it is not live; it must still be code-compatible and pass the lifecycle gate. The BILI_MCP_PROXY env var (also set by CLI --origin) takes precedence over this file value; empty/whitespace means unset. |
 | `claude.nativePort` | number | unset (lane sticky zone port) | BILI_CLAUDE_NATIVE_PORT | Exact port pin for the claude native lane's hook-spawned proxy (strict-port: squatters are refused loudly). |
 | `pi.subagents` | object \| boolean | {} (acp_delegate enabled with package defaults) | PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT | Built-in pi-lane sub-agents (acp_delegate) surface, #2230 config-home. The pi.subagents section of billion-context.json owns the delegate config; the four acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a deprecated fallback read only while the section is absent. prompt replaces delegatePrompt; debug is scoped to the sub-agent subsystem. Boolean shorthand subagents: false disables the whole surface. Full field table: the pi section in CONFIGURATION.md. |
+| `pi.inline` | boolean | false | BILI_PI_INLINE | Pi inline lane (#3278): run the pi extension's compression IN-PROCESS — no spawned proxy, no ephemeral port; model traffic and the /__bili//__acp tool surface are served by an in-process engine through a pseudo-origin. Resolved env > file > default(off): BILI_PI_INLINE=1/true enables, BILI_PI_INLINE=0/false explicitly disables over this file value. |
 
 **MITM lane**
 
@@ -247,7 +248,6 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | Content cache & retrieve: large outputs stored losslessly beside the session, replaced by head excerpt + pointer fetched back via acp_retrieve; no cap or eviction. |
 | `compress.search` | object | off | — | Search-behavior settings for search_context; currently holds planAware re-ranking. |
 | `compress.search.planAware` | boolean | false | — | When on, search_context candidates are re-ranked against current plan state; off keeps byte-identical lexical results. |
-| `compress.imageCompression` | object | opt-in (disabled) | — | Opt-in lossy downscale via optional sharp before sending; image_full restores originals; proxy mode only. |
 | `compress.prompts` | Partial<Prompts> | unset (kernel doctrine) | — | Override the kernel doctrine texts; load-bearing for quality — gated behind acknowledgePromptsRisk. |
 | `compress.reasoningGuard` | object | off | — | Auto-repair of reasoning-lattice truncation on gpt-5.x/6.x (up to 3 continue-nudge rounds). |
 | `compress.outputSteering` | object { enabled?, verbosityLevel?, effortRouting? } | enabled false · verbosityLevel 2 | — | Appends a conciseness directive to the system-prompt tail; clamps mechanical continuation requests. |
@@ -263,11 +263,6 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.ccr.excludeTools` | string[] | [] | — | Tool names excluded from CCR storage. |
 | `compress.ccr.toolName` | string | "acp_retrieve" | — | Registered name of the retrieval tool. |
 | `compress.ccr.maxHeadChars` | number | 96 | — | Maximum head-excerpt length left inline at the storage pointer. |
-| `compress.imageCompression.enabled` | boolean | false | — | Enable lossy image downscaling (requires the optional sharp dependency). |
-| `compress.imageCompression.minTokens` | number | 512 | — | Only downscale images whose counted tokens exceed this. |
-| `compress.imageCompression.maxDimension` | number | 1280 | — | Largest output dimension after downscaling. |
-| `compress.imageCompression.quality` | number | 80 | — | Encoder quality (1–100). |
-| `compress.imageCompression.format` | string | "webp" | — | Output image format. |
 | `compress.prompts.compressPhilosophy` | string | unset (kernel text) | — | Override of the compression philosophy doctrine paragraph. |
 | `compress.prompts.howToCompressRules` | string | unset (kernel text) | — | Override of the compression how-to rules. |
 | `compress.prompts.tier2DistillRules` | string | unset (kernel text) | — | Override of the tier-2 distillation rules. |
@@ -354,6 +349,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_NATIVE_OMP` | boolean-ish | off | — | Host posture: marks an omp-native plugin process. |
 | `BILI_NATIVE_OPENCODE` | boolean-ish | off | — | Host posture: marks an opencode-native plugin process. |
 | `BILI_NATIVE_PI` | boolean-ish | off | — | Host posture: marks a pi-native plugin process. |
+| `BILI_PI_INLINE` | boolean-ish | off | — | Host posture: pi inline lane (#3278) — the pi extension compresses IN-PROCESS through the pseudo-origin instead of spawning its own proxy; outranks a preset BILLION_CONTEXT_PROXY attach target. |
 | `BILI_NATIVE_ZCODE` | boolean-ish | off | — | Host posture: marks a zcode-native plugin process. |
 | `BILI_PI_BIN` | string | pi (PATH lookup) | — | Host posture: explicit binary path for the pi client binary. |
 | `BILI_DSH_BIN` | string | dsh (PATH lookup) | — | Host posture: explicit binary path for the dsh client binary. |
@@ -1375,19 +1371,6 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Description:** Opt-in **planning-aware retrieval** for `search_context` (issue #1336). When enabled, if a query matches more blocks than `limit`, the candidates are re-ranked against the current plan state extracted from the in-context message view: the LAST tool call of each planning tool (built-in patterns `TodoWrite`, `todowrite`, `todo_list`, `update_plan`, `TaskCreate`, `TaskUpdate`, plus every `compress.protectedLatestTools` pattern — same latest-wins semantics as the kernel's snapshot protection) and the most recent user turn. Candidate topics/summaries are scored by weighted term overlap with that state; blocks scoring above zero sort first, ties keep the original lexical order. Two things happen only then: the returned subset can differ from the pure lexical cut, and a `[plan-aware]` steering section is appended with (a) `top fetch targets:` — the covered ref spans of the top-scoring returned blocks, and (b) a hint for any covered ref already retrieved ≥2 times this session, pointing at a one-shot `decompress({blockId, startId, endId})` range restore instead of repeat `acp_retrieve`. When the flag is off, when no plan state is in context, or when the match pool fits inside `limit`, the output is byte-identical to the pre-feature behavior. Ranking touches candidate order only — no store/fold/injection mechanics change, no new persistence, and foreign-session searches (`conversation_id`) stay read-only lexical. Every re-rank logs an `[acp-search-plan] …` line with the per-block scores. Companion stats: whole-block decompresses count up in `acp_status` under a `RETRIEVAL QUALITY` line (total, plus how many had a cheaper precise path available — i.e. the block carried a ref span and CCR was armed), so the retrieve-vs-decompress trade can be measured before/after enabling. Sub-fields (merged deepest-wins like every other CompressSettings field):
   - `planAware: boolean` — master switch; anything other than `true` keeps the feature fully off.
 
-#### `imageCompression`
-
-- **Type:** `object` (`{ enabled?, minTokens?, maxDimension?, quality?, format? }`)
-- **Default:** *(disabled — the feature is off unless you set `enabled: true`)*
-- **Status:** ACTIVE (v1 — proxy mode)
-- **Description:** Opt-in **image pre-compression** for screenshot-heavy tool results (issue #1095, via the `acp-kernel` image-compression API, acp-kernel >= 0.0.84). Multimodal providers bill images by pixel area, so a phone screenshot costs more than a large code block. When enabled, screenshot-like images (deterministic heuristic classifier: portrait aspect ratio in band + minimum short side) in tool results are downscaled **once at arrival** — before they enter the wire — so the model still sees the UI at a fraction of the billed pixels. Non-screenshot images pass through byte-identical. The routing decision (pass vs downsample + recipe) is made by the kernel per image; the host executes the encode with the optional `sharp` dependency (lazy-loaded; missing or failing ⇒ the original passes through, never blocking the main flow). **Lossy by nature** — unlike text CCR, downscaled pixels can't be retrieved; mitigation: the injected `image_full` tool lets the model restore the original resolution for the rest of the session when it can't read details (sticky, idempotent; the restore persists across restarts with the shrink records). No proxy-side original storage is needed: the client's own history still carries the original bytes (it never saw the shrunk form), so a restored ref simply stops being re-routed and the original rides the wire again. Per-image savings log as `[acp-image] …` lines and aggregate into the `[acp-usage]` suffix (`img-saved=Ntok/MKB xK`). Sub-fields (merged deepest-wins like every other CompressSettings field):
-  - `enabled: boolean` — master switch; anything other than `true` keeps the feature fully off (byte-identical pass-through, no `image_full` tool on the wire).
-  - `minTokens: number` — only route images whose billing-aware token estimate ≥ this (kernel default `512`).
-  - `maxDimension: number` — longest side (px) of the downsample recipe (kernel default `1280`).
-  - `quality: number` — lossy encode quality 1–100 of the recipe (kernel default `80`).
-  - `format: "webp" | "jpeg" | "png"` — encode format of the recipe (kernel default `"webp"`).
-  All four wire carriers are rewritten at the forward boundary: Anthropic `image` blocks, OpenAI `image_url` parts (including single-string data-URL messages; remote URLs are never touched), Responses `input_image`, and Google `inlineData`. Determinism contract (same invariant as CCR #1097): the substituted-at-arrival bytes ARE the standing wire content — a guard refuses to re-route any payload that isn't a known original fingerprint for an already-shrunk ref, so processed messages re-entering the pass (fold re-requests) can't double-shrink and bust the prefix cache. Note the kernel's pixel-tile token estimate is coarse and capped (~2k tokens for large screenshots): a shrink may save real wire bytes while saving zero estimated tokens — both numbers appear in the log. Fingerprint bookkeeping is memory-only (not persisted): after a proxy restart, previously shrunk (non-restored) refs pass through at original resolution until the session resets — the double-shrink guard won't re-route payloads it can't verify as known originals, so savings for those refs pause rather than risk a double-shrink (a reset clears the records, so they re-shrink deterministically on the next arrival); previously restored refs stay restored. v1 scope gate: **proxy mode only** (plugin agents would need `image_full` advertised in their plugin manifest first). Requires `acp-kernel` >= 0.0.84 and the optional `sharp` package for actual shrinking (without it every image passes through unchanged).
-
 #### `rules`
 
 - **Type:** `boolean`
@@ -1690,6 +1673,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | `persist.epermAlertThreshold` | 5 |
 | `BILI_PERSIST_TAIL_TOKENS` | `persist.tailTokens` | 16384 (0 disables message persistence) |
 | `BILI_PERSIST_ZSTD` | `persist.zstd` | false |
+| `BILI_PI_INLINE` | `pi.inline` | false |
 | `BILI_POST_RESPONSE_LINGER_MS` | `network.postResponseLingerMs` | 5000 |
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | 300000 |
 | `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | 30000 |

@@ -1236,22 +1236,6 @@
           ]
         }
       }
-    },
-    "imageFullGoogle": {
-      "name": "image_full",
-      "description": "Restore original-resolution images for a previously downscaled message. Call when you cannot read details (text, colors, alignment) in a reduced image: pass the message ref (\"mNNNNN\") from the [Downscaled screenshots] note. Full resolution applies for the rest of this session.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "ref": {
-            "type": "string",
-            "description": "mNNNNN ref of the message whose image(s) should be restored to full resolution"
-          }
-        },
-        "required": [
-          "ref"
-        ]
-      }
     }
   }
 }

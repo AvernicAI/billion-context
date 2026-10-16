@@ -498,9 +498,6 @@ test("mergeCompressionState keeps parsed values over defaults", () => {
     tokensCompressed: 1234,
     compressionCount: 7,
     absorbedTokens: 0,
-    imagesShrunk: 0,
-    imageBytesSaved: 0,
-    imageTokensSaved: 0,
     storedCount: 0,
     retrievalCount: 0,
   });

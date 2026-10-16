@@ -8,7 +8,7 @@ import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.j
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
 import { ONE_CALL_HINT } from "acp-kernel";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
-import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled } from "./image-compress.js";
+import { recordThreadTail } from "./server/thread-tracking.js";
 import { imagePlaceholdersForSummary } from "./image-note.js";
 import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
@@ -76,11 +76,6 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
         const injections = drainPendingRetrievals(ctx.session);
         if (injections.length === 0) return ack;
         return { ...ack, text: injections.reduce((acc, inj) => `${acc}\n\n${inj.text}`, ack.text) };
-    }
-    if (imageCompressionEnabled(ctx.session) && toolName === IMAGE_FULL_TOOL_NAME) {
-        // Restore is passive egress behavior (the next forward re-emits the
-        // cached original), so there is nothing to drain inline.
-        return executeImageFull(args, ctx.session, ctx.config);
     }
     return toolFail(`[Unknown proxy tool: ${toolName}]`);
 }
@@ -518,6 +513,8 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
                 tokenCount: statusInputBaseline(ctx.session),
                 renderTags: "none",
                 contentStore: contentStoreOf(ctx.session),
+                // #3236: screen advertised tail ranges on the apply class.
+                applyView: ctx.compressMessages,
             });
             nudge = turn.nudge;
         } catch {

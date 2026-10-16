@@ -157,12 +157,6 @@ interface PersistedSession {
         retrieveDelivered?: number;
         storedBytes?: number;
         storeBytesSaved?: number;
-        imageShrunkCount?: number;
-        imageBytesSaved?: number;
-        imageTokensSaved?: number;
-        imageFullCalls?: number;
-        imageFullRestores?: number;
-        imageFullFailStreak?: number;
         rangeRestores?: number;
         wholeBlockRestores?: number;
         wholeBlockRestoresPreciseAvailable?: number;
@@ -231,11 +225,6 @@ function mergeState(parsed: CompressionState): CompressionState {
         // resurrects with absorbed=[] and hideAbsorbedMessages has nothing to hide.
         absorbed: parsed.absorbed ?? fresh.absorbed,
         rules: parsed.rules ?? fresh.rules,
-        // #1095: without these, a restart forgets both which refs are restored
-        // (image_full silently re-downscales them) and the shrink records that
-        // keep re-encoding deterministic per ref.
-        imageFullRestored: parsed.imageFullRestored ?? fresh.imageFullRestored,
-        imageShrinks: parsed.imageShrinks ?? fresh.imageShrinks,
     };
 }
 
@@ -1966,20 +1955,6 @@ function buildSession(parsed: PersistedSession): Session {
             retrieveDelivered: stats.retrieveDelivered ?? 0,
             storedBytes: stats.storedBytes ?? 0,
             storeBytesSaved: stats.storeBytesSaved ?? 0,
-            imageShrunkCount: stats.imageShrunkCount ?? 0,
-            imageBytesSaved: stats.imageBytesSaved ?? 0,
-            imageTokensSaved: stats.imageTokensSaved ?? 0,
-            imageFullCalls: stats.imageFullCalls ?? 0,
-            imageFullRestores: stats.imageFullRestores ?? 0,
-            // #3266: the save path spreads session.stats wholesale but this reader
-            // restores field-by-field — without the entry a restart silently drops
-            // the guardrail streak and re-arms the restore note after repeated
-            // failures (same spread-vs-whitelist gap class as #1724/#2322).
-            // Presence-preserving on purpose: defaulting absent→0 would materialize
-            // the key in every reloaded session's stats, changing the persisted
-            // bytes of sessions that never used image_full (storage corpus /
-            // render-golden digests pin those bytes). Consumers read `?? 0`.
-            ...(typeof stats.imageFullFailStreak === "number" && Number.isFinite(stats.imageFullFailStreak) ? { imageFullFailStreak: Math.max(0, stats.imageFullFailStreak) } : {}),
             rangeRestores: stats.rangeRestores ?? 0,
             // #1336: retrieval-quality counters (whole-block restores vs cheaper
             // precise path available) — round-trip so the long-run ratio in
