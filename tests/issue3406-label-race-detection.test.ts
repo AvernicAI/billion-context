@@ -1,12 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInitialState } from "acp-kernel";
 import type { CompressionBlock } from "acp-kernel";
 import { flatFileNameFor } from "acp-kernel/persist";
-import { SessionStore } from "../src/persist.ts";
+import { SessionStore, relPathFor } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -18,9 +18,11 @@ import { rmrf } from "./tmp-rm.ts";
 // later lookup and the prior conversation stays unreachable under the label.
 // A full fix needs an index/format decision (owner-gated); these tests pin
 // the stopgap: at scan completion the store logs ONE loud warn naming both
-// states — and stays silent for the two look-alike shapes that are NOT the
-// race (a healthy alias-resume re-key keeps its original createdAt; a plain
-// unrecorded alias has no conflicting direct-id file at all).
+// states — for BOTH on-disk shapes of the racy direct-id file (flat and
+// protocol-namespaced, #1937) — and stays silent for the two look-alike
+// shapes that are NOT the race (a healthy alias-resume re-key keeps its
+// original createdAt; a plain unrecorded alias has no conflicting direct-id
+// file at all).
 
 // Plain JSON session files so seeds and round-trips stay deterministic (#1080)
 process.env.BILI_PERSIST_ZSTD = "0";
@@ -126,7 +128,7 @@ function fileById(root: string, id: string): string | null {
 
 interface LogLine { level: "info" | "warn" | "error"; msg: string }
 
-interface UnderLabelShape { createdAt: number; savedAt: number; mtimeSec: number }
+interface UnderLabelShape { createdAt: number; savedAt: number; mtimeSec: number; namespaced?: boolean }
 
 /** Corpus shared by all legs: 4 filler sessions (newest mtimes — they take
  *  the whole warm window) plus the OLD labeled session outside the window.
@@ -163,7 +165,12 @@ async function seedCorpus(dir: string, underLabel?: UnderLabelShape): Promise<Ar
     utimesSync(oldFile, base - 120, base - 120);
     entries.push({ id: "s3406-old", file: oldFile });
     if (underLabel) {
-        const nFile = path.join(dir, flatFileNameFor("s3406-label"));
+        // Production racy sessions carry protocol meta and persist NAMESPACED
+        // (proto/<host>_<hash>.json, #1937) — matched by the suffix branch;
+        // namespaced:false pins the flat fallback shape.
+        const rel = underLabel.namespaced ? relPathFor("s3406-label", "openai") : flatFileNameFor("s3406-label");
+        const nFile = path.join(dir, rel);
+        mkdirSync(path.dirname(nFile), { recursive: true });
         writeFileSync(nFile, JSON.stringify({
             version: 2,
             savedAt: underLabel.savedAt,
@@ -238,6 +245,37 @@ withShadowMode("#3406 item 3: racy empty-under-label session gets exactly one lo
     // …and the label still serves the empty state (the stranded shape the warn describes).
     const again = store.loadSync("s3406-label");
     assert.equal(again!.stats.requests, 0, "direct-id file keeps winning lookups under the label");
+    store.closeQuietly();
+});
+
+withShadowMode("#3406 item 3: namespaced (production-shape) racy session gets exactly one loud warn at scan completion", async (dir) => {
+    // Same race as leg 1, but the racy direct-id file sits where real traffic
+    // puts it: openai/<host>_<hash>.json — detection must find it through the
+    // suffix branch, not just the flat-name match.
+    const entries = await seedCorpus(dir, { createdAt: Date.now() + 60_000, savedAt: Date.now() + 60_000, mtimeSec: Math.floor(Date.now() / 1000) - 6 * 60, namespaced: true });
+    const logs: LogLine[] = [];
+    const fillsTotal = entries.filter((e) => e.id.startsWith("s3406-fill-")).reduce((sum, e) => sum + statSync(e.file).size, 0);
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true, log: (level, msg) => logs.push({ level, msg }) });
+    const booted = await store.boot({ maxSessions: 4, maxBytes: fillsTotal });
+    assert.deepEqual([...booted.keys()].sort(), ["s3406-fill-0", "s3406-fill-1", "s3406-fill-2", "s3406-fill-3"], "warm set = the 4 fillers only");
+    const racyFile = entries.find((e) => e.id === "s3406-label")!.file;
+    assert.ok(path.relative(dir, racyFile).includes(path.sep), "racy file is protocol-namespaced, not flat");
+
+    const resumed = store.loadSync("s3406-label");
+    assert.ok(resumed, "namespaced direct-id file resolves under the label");
+    assert.equal(resumed!.stats.requests, 0, "the resumed state is the empty racy one");
+
+    await store.backgroundScanComplete();
+    const warns = logs.filter((l) => l.level === "warn" && l.msg.includes("label resume raced"));
+    assert.equal(warns.length, 1, "exactly one race warning");
+    assert.ok(warns[0].msg.includes("s3406-label"), "warn names the label");
+    assert.ok(warns[0].msg.includes("s3406-old"), "warn names the surviving conversation id");
+
+    const old = store.loadSync("s3406-old");
+    assert.ok(old, "old state loads by id");
+    assert.equal(old!.stats.contextTokens, 700);
+    const again = store.loadSync("s3406-label");
+    assert.equal(again!.stats.requests, 0, "namespaced direct-id file keeps winning lookups under the label");
     store.closeQuietly();
 });
 
