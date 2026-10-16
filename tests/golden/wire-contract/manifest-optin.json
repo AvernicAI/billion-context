@@ -60,12 +60,13 @@
                           },
                           "summary": {
                             "type": "string",
-                            "description": "Self-contained summary replacing the range. REQUIRED unless dryRun=true"
+                            "description": "Self-contained summary replacing the range"
                           }
                         },
                         "required": [
                           "startId",
-                          "endId"
+                          "endId",
+                          "summary"
                         ]
                       },
                       {
@@ -92,12 +93,13 @@
                           },
                           "summary": {
                             "type": "string",
-                            "description": "Self-contained summary replacing the range. REQUIRED unless dryRun=true"
+                            "description": "Self-contained summary replacing the range"
                           }
                         },
                         "required": [
                           "startRef",
-                          "endRef"
+                          "endRef",
+                          "summary"
                         ]
                       }
                     ]
@@ -126,11 +128,7 @@
             },
             "summary": {
               "type": "string",
-              "description": "Flat single-range form (no content): self-contained summary replacing the range. REQUIRED unless dryRun=true"
-            },
-            "dryRun": {
-              "type": "boolean",
-              "description": "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true."
+              "description": "Flat single-range form (no content): self-contained summary replacing the range"
             }
           }
         }
@@ -302,12 +300,13 @@
                             },
                             "summary": {
                               "type": "string",
-                              "description": "Self-contained summary replacing the range. REQUIRED unless dryRun=true"
+                              "description": "Self-contained summary replacing the range"
                             }
                           },
                           "required": [
                             "startId",
-                            "endId"
+                            "endId",
+                            "summary"
                           ]
                         },
                         {
@@ -334,12 +333,13 @@
                             },
                             "summary": {
                               "type": "string",
-                              "description": "Self-contained summary replacing the range. REQUIRED unless dryRun=true"
+                              "description": "Self-contained summary replacing the range"
                             }
                           },
                           "required": [
                             "startRef",
-                            "endRef"
+                            "endRef",
+                            "summary"
                           ]
                         }
                       ]
@@ -368,11 +368,7 @@
               },
               "summary": {
                 "type": "string",
-                "description": "Flat single-range form (no content): self-contained summary replacing the range. REQUIRED unless dryRun=true"
-              },
-              "dryRun": {
-                "type": "boolean",
-                "description": "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true."
+                "description": "Flat single-range form (no content): self-contained summary replacing the range"
               }
             }
           }
@@ -562,12 +558,13 @@
                           },
                           "summary": {
                             "type": "string",
-                            "description": "Self-contained summary replacing the range. REQUIRED unless dryRun=true"
+                            "description": "Self-contained summary replacing the range"
                           }
                         },
                         "required": [
                           "startId",
-                          "endId"
+                          "endId",
+                          "summary"
                         ]
                       },
                       {
@@ -594,12 +591,13 @@
                           },
                           "summary": {
                             "type": "string",
-                            "description": "Self-contained summary replacing the range. REQUIRED unless dryRun=true"
+                            "description": "Self-contained summary replacing the range"
                           }
                         },
                         "required": [
                           "startRef",
-                          "endRef"
+                          "endRef",
+                          "summary"
                         ]
                       }
                     ]
@@ -628,11 +626,7 @@
             },
             "summary": {
               "type": "string",
-              "description": "Flat single-range form (no content): self-contained summary replacing the range. REQUIRED unless dryRun=true"
-            },
-            "dryRun": {
-              "type": "boolean",
-              "description": "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true."
+              "description": "Flat single-range form (no content): self-contained summary replacing the range"
             }
           }
         }

@@ -78,9 +78,13 @@ export interface ParsedCompressInput {
  */
 export function parseCompressArgs(
   input: unknown,
-  opts?: { callId?: string },
+  opts?: { callId?: string; allowDryRun?: boolean },
 ): ParsedCompressInput {
   const callId = opts?.callId;
+  // #3185: the dryRun preview surface is opt-in per host config. When the host
+  // does not enable it, the flag is never detected — object field or raw-text
+  // alike — so a summary-less range is rejected exactly as before this feature.
+  const allowDryRun = opts?.allowDryRun === true;
   const diag: CompressParseDiagnostics = {
     ok: false,
     kind: "ok",
@@ -93,7 +97,7 @@ export function parseCompressArgs(
   }
 
   if (typeof input === "string") {
-    return parseStringInput(input, callId, diag);
+    return parseStringInput(input, callId, diag, allowDryRun);
   }
 
   if (typeof input !== "object" || Array.isArray(input)) {
@@ -101,22 +105,22 @@ export function parseCompressArgs(
     return finish([], diag);
   }
 
-  return parseObjectValue(input as Record<string, unknown>, callId, diag);
+  return parseObjectValue(input as Record<string, unknown>, callId, diag, allowDryRun);
 }
 
 function parseStringInput(
   raw: string,
   callId: string | undefined,
   diag: CompressParseDiagnostics,
+  allowDryRun: boolean,
 ): ParsedCompressInput {
   diag.rawPrefix = clampPrefix(raw, 800);
   diag.length = raw.length;
   const cleaned = stripFence(raw.trim());
-  // Salvage-mode inputs never reach parseObjectValue, so the flag has to be
-  // detected from the raw text there; for parseable objects the exact field
-  // check below wins.
-  const rawDryRun = detectDryRunInRaw(cleaned);
-  const first = parseStringCore(cleaned, callId, diag, rawDryRun);
+  // The dryRun gate (allowDryRun) is threaded down so a disabled host never
+  // previews: parseable objects read the exact field, salvage prefixes detect
+  // it from the raw text. Gated here so it is never detected when off.
+  const first = parseStringCore(cleaned, callId, diag, allowDryRun);
   // Weak local models emit single-quoted args ({'content': [...]}). The
   // salvage regex only recognizes double-quoted "content", so a truncated
   // single-quoted prefix recovers nothing on the first pass. Retry once
@@ -132,7 +136,7 @@ function parseStringInput(
       };
       retryDiag.rawPrefix = diag.rawPrefix;
       retryDiag.length = diag.length;
-      const retry = parseStringCore(normalized, callId, retryDiag, rawDryRun);
+      const retry = parseStringCore(normalized, callId, retryDiag, allowDryRun);
       if (retry.ranges.length > first.ranges.length) {
         retryDiag.quoteSalvage = true;
         return retry;
@@ -146,7 +150,7 @@ function parseStringCore(
   cleaned: string,
   callId: string | undefined,
   diag: CompressParseDiagnostics,
-  rawDryRun: boolean,
+  allowDryRun: boolean,
 ): ParsedCompressInput {
   if (cleaned === "") {
     diag.kind = "empty-input";
@@ -162,7 +166,7 @@ function parseStringCore(
   }
 
   if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-    return parseObjectValue(value as Record<string, unknown>, callId, diag);
+    return parseObjectValue(value as Record<string, unknown>, callId, diag, allowDryRun);
   }
   if (value !== undefined) {
     // Parsed, but not to an object: bare array, number, boolean, null.
@@ -170,9 +174,10 @@ function parseStringCore(
     return finish([], diag);
   }
 
-  // Unparseable prefix: salvage the complete content-array entries.
+  // Unparseable prefix: salvage the complete content-array entries. Salvage
+  // never reaches parseObjectValue, so the flag is detected from the raw text.
   const entries = salvageContentEntries(cleaned);
-  return finishSalvage(entries, callId, diag, looksTruncated(cleaned), rawDryRun);
+  return finishSalvage(entries, callId, diag, looksTruncated(cleaned), allowDryRun && detectDryRunInRaw(cleaned));
 }
 
 /** #3185: best-effort dryRun detection for inputs that never reach an object
@@ -190,9 +195,11 @@ function parseObjectValue(
   value: Record<string, unknown>,
   callId: string | undefined,
   diag: CompressParseDiagnostics,
+  allowDryRun: boolean,
 ): ParsedCompressInput {
   diag.keys = Object.keys(value);
-  const dryRun = value["dryRun"] === true;
+  // Gated on allowDryRun so a disabled host treats `dryRun` as an unknown key.
+  const dryRun = allowDryRun && value["dryRun"] === true;
   const content = value["content"];
   if (content === undefined) {
     // Model drift: a single range at the top level (no content array).

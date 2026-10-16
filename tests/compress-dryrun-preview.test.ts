@@ -5,8 +5,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, defaultConfig, assignRefs, emptyRefMap } from "acp-kernel";
-import { parseCompressInput } from "../src/compress-tool.ts";
+import { parseCompressInput, BILI_ACP_TOOLS_OPENAI, COMPRESS_TOOL_OPENAI_DRYRUN, withDryRunCompress, buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+
+// This file exercises the ON path end-to-end (the switch defaults OFF); the
+// default-OFF behavior is asserted explicitly in the final switch test below,
+// which clears the env override there.
+process.env.BILI_COMPRESS_DRYRUN = "1";
 
 type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] };
 
@@ -160,5 +165,40 @@ test("#3193 review: malformed dryRun (no valid ranges) reports PREVIEW FAILED an
             assert.equal(ctx.session.metadata["compressFailKeys"], undefined, `fail-streak key must stay unset (round ${i + 1})`);
             assert.equal(ctx.session.metadata["compressFailStreak"], undefined, `loop streak must stay unset (round ${i + 1})`);
         }
+    }
+});
+
+test("#3185 switch: served schema + prompt toggle with the knob (one gate serves every pack)", () => {
+    const saved = process.env.BILI_COMPRESS_DRYRUN;
+    try {
+        delete process.env.BILI_COMPRESS_DRYRUN;
+        const off = withDryRunCompress(BILI_ACP_TOOLS_OPENAI, COMPRESS_TOOL_OPENAI_DRYRUN);
+        assert.deepEqual(off, BILI_ACP_TOOLS_OPENAI, "off -> base array served untouched");
+        const compOff = off.find((t) => t.function.name === "compress")!;
+        assert.ok(!("dryRun" in compOff.function.parameters.properties), "off -> no dryRun field in schema");
+        assert.ok(!buildCompressSystemPrompt().includes("dryRun"), "off -> no strategy sentence in prompt");
+
+        process.env.BILI_COMPRESS_DRYRUN = "1";
+        const on = withDryRunCompress(BILI_ACP_TOOLS_OPENAI, COMPRESS_TOOL_OPENAI_DRYRUN);
+        const compOn = on.find((t) => t.function.name === "compress")!;
+        assert.ok("dryRun" in compOn.function.parameters.properties, "on -> dryRun field served");
+        assert.ok(buildCompressSystemPrompt().includes("preview the whole batch first with dryRun:true"), "on -> strategy sentence present");
+    } finally {
+        if (saved === undefined) delete process.env.BILI_COMPRESS_DRYRUN;
+        else process.env.BILI_COMPRESS_DRYRUN = saved;
+    }
+});
+
+test("#3185 switch OFF: a dryRun:true call is ignored and summary-less previews are rejected (commit path unchanged)", () => {
+    const saved = process.env.BILI_COMPRESS_DRYRUN;
+    try {
+        delete process.env.BILI_COMPRESS_DRYRUN;
+        const parsed = parseCompressInput({ content: [{ startId: "m00001", endId: "m00030" }], dryRun: true });
+        assert.equal(parsed.dryRun, false, "flag dropped when the switch is off");
+        assert.equal(parsed.ranges.length, 0, "summary-less entry rejected as on the commit path");
+        assert.equal(parsed.diagnostics.invalidItems, 1);
+    } finally {
+        if (saved === undefined) delete process.env.BILI_COMPRESS_DRYRUN;
+        else process.env.BILI_COMPRESS_DRYRUN = saved;
     }
 });

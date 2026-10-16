@@ -62,8 +62,7 @@ const COMPRESS_RANGE_OBJECT = {
     },
     summary: {
       type: "string",
-      description:
-        "Self-contained summary replacing the range. REQUIRED unless dryRun=true",
+      description: "Self-contained summary replacing the range",
     },
   },
 };
@@ -107,8 +106,97 @@ export const COMPRESS_PARAMETERS = {
                 description:
                   "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line",
               },
-              // #3193 review: no "summary" in required — dryRun previews omit
-              // it; parseCompressArgs still enforces it for real commits.
+               {
+                 ...COMPRESS_RANGE_OBJECT,
+                 required: ["startId", "endId", "summary"],
+               },
+               {
+                 ...COMPRESS_RANGE_OBJECT,
+                 required: ["startRef", "endRef", "summary"],
+               },
+            ],
+          },
+        },
+        { type: "string" },
+      ],
+    },
+    startId: {
+      type: "string",
+      description:
+        "Flat single-range form (no content): mNNNNN ref at the start of the range",
+    },
+    endId: {
+      type: "string",
+      description:
+        "Flat single-range form (no content): mNNNNN ref at the end of the range",
+    },
+    startRef: {
+      type: "string",
+      description: "Flat single-range form: alternate spelling of startId",
+    },
+    endRef: {
+      type: "string",
+      description: "Flat single-range form: alternate spelling of endId",
+    },
+    summary: {
+      type: "string",
+      description:
+        "Flat single-range form (no content): self-contained summary replacing the range",
+    },
+  },
+};
+
+/** #3185: the compress tool's optional `dryRun` preview capability is OFF by
+ *  default (config `compress.dryRunPreview` / env BILI_COMPRESS_DRYRUN). The
+ *  base schemas above are the pre-#3185 surface — byte-identical to what a
+ *  host serves when the knob is off. The `_DRYRUN` variants below add the
+ *  `dryRun` parameter, relax `summary` out of `required`, and suffix the
+ *  summary descriptions; hosts serve them only when the knob is on. Keeping
+ *  the two surfaces separate (instead of stripping at serve time) makes the
+ *  off-path provably identical to master rather than dependent on a strip
+ *  transform reconstructing it. */
+const DRYRUN_SUMMARY_SUFFIX = ". REQUIRED unless dryRun=true";
+
+export const COMPRESS_DRYRUN_PARAM = {
+  type: "boolean" as const,
+  description:
+    "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true.",
+};
+
+/** #3185: strategy sentence appended to the compress tool bullet when the
+ *  dryRun preview is enabled; kept out of the base TOOLS section so the off
+ *  path stays byte-identical to master. Leading space preserves the bullet's
+ *  sentence spacing when concatenated after the anchor. */
+export const COMPRESS_DRYRUN_PROMPT_SENTENCE =
+  " For model-selected ranges, preview the whole batch first with dryRun:true (omit summaries): evaluate estimatedTokensSaved and exclusions, adjust or discard poor ranges, then write one summary per selected range and commit the whole batch in ONE call. Skip the preview only when committing fresh acp_status-recommended ranges verbatim.";
+
+/** COMPRESS_PARAMETERS with the dryRun surface added: the `dryRun` boolean
+ *  parameter, `summary` dropped from the nested object `required` lists (a
+ *  preview omits it), and the flat summary description suffixed to say so.
+ *  Written as a standalone literal (not a clone-and-mutate of COMPRESS_PARAMETERS)
+ *  because the nested `anyOf` unions make structural navigation unsound under
+ *  the inferred literal types; it reuses COMPRESS_RANGE_OBJECT so the range-entry
+ *  shape cannot drift between the two surfaces. */
+export const COMPRESS_PARAMETERS_DRYRUN = {
+  type: "object",
+  properties: {
+    topic: {
+      type: "string",
+      description: "Optional short title for the compressed range",
+    },
+    content: {
+      description:
+        "One or more ranges to compress into separate summary blocks. PREFERRED (multi-range batch): ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Array form: one entry per range — a line-form string or an object {startId,endId,summary,topic?}. Batch multiple ranges into ONE call — do not split into one call per range. REQUIRED unless the flat single-range form is used.",
+      anyOf: [
+        {
+          type: "array",
+          items: {
+            anyOf: [
+              {
+                type: "string",
+                description:
+                  "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (a JSON string: quotes \\\", newlines \\n). A single string may carry MULTIPLE ranges — each block starts with its own refs header line",
+              },
               {
                 ...COMPRESS_RANGE_OBJECT,
                 required: ["startId", "endId"],
@@ -144,21 +232,24 @@ export const COMPRESS_PARAMETERS = {
     summary: {
       type: "string",
       description:
-        "Flat single-range form (no content): self-contained summary replacing the range. REQUIRED unless dryRun=true",
+        "Flat single-range form (no content): self-contained summary replacing the range" +
+        DRYRUN_SUMMARY_SUFFIX,
     },
-    dryRun: {
-      type: "boolean",
-      description:
-        "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true.",
-    },
+    dryRun: COMPRESS_DRYRUN_PARAM,
   },
 };
 
 export const COMPRESS_TOOL = {
   name: COMPRESS_TOOL_NAME,
   description:
-    "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. PREFERRED form: content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Also accepted: object entries {startId,endId,summary,topic?} in the content array, and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+     "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. PREFERRED form: content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Also accepted: object entries {startId,endId,summary,topic?} in the content array, and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
   input_schema: COMPRESS_PARAMETERS,
+};
+
+/** Anthropic-format compress tool with the dryRun preview surface (#3185). */
+export const COMPRESS_TOOL_DRYRUN = {
+  ...COMPRESS_TOOL,
+  input_schema: COMPRESS_PARAMETERS_DRYRUN,
 };
 
 export type ParsedRange = {
@@ -260,6 +351,12 @@ export const COMPRESS_TOOL_OPENAI = {
   },
 };
 
+/** OpenAI chat-format compress tool with the dryRun preview surface (#3185). */
+export const COMPRESS_TOOL_OPENAI_DRYRUN = {
+  ...COMPRESS_TOOL_OPENAI,
+  function: { ...COMPRESS_TOOL_OPENAI.function, parameters: COMPRESS_PARAMETERS_DRYRUN },
+};
+
 const FUNCTION_PROMPT_SECTIONS: ReadonlyArray<
   readonly [keyof CompressPromptSections, string]
 > = [
@@ -275,7 +372,7 @@ Each message in the conversation is annotated with a <acp tokens="2.1K" type="to
 
 You have five context-management tools:
 
-- compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\\nsummary…\\nm00300–m00350 Deploy\\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary (a valid JSON string: \\\" and \\n). A single range is the same shape with one block. Object entries {startId,endId,summary,topic?} in the content array are also accepted. Never split a batch into one call per range. For model-selected ranges, preview the whole batch first with dryRun:true (omit summaries): evaluate estimatedTokensSaved and exclusions, adjust or discard poor ranges, then write one summary per selected range and commit the whole batch in ONE call. Skip the preview only when committing fresh acp_status-recommended ranges verbatim.
+- compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\\nsummary…\\nm00300–m00350 Deploy\\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary (a valid JSON string: \\\" and \\n). A single range is the same shape with one block. Object entries {startId,endId,summary,topic?} in the content array are also accepted. Never split a batch into one call per range.
 - decompress — Restore a previously compressed block's content. By default restores one tier up (T2→T1 summaries, not raw messages). Use full: true to restore all the way to original messages. Use toFile to write to file instead of inflating context. Example: decompress({ blockId: "b5" }) or decompress({ blockId: "b5", toFile: "path" }) or decompress({ blockId: "b5", full: true }).
 - search_context — Search compressed block summaries (and optionally visible messages) by keyword. Use BEFORE decompressing to find the right block. Example: search_context({ query: "auth token refresh" }).
 - acp_status — Context status with compressible ranges. No args = overview + ranges. Use to find what to compress next.`,
@@ -571,6 +668,12 @@ export const COMPRESS_TOOL_RESPONSES = {
   parameters: COMPRESS_TOOL_OPENAI.function.parameters,
 };
 
+/** Responses-format compress tool with the dryRun preview surface (#3185). */
+export const COMPRESS_TOOL_RESPONSES_DRYRUN = {
+  ...COMPRESS_TOOL_RESPONSES,
+  parameters: COMPRESS_PARAMETERS_DRYRUN,
+};
+
 export const DECOMPRESS_TOOL_RESPONSES = {
   type: "function" as const,
   name: DECOMPRESS_TOOL_OPENAI.function.name,
@@ -719,21 +822,46 @@ export const COMPRESS_TOOL_GOOGLE = {
             },
             summary: {
               type: "string",
-              description:
-                "Self-contained summary replacing the range. REQUIRED unless dryRun=true",
+              description: "Self-contained summary replacing the range",
             },
           },
-          required: ["startId", "endId"],
+          required: ["startId", "endId", "summary"],
         },
-      },
-      dryRun: {
-        type: "boolean",
-        description:
-          "Preview without committing: validates the range(s) and reports what would fold, be excluded or withdrawn, which blocks would be absorbed, and the estimated tokens saved. Zero side effects — nothing stored, no refs allocated. Omit summary when dryRun=true.",
       },
     },
     required: ["content"],
   },
+};
+
+/** Gemini flat-format compress tool with the dryRun preview surface (#3185). */
+export const COMPRESS_TOOL_GOOGLE_DRYRUN = {
+  ...COMPRESS_TOOL_GOOGLE,
+  parameters: (() => {
+    const p = COMPRESS_TOOL_GOOGLE.parameters;
+    const content = p.properties.content;
+    const items = content.items;
+    return {
+      ...p,
+      properties: {
+        ...p.properties,
+        content: {
+          ...content,
+          items: {
+            ...items,
+            properties: {
+              ...items.properties,
+              summary: {
+                ...items.properties.summary,
+                description: items.properties.summary.description + DRYRUN_SUMMARY_SUFFIX,
+              },
+            },
+            required: ["startId", "endId"],
+          },
+        },
+        dryRun: COMPRESS_DRYRUN_PARAM,
+      },
+    };
+  })(),
 };
 
 export const DECOMPRESS_TOOL_GOOGLE = {
