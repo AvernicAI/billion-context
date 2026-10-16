@@ -1712,8 +1712,12 @@ type FileConfig = {
      *  collision with the top-level proxy `debug`). Boolean shorthand:
      *  `"pi": {"subagents": false}` disables the whole surface. The four
      *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
-     *  deprecated fallback, read only while this section is absent. */
-     pi?: { subagents?: PiSubagentsFileConfig | boolean };
+     *  deprecated fallback, read only while this section is absent.
+     *  `inline` (#3278): run the pi lane's compression IN-PROCESS (no spawned
+     *  proxy) — the config-file home of the BILI_PI_INLINE knob, resolved
+     *  env > file > default(off); BILI_PI_INLINE=0/false explicitly disables
+     *  it over the file. */
+     pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean };
     /** Feature rollout (canary) block (#3062, resolved by src/rollout.ts):
      *  per-feature overrides of the version's baked-in rollout plan
      *  (ROLLOUT_FEATURES). `installId` pins the bucketing identity instead of
