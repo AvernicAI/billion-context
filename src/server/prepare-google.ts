@@ -8,7 +8,7 @@ import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBilli
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
-import { nudgeSuppressed } from "../session-self-heal.js";
+import { biliToolsDeclaredOnWire, nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
 import { recordConflict } from "../conflict-watch.js";
@@ -91,8 +91,12 @@ export async function prepareGoogle(
     const isTitleGen = maxTokens <= 200;
     const shouldInject = opts.compress.injectTool && !isTitleGen;
     const injectTools = shouldInject && !pluginMode;
-    // #3177: DSH tools are host-scope (the preset agent can't reach them) — suppress the model-side compress surface.
-    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh";
+    // #3177/#3401: suppress the model-side compress surface ONLY when the DSH agent genuinely
+    // cannot reach bili's ACP tools — judged from the request's own tools array (ground truth of
+    // what the model sees; bili injects nothing in plugin mode), NOT from the lane name alone.
+    // Some DSH profiles expose the tools to the agent; keying off "pluginAgent===dsh" over-suppressed
+    // those (see #3401). The host's tool table is per-session-stable, so this does not flip mid-session.
+    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh" && !biliToolsDeclaredOnWire(parsed, "google");
     // #2483: this lane used to ignore renderNone entirely (hardcoded "text-only"
     // in processTurn, Prepared and countTokens) — the knob was dead config on /v1beta.
     const renderStrategy = knobRenderNone() ? "none" : "text-only";

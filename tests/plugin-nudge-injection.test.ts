@@ -10,6 +10,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { BILI_ACP_TOOLS_OPENAI } from "../src/compress-tool.js";
 
 // #451 regression: 0.1.69 gated all three nudge injection sites by !pluginMode
 // on the premise that "in plugin mode the agent owns compression". The agent
@@ -49,7 +50,7 @@ function turn2Messages(): Record<string, unknown>[] {
     ];
 }
 
-async function forwardedTurn2(sessionId: string, extraHeaders: Record<string, string>): Promise<{ count: number; messages: Record<string, unknown>[] }> {
+async function forwardedTurn2(sessionId: string, extraHeaders: Record<string, string>, bodyExtra?: Record<string, unknown>): Promise<{ count: number; messages: Record<string, unknown>[] }> {
     const received: unknown[][] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -98,7 +99,7 @@ async function forwardedTurn2(sessionId: string, extraHeaders: Record<string, st
         const r1 = await fetch(url, {
             method: "POST",
             headers,
-            body: JSON.stringify({ model: "deepseek-v4-flash", max_tokens: 64_000, messages: [{ role: "user", content: "hello" }] }),
+            body: JSON.stringify({ model: "deepseek-v4-flash", max_tokens: 64_000, messages: [{ role: "user", content: "hello" }], ...(bodyExtra ?? {}) }),
         });
         assert.equal(r1.status, 200);
         await r1.text();
@@ -108,7 +109,7 @@ async function forwardedTurn2(sessionId: string, extraHeaders: Record<string, st
         const r2 = await fetch(url, {
             method: "POST",
             headers,
-            body: JSON.stringify({ model: "deepseek-v4-flash", max_tokens: 64_000, messages: turn2Messages() }),
+            body: JSON.stringify({ model: "deepseek-v4-flash", max_tokens: 64_000, messages: turn2Messages(), ...(bodyExtra ?? {}) }),
         });
         assert.equal(r2.status, 200);
         await r2.text();
@@ -159,4 +160,28 @@ test("#3177: DSH plugin session also drops the standing compress system prompt (
     // The full standing prompt (philosophy + how-to + tool surface) is far larger than
     // the tags-only fallback DSH falls back to — so DSH's leading system block shrinks.
     assert.ok(ompSys.length - dshSys.length > 300, `omp system ${ompSys.length}B vs dsh ${dshSys.length}B — DSH must drop the standing compress prompt`);
+});
+
+// #3401: reachability is judged from the request's own tools array, not the lane name.
+// A DSH profile that exposes bili's ACP tools to its agent must KEEP the whole model-side
+// compress surface — #3177 keyed the suppression off pluginAgent==="dsh" alone and
+// over-suppressed exactly those setups. These are REAL agent turns: the tools array carries
+// bili's ACP set alongside the host's own action tools (a host tool vetoes the #1897
+// "leaked bili tools only" side-request demotion, so the request rides the normal pipeline).
+const dshAgentTools = [
+    ...BILI_ACP_TOOLS_OPENAI,
+    { type: "function" as const, function: { name: "read_file", description: "host action tool", parameters: { type: "object", properties: {} } } },
+];
+
+test("#3401: DSH keeps the compress nudge when its agent exposes the ACP tools on the wire (regression)", async () => {
+    const dshNoTools = await forwardedTurn2("dsh3401-notools", { "x-bili-plugin": "dsh" });
+    const dshWithTools = await forwardedTurn2("dsh3401-tools", { "x-bili-plugin": "dsh" }, { tools: dshAgentTools });
+    assert.equal(dshNoTools.count, 30, "control: DSH without tools on the wire still drops the nudge (#3177)");
+    assert.equal(dshWithTools.count, 31, "DSH whose agent exposes the ACP tools keeps the nudge — pre-fix this was 30 too");
+});
+
+test("#3401: DSH keeps the standing compress system prompt when its agent exposes the ACP tools on the wire (regression)", async () => {
+    const dshWithTools = await forwardedTurn2("dsh3401-sys", { "x-bili-plugin": "dsh" }, { tools: dshAgentTools });
+    const sys = String((dshWithTools.messages[0] ?? {})["content"] ?? "");
+    assert.ok(sys.includes("ACP TAGS"), "DSH with exposed ACP tools keeps the standing compress prompt (carries the ACP tag guidance)");
 });

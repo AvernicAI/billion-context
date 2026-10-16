@@ -9,7 +9,7 @@ import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTo
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
-import { nudgeSuppressed } from "../session-self-heal.js";
+import { biliToolsDeclaredOnWire, nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
@@ -49,8 +49,12 @@ export async function prepareAnthropic(
     const stream = parsed.stream === true;
     ++session.stats.requests;
     const injectTools = opts.compress.injectTool && !pluginMode;
-    // #3177: DSH tools are host-scope (the preset agent can't reach them) — suppress the model-side compress surface.
-    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh";
+    // #3177/#3401: suppress the model-side compress surface ONLY when the DSH agent genuinely
+    // cannot reach bili's ACP tools — judged from the request's own tools array (ground truth of
+    // what the model sees; bili injects nothing in plugin mode), NOT from the lane name alone.
+    // Some DSH profiles expose the tools to the agent; keying off "pluginAgent===dsh" over-suppressed
+    // those (see #3401). The host's tool table is per-session-stable, so this does not flip mid-session.
+    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh" && !biliToolsDeclaredOnWire(parsed, "anthropic");
     // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
     // core.processTurn — see planReasoningDrop for why the post-turn view is too late.
     let reasoningPlan = new Set<string>();

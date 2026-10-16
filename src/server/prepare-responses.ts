@@ -11,7 +11,7 @@ import { excludeDeadRefRanges } from "../acp-status.js";
 import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as patchResponsesInput, responsesToCoreWithToolImages as responsesToCore } from "../responses-tool-output.js";
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
 import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
-import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
+import { biliToolsDeclaredOnWire, nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
@@ -112,10 +112,15 @@ export async function prepareResponses(
 
     const shouldInject = opts.compress.injectTool;
     const injectTools = shouldInject && !pluginMode;
-    // #3177: DSH tools are host-scope (the preset agent can't reach them) — suppress the model-side compress surface.
-    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh";
-    // Effective gate for the standing prompt + nudge: DSH reads as injectTool-off so it takes the same
-    // stable tags-only developer slot as any non-injecting session (prefix cache stays append-stable).
+    // #3177/#3401: suppress the model-side compress surface ONLY when the DSH agent genuinely
+    // cannot reach bili's ACP tools — judged from the request's own tools array (ground truth of
+    // what the model sees; bili injects nothing in plugin mode), NOT from the lane name alone.
+    // Some DSH profiles expose the tools to the agent; keying off "pluginAgent===dsh" over-suppressed
+    // those (see #3401). The host's tool table is per-session-stable, so this does not flip mid-session.
+    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh" && !biliToolsDeclaredOnWire(parsed, "responses");
+    // Effective gate for the standing prompt + nudge. When suppressed, DSH reads as injectTool-off so
+    // it takes the same stable tags-only developer slot as any non-injecting session (prefix cache
+    // stays append-stable); when NOT suppressed the surface is on and stable across turns likewise.
     const compressSurfaceOn = shouldInject && !dshCompressSurfaceOff;
     // Codex native remote-compact request: no compress prompt/tools (the model
     // produces the compaction itself), no acp tags, plain passthrough so the

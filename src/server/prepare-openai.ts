@@ -10,7 +10,7 @@ import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTo
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
-import { nudgeSuppressed } from "../session-self-heal.js";
+import { biliToolsDeclaredOnWire, nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
@@ -79,13 +79,17 @@ export async function prepareOpenai(
     const isTitleGen = maxTokens <= 200;
     const shouldInject = opts.compress.injectTool && !isTitleGen;
     const injectTools = shouldInject && !pluginMode;
-    // #3177: DSH registers bili's ACP tools host-scope (invisible to the preset
-    // agent — 0/3939 request headers carry them), so model-driven compression is
-    // structurally unreachable there. Drop the model-side compress surface (system
-    // prompt + nudge) for DSH plugin sessions; otherwise the nudge tells the model
-    // to call a tool it can never see ("unknown tool \"compress\""). pi/omp/opencode
-    // keep it — their extensions expose the tools to the agent.
-    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh";
+    // #3177/#3401: drop the model-side compress surface (system prompt + nudge)
+    // ONLY when the DSH agent genuinely cannot reach bili's ACP tools — judged from
+    // the request's own tools array (ground truth of what the model sees; bili injects
+    // nothing in plugin mode), NOT from the lane name. #3177 assumed every DSH install
+    // registers them host-scope (its scanned profile had 0/3939 headers carrying them),
+    // but some DSH profiles expose them to the agent, and keying off "pluginAgent===dsh"
+    // alone over-suppressed those and killed the whole model-side compression path. When
+    // the tools are on the wire the model CAN call them, so keep the surface. The host's
+    // tool table is per-session-stable, so this does not flip mid-session (no prefix-cache
+    // churn). pi/omp/opencode keep it unconditionally — their extensions always expose it.
+    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh" && !biliToolsDeclaredOnWire(parsed, "openai");
 
     const markerCounts = stripRawStage(parsed, "openai");
     logRawStripCounts(markerCounts, log, sessionId);
