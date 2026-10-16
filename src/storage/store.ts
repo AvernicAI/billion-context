@@ -287,7 +287,11 @@ export class UnifiedStore implements StorageBackend {
         } catch (err) {
             loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
         }
-        this.db.close();
+        try {
+            this.db.close();
+        } catch (err) {
+            loggerLog("warn", `[storage] db handle release on close failed: ${String(err)}`);
+        }
     }
 
     /** #3049: O(1) ownership probe for the persist stale-guard. Reads only
