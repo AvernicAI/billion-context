@@ -181,7 +181,12 @@ test("#3401: DSH keeps the compress nudge when its agent exposes the ACP tools o
 });
 
 test("#3401: DSH keeps the standing compress system prompt when its agent exposes the ACP tools on the wire (regression)", async () => {
-    const dshWithTools = await forwardedTurn2("dsh3401-sys", { "x-bili-plugin": "dsh" }, { tools: dshAgentTools });
-    const sys = String((dshWithTools.messages[0] ?? {})["content"] ?? "");
-    assert.ok(sys.includes("ACP TAGS"), "DSH with exposed ACP tools keeps the standing compress prompt (carries the ACP tag guidance)");
+    const dshNoTools = await forwardedTurn2("dsh3401-sys-off", { "x-bili-plugin": "dsh" });
+    const dshWithTools = await forwardedTurn2("dsh3401-sys-on", { "x-bili-plugin": "dsh" }, { tools: dshAgentTools });
+    const off = String((dshNoTools.messages[0] ?? {})["content"] ?? "");
+    const on = String((dshWithTools.messages[0] ?? {})["content"] ?? "");
+    assert.ok(on.includes("ACP TAGS"), "DSH with exposed ACP tools keeps the standing compress prompt (carries the ACP tag guidance)");
+    // 'ACP TAGS' alone cannot discriminate — the suppressed tags-only fallback carries it too.
+    // The FULL compress prompt must be present: same length-delta discipline as the #3177 test above.
+    assert.ok(on.length - off.length > 300, `with-tools ${on.length}B vs no-tools ${off.length}B — exposed ACP tools must restore the full compress prompt, not just the tags-only fallback`);
 });
