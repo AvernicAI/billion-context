@@ -18,8 +18,6 @@ const TRAY_ID: &str = "bili-main";
 fn main() {
     let cfg = bili_tray_core::config::load();
     let dashboard_url = format!("http://127.0.0.1:{}/__bili/", cfg.port);
-    let open_cfg_path = bili_tray_core::config::path();
-    let log_path = bili_tray_core::platform::bili_state_dir().join("bili.log");
 
     tauri::Builder::default()
         .setup(move |app| {
@@ -35,14 +33,8 @@ fn main() {
                 .tooltip("")
                 .show_menu_on_left_click(true)
                 .on_menu_event(move |handle: &AppHandle, event| match event.id().as_ref() {
-                    "open-sessions" => {
+                    "open-dashboard" => {
                         let _ = bili_tray_core::platform::open_in_browser(&dashboard_url);
-                    }
-                    "open-config" => {
-                        let _ = bili_tray_core::platform::open_path(&open_cfg_path);
-                    }
-                    "open-logs" => {
-                        let _ = bili_tray_core::platform::open_path(&log_path);
                     }
                     "quit" => handle.exit(0),
                     _ => {}
@@ -110,9 +102,7 @@ fn build_menu(
         false,
         None::<&str>,
     )?;
-    let sessions = MenuItem::with_id(app, "open-sessions", "Open Sessions", true, None::<&str>)?;
-    let config = MenuItem::with_id(app, "open-config", "Open Config", true, None::<&str>)?;
-    let logs = MenuItem::with_id(app, "open-logs", "Open Logs", true, None::<&str>)?;
+    let dashboard = MenuItem::with_id(app, "open-dashboard", "Open Dashboard", true, None::<&str>)?;
     let port_info = MenuItem::with_id(
         app,
         "port-info",
@@ -124,7 +114,7 @@ fn build_menu(
     MenuBuilder::new(app)
         .item(&header)
         .separator()
-        .items(&[&sessions, &config, &logs])
+        .item(&dashboard)
         .separator()
         .item(&port_info)
         .separator()
