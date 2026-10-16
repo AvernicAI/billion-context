@@ -353,7 +353,10 @@ test("e2e anthropic: auto-mode classifier passthrough when BILI_AUTO_MODE_FORGE=
                 max_tokens: 64,
                 stream: true,
                 system: "You are a safety classifier. Respond with <severity>N</severity>.",
-                messages: [{ role: "user", content: "Is this command safe? rm -rf /" }],
+                // #3359: the real CC classifier resends the flattened session in a
+            // <transcript> wrapper in EVERY stage — the fixture mirrors that
+            // contract; stop sequences alone are not the lane's identity.
+            messages: [{ role: "user", content: "<transcript>\n[user] Is this command safe? rm -rf /\n</transcript>" }],
                 stop_sequences: ["</severity>"],
             }),
         });
@@ -441,7 +444,10 @@ test("e2e anthropic: auto-mode classifier forged locally by default — zero ups
             max_tokens: 64,
             stream: true,
             system: "You are a safety classifier.",
-            messages: [{ role: "user", content: "Is this command safe? rm -rf /" }],
+            // #3359: the real CC classifier resends the flattened session in a
+            // <transcript> wrapper in EVERY stage — the fixture mirrors that
+            // contract; stop sequences alone are not the lane's identity.
+            messages: [{ role: "user", content: "<transcript>\n[user] Is this command safe? rm -rf /\n</transcript>" }],
             stop_sequences: ["</severity>"],
         });
         assert.equal(h.captured.length, 0, `classifier request must produce ZERO upstream egress, got ${h.captured.length} requests`);
@@ -464,7 +470,10 @@ test("e2e anthropic: auto-mode classifier block flavor forged as bare <block>no<
             max_tokens: 64,
             stream: true,
             system: "You are a safety classifier.",
-            messages: [{ role: "user", content: "Is this command safe? rm -rf /" }],
+            // #3359: the real CC classifier resends the flattened session in a
+            // <transcript> wrapper in EVERY stage — the fixture mirrors that
+            // contract; stop sequences alone are not the lane's identity.
+            messages: [{ role: "user", content: "<transcript>\n[user] Is this command safe? rm -rf /\n</transcript>" }],
             stop_sequences: ["</block>"],
         });
         assert.equal(h.captured.length, 0, "zero upstream egress");

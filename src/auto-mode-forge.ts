@@ -129,16 +129,17 @@ export function requestText(parsed: AnthropicRequestBody): string {
 }
 
 /** True for BOTH stages and BOTH flavors — see the module header for why each
- *  signal exists and which shapes carry it. */
+ *  signal exists and which shapes carry it. #3359: the <transcript> wrapper is
+ *  the structural precondition — every stage of the lane resends it and no
+ *  legitimate coding session does. Each signal ALONE can appear in legitimate
+ *  traffic (a user can literally set "</severity>" as a stop sequence), so a
+ *  stop-word hit corroborates the wrapper; it never triggers on its own. */
 export function isAutoModeClassifier(parsed: AnthropicRequestBody): boolean {
-    const stops = parsed.stop_sequences;
-    if (Array.isArray(stops) && stops.some((s) => typeof s === "string" && AUTO_MODE_CLASSIFIER_STOPS.has(s))) {
-        return true;
-    }
     const text = requestText(parsed);
-    const hasTranscript = text.includes(TRANSCRIPT_MARKER);
-    if (!hasTranscript) return false;
-    return [...SEVERITY_FLAVOR_MARKERS, ...BLOCK_FLAVOR_MARKERS, ...SHARED_POLICY_MARKERS]
+    if (!text.includes(TRANSCRIPT_MARKER)) return false;
+    const stops = parsed.stop_sequences;
+    const stopHit = Array.isArray(stops) && stops.some((s) => typeof s === "string" && AUTO_MODE_CLASSIFIER_STOPS.has(s));
+    return stopHit || [...SEVERITY_FLAVOR_MARKERS, ...BLOCK_FLAVOR_MARKERS, ...SHARED_POLICY_MARKERS]
         .some((marker) => text.includes(marker));
 }
 

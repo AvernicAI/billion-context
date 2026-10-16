@@ -55,10 +55,20 @@ const SEVERITY_SYS = "You are a safety classifier. 50 is exactly the allow/block
 const BLOCK_SYS = 'Respond with <block>yes</block> or <block>no</block>.';
 const TRANSCRIPT_USER = [{ type: "text" as const, text: "<transcript>\n[user] run deploy\n[assistant] done\n</transcript>" }];
 
-test("isAutoModeClassifier: stage-1 non-fast — magic stop sequences are sufficient alone", () => {
-    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["</severity>"] })));
-    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["</block>"] })));
-    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["junk", "</severity>", "more"] })));
+test("isAutoModeClassifier: stage-1 non-fast — magic stops corroborate the <transcript> wrapper", () => {
+    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["</severity>"], messages: [{ role: "user", content: TRANSCRIPT_USER }] })));
+    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["</block>"], messages: [{ role: "user", content: TRANSCRIPT_USER }] })));
+    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["junk", "</severity>", "more"], messages: [{ role: "user", content: TRANSCRIPT_USER }] })));
+});
+
+// #3359 regression: the stop-word arm used to short-circuit ALONE, forging an
+// allow verdict for any anthropic-wire request whose stop_sequences carried
+// </severity>/</block> — non-classifier traffic replaced by a local garbage
+// answer with zero egress. The conjunction (transcript wrapper) is mandatory.
+test("isAutoModeClassifier: #3359 — stop words WITHOUT the <transcript> wrapper do not trigger", () => {
+    assert.ok(!isAutoModeClassifier(req({ stop_sequences: ["</severity>"] })), "severity stop alone");
+    assert.ok(!isAutoModeClassifier(req({ stop_sequences: ["</block>"] })), "block stop alone");
+    assert.ok(!isAutoModeClassifier(req({ stop_sequences: ["junk", "</severity>", "more"] })), "severity stop mixed with junk, no transcript");
 });
 
 test("isAutoModeClassifier: no-stop shapes (stage-1-fast / stage-2) — policy wording AND <transcript> wrapper", () => {
