@@ -352,6 +352,15 @@ export class UnifiedShadow {
         return this.store.lookupConversation(namespace, conversationId);
     }
 
+    /** #3049: O(1) counter probe backing the persist stale-guard fast path.
+     *  Safe on a disabled sidecar? NO — call sites must check stats first
+     *  (this throws like every other pass-through; the guard treats any
+     *  failure as "no fast path" and falls back to the full envelope read). */
+    sessionCounters(sessionId: string): { requests: number; nextBlockId: number } | null {
+        this.assertLive();
+        return this.store.sessionCounters(sessionId);
+    }
+
     listConversationBindings(namespace?: string): { namespace: string; conversationId: string; sessionId: string; claimedAt: number }[] {
         this.assertLive();
         return this.store.listConversationBindings(namespace);

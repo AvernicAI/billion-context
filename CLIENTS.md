@@ -788,7 +788,7 @@ file (2.x rejects bare file paths in the config `plugin` array); **1.x**
 hosts get the bare file path.
 
 What the plugin does (both generations): registers the bili tools natively
-in-host — compress / decompress / search_context / acp_status (+ absorb) —
+in-host — compress / decompress / search_context / acp_status —
 and stamps the proxy headers on every outgoing provider request, including
 context-window / max-output read from the host's own model catalog
 (`ctx.catalog.model.list()`, refreshed every 60s) and reported to the proxy

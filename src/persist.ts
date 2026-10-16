@@ -108,6 +108,13 @@ const MIGRATION_MARKER = ".bili-migration-286.done";
 
 const STALE_WARN_THROTTLE_MS = 60_000;
 
+/** #3049: slack for the ownership fast path's mtime check — covers this
+ *  process's own write latency (builder → atomic write lands a few ms after
+ *  builtAtMs). Foreign writes landing INSIDE this window are missed for one
+ *  cycle only if their writer also bypasses the shared index (disabled
+ *  sidecar); see ownershipFastPath. */
+const OWN_COMMIT_GRACE_MS = 1_500;
+
 interface PersistedSession {
     version: number;
     savedAt: number;
@@ -314,6 +321,25 @@ export class SessionStore {
     private readonly store: StateStore<PersistedSession>;
     private readonly log: Logger;
     private readonly staleWarnAt = new Map<string, number>();
+
+    /** #3049: ownership token for the stale-guard fast path. Set INSIDE the
+     *  guardedBuild closure after the sidecar ingest of the record we are
+     *  about to write (or the disk record we adopted): {counters of that
+     *  commit, wall-clock build time}. The next guard compares this token
+     *  against the unified row + the envelope file's mtime to prove nobody
+     *  else committed since — skipping the full-file read+parse that costs
+     *  ~320ms/turn on >40MiB sessions. Cleared on the direct-write paths
+     *  (restore/rekey) that bypass guardedBuild. */
+    private readonly ownCommit = new Map<string, { requests: number; nextBlockId: number; builtAtMs: number }>();
+
+    /** #3049 test seam: how many times the stale guard took the FULL
+     *  envelope read (the expensive path). The fast path collapses this to
+     *  one read per external writer, not one read per save. */
+    private staleGuardFullReads = 0;
+
+    __staleGuardFullReadsForTests(): number {
+        return this.staleGuardFullReads;
+    }
     private readonly codec?: StateStoreCodec;
     private readonly readCodec: StateStoreCodec;
     private boundedReads = false;
@@ -564,6 +590,11 @@ export class SessionStore {
                 // negative value is gone from disk.
                 await this.store.writeNow(id, () => buildRecord(session));
                 clamped++;
+                // #3049: the clamp rewrite writes a DIFFERENT payload than any
+                // ingested record (clamped stats) without a sidecar ingest —
+                // drop any stale token; boot-time loads have none, but keep
+                // this correct for future callers.
+                this.ownCommit.delete(id);
             }
             out.set(id, session);
         }
@@ -998,6 +1029,10 @@ export class SessionStore {
             }
             session.id = label;
             await this.store.writeNow(label, () => buildRecord(session));
+            // #3049: direct write bypassing guardedBuild — the boot rekey
+            // rewrites envelopes without the sidecar ingest, so any prior
+            // ownership token for this id is stale.
+            this.ownCommit.delete(label);
             await this.removeLegacyFile(id, session);
             const envelope = loaded.get(id);
             if (envelope) {
@@ -1406,6 +1441,13 @@ export class SessionStore {
         record.meta = { ...record.meta, restoredFrom: cp.session_id, restoredCheckpoint: cp.cp_id } as PersistedSession["meta"];
         await this.store.writeNow(newId, () => record);
         shadow.record(record);
+        // #3049: the replica record was ingested from the checkpoint payload
+        // — the ownership token must mirror exactly those counters.
+        this.ownCommit.set(newId, {
+            requests: record.stats?.requests ?? record.requests ?? 0,
+            nextBlockId: record.state?.nextBlockId ?? 0,
+            builtAtMs: Date.now(),
+        });
         // Materialize the content-store sidecar for the restored id too:
         // buildRecord drops forkContentStore on the next live save (no fork
         // receipt), so the record alone is not durable — the sidecar is what
@@ -1482,8 +1524,18 @@ export class SessionStore {
      *  holding a STALE in-memory copy would roll counters back (requests:3 →
      *  2). Both signals below are monotonic per session id, so either being
      *  strictly smaller proves staleness. Returns the fresher-on-disk payload
-     *  when the incoming record is stale, else null. */
+     *  when the incoming record is stale, else null.
+     *
+     *  #3049: the guard used to re-read and re-parse the ENTIRE envelope on
+     *  every save just to compare these two numbers (~320ms and a full file
+     *  read per turn on >40MiB sessions). ownershipFastPath proves — without
+     *  reading the file — that no other writer has committed since OUR last
+     *  build, in which case the disk record is exactly the one this builder
+     *  chain last wrote (or converged to), and the in-process comparison
+     *  below (monotonic counters, same session object) is sufficient. */
     private staleDiskPayload(incoming: PersistedSession): PersistedSession | null {
+        if (this.ownershipFastPath(incoming)) return null;
+        this.staleGuardFullReads++;
         const envelope = this.loadEnvelope(incoming.id, incoming.meta);
         if (!envelope) return null;
         const disk = envelope.payload;
@@ -1494,6 +1546,76 @@ export class SessionStore {
             const diskBlocks = disk.state?.nextBlockId ?? 0;
             const incBlocks = incoming.state?.nextBlockId ?? 0;
             if (incBlocks < diskBlocks) return disk;
+        }
+        return null;
+    }
+
+    /** #3049 ownership fast path — proves "the disk envelope is still the
+     *  record this process last committed" with three cheap signals, no
+     *  payload read:
+     *
+     *  1. Unified row counters equal OUR last commit's counters. Every
+     *     shadow/full instance sharing the directory shares index.db (#394
+     *     multi-process topology), and each commit ingests before it writes
+     *     the file — so a sibling's newer commit bumps the row first and this
+     *     comparison fails, falling back to the exact full read.
+     *  2. The envelope file's mtime is not newer than our last build (plus
+     *     grace for our own write latency). A writer that does NOT share the
+     *     index (legacy-mode sibling, manual edit) still touches the file, and
+     *     an mtime past our build window forces the full read.
+     *  3. The incoming counters are not behind our own commit — they cannot
+     *     be, in-process (same session object, monotonic counters), but the
+     *     check keeps this path self-contained; any surprise defers to the
+     *     full read.
+     *
+     *  Residual (deliberate, strictly narrower than an unconditional
+     *  size/mtime ownership skip): a sibling whose sidecar is DISABLED (3-
+     *  strike drift) writing a newer envelope within the same grace window
+     *  (~1.5s) as our build is missed for one cycle; its next write wins the
+     *  exact guard again. Crash safety is clean: a process that dies between
+     *  its DB ingest and its file write leaves no token here (fresh map), so
+     *  the next boot always takes the full read. */
+    private ownershipFastPath(incoming: PersistedSession): boolean {
+        const own = this.ownCommit.get(incoming.id);
+        if (!own) return false;
+        const shadow = this.shadow;
+        if (!shadow || shadow.stats.disabled) return false; // shadow/full only — legacy stays exact
+        const incRequests = incoming.stats?.requests ?? incoming.requests ?? 0;
+        const incBlocks = incoming.state?.nextBlockId ?? 0;
+        if (incRequests < own.requests || incBlocks < own.nextBlockId) return false;
+        let row: { requests: number; nextBlockId: number } | null = null;
+        try {
+            row = shadow.sessionCounters(incoming.id);
+        } catch {
+            return false; // sidecar hiccup — full read decides
+        }
+        if (!row || row.requests !== own.requests || row.nextBlockId !== own.nextBlockId) return false;
+        const stat = this.statEnvelope(incoming.id, incoming.meta);
+        if (!stat) return false;
+        if (stat.mtimeMs > own.builtAtMs + OWN_COMMIT_GRACE_MS) return false;
+        return true;
+    }
+
+    /** #3049: stat the envelope the way loadEnvelope would resolve it — the
+     *  kernel-discovered source file first, then the canonical live paths.
+     * Null when no file exists yet (first save: the full read correctly
+     * returns null-fast via loadEnvelope's miss). */
+    private statEnvelope(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): { mtimeMs: number } | null {
+        const candidates: string[] = [];
+        const known = this.sourceFiles.get(id);
+        if (known) candidates.push(known);
+        candidates.push(
+            path.join(this.sessionsDir, relPathFor(id, meta?.protocol, meta?.upstreamOrigin)),
+            path.join(this.sessionsDir, relPathFor(id)),
+            path.join(this.sessionsDir, flatFileNameFor(id)),
+        );
+        for (const file of candidates) {
+            try {
+                const st = statSync(file);
+                return { mtimeMs: st.mtimeMs };
+            } catch {
+                // try next
+            }
         }
         return null;
     }
@@ -1525,6 +1647,7 @@ export class SessionStore {
                 this.shadow?.record(record, tail && tail.length > 0
                     ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
                     : undefined, session.contentStore ?? undefined);
+                this.noteOwnCommit(session.id, record);
                 return record;
             }
             const now = Date.now();
@@ -1546,8 +1669,22 @@ export class SessionStore {
             this.shadow?.record(disk);
             // Rewrite the disk's own payload: content-identical no-op that
             // preserves the newer state while satisfying the write chain.
+            this.noteOwnCommit(session.id, disk);
             return disk;
         };
+    }
+
+    /** #3049: record what THIS builder chain just committed (the record it
+     *  returned — our fresh build, or the disk payload the guard made us
+     *  adopt). The unified row was ingested from the same payload in the same
+     *  closure, so token counters === row counters until any other writer
+     *  commits. Called from inside the guardedBuild closure only. */
+    private noteOwnCommit(id: string, committed: PersistedSession): void {
+        this.ownCommit.set(id, {
+            requests: committed.stats?.requests ?? committed.requests ?? 0,
+            nextBlockId: committed.state?.nextBlockId ?? 0,
+            builtAtMs: Date.now(),
+        });
     }
 
     /** #2401: read-side convergence. Replace the live session's persisted

@@ -72,6 +72,23 @@ export async function probeIncrementalTurns(proxyBase: string, fetchImpl: typeof
     return ok;
 }
 
+/** Does this message list look like the Anthropic wire shape the lane's
+ *  anthropicToCore can ingest? OpenAI-tool shapes (role:"tool"/"function",
+ *  assistant.tool_calls, tool_call_id) are NOT convertible — the adapter
+ *  falls back to a full resend for those conversations (correctness over
+ *  savings). Content may be a string or a block array, both fine. */
+export function wireMessagesLookAnthropic(messages: unknown): messages is IncrementalWireMessage[] {
+    if (!Array.isArray(messages) || messages.length === 0) return false;
+    for (const m of messages) {
+        if (m === null || typeof m !== "object") return false;
+        const msg = m as { role?: unknown; content?: unknown; tool_calls?: unknown; tool_call_id?: unknown };
+        if (typeof msg.role !== "string" || msg.role === "tool" || msg.role === "function") return false;
+        if (msg.tool_calls !== undefined || msg.tool_call_id !== undefined) return false;
+        if (typeof msg.content !== "string" && !Array.isArray(msg.content)) return false;
+    }
+    return true;
+}
+
 function wireHash(m: IncrementalWireMessage): string {
     return createHash("sha256").update(`${m.role}\u0000${JSON.stringify(m.content)}`).digest("hex").slice(0, 16);
 }

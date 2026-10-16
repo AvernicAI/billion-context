@@ -452,6 +452,19 @@ test("incremental client helper: seed implies resync, delta slices, edits resync
     __resetIncrementalClientForTests();
 });
 
+test("wireMessagesLookAnthropic: anthropic shapes pass, OpenAI-tool shapes fall back to full resend", async () => {
+    const { wireMessagesLookAnthropic } = await import("../src/agent/incremental-client.js");
+    assert.equal(wireMessagesLookAnthropic([{ role: "user", content: "hi" }]), true, "string content");
+    assert.equal(wireMessagesLookAnthropic([{ role: "user", content: [{ type: "text", text: "hi" }] }]), true, "block content");
+    assert.equal(wireMessagesLookAnthropic([{ role: "assistant", content: [{ type: "tool_use", id: "t", name: "x", input: {} }] }, { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "ok" }] }]), true, "anthropic tool blocks are native wire shape");
+    assert.equal(wireMessagesLookAnthropic([]), false, "empty list is not a conversation");
+    assert.equal(wireMessagesLookAnthropic("nope"), false);
+    assert.equal(wireMessagesLookAnthropic([{ role: "user", content: "hi" }, { role: "tool", content: "out" }]), false, "OpenAI tool role is not convertible");
+    assert.equal(wireMessagesLookAnthropic([{ role: "assistant", content: "x", tool_calls: [{ id: "c", type: "function", function: { name: "f" } }] }]), false, "tool_calls cannot ride anthropicToCore");
+    assert.equal(wireMessagesLookAnthropic([{ role: "user", content: "hi", tool_call_id: "c" }]), false);
+    assert.equal(wireMessagesLookAnthropic([{ role: "user", content: 42 }]), false, "content must be string or array");
+});
+
 test("incrementalTurnBodyShape accepts the incremental payload and rejects anthropic/garbage", async () => {
     const { incrementalTurnBodyShape } = await import("../src/incremental-lane.js");
     const inc = Buffer.from(JSON.stringify({ conversationId: "c1", sinceSeq: 0, request: {}, messages: [] }));

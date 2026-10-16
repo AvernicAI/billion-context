@@ -11,7 +11,6 @@ import {
 } from "acp-kernel";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
 import { IMAGE_PLACEHOLDER, imagePlaceholdersForSummary } from "./image-note.js";
-import { applyAbsorbView } from "./absorb.js";
 import { adoptContentStore, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
@@ -1638,7 +1637,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             });
             deps.session.state = turn.state;
             adoptContentStore(deps.session, turn.contentStore);
-            const view = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
+            const view = turn.messages;
             const est = applyEstimateCalibration(estimateCoreMessages(view) + wireOverhead, kFactor, kOrigin, deps.upstreamOrigin) + imageReserve;
             result.payloadEstimate = est;
             // #2952 review: keep the char-count UPPER bound fresh through recovery.
@@ -1807,7 +1806,6 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         adoptContentStore(deps.session, turn.contentStore);
         // Absorbed pairs are hidden on the wire, so the fit check must see the
         // same reduced payload prepare* will actually forward.
-        turn.messages = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
         // Floor on the session's measured input baseline: the upstream's
         // input_tokens also covers the system prompt + tool definitions, which
         // are not in turn.messages, so the direct estimate can undershoot.

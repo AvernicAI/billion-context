@@ -44,7 +44,6 @@ import {
     BILI_DECOMPRESS_TOOL_OPENAI,
     BILI_DECOMPRESS_TOOL_RESPONSES,
     BILI_DECOMPRESS_TOOL_GOOGLE,
-    ABSORB_TOOL_RESPONSES,
     RULE_TOOL,
     RULE_TOOL_OPENAI,
     RULE_TOOL_RESPONSES,
@@ -273,7 +272,6 @@ const BILI_ARRAYS: Array<[string, Wire]> = [
 const BILI_INDIVIDUALS: Array<[string, Wire]> = [
     ["BILI_SEARCH_CONTEXT_TOOL", "anthropic"], ["BILI_SEARCH_CONTEXT_TOOL_OPENAI", "openai-chat"], ["BILI_SEARCH_CONTEXT_TOOL_RESPONSES", "responses"], ["BILI_SEARCH_CONTEXT_TOOL_GOOGLE", "google"],
     ["BILI_DECOMPRESS_TOOL", "anthropic"], ["BILI_DECOMPRESS_TOOL_OPENAI", "openai-chat"], ["BILI_DECOMPRESS_TOOL_RESPONSES", "responses"], ["BILI_DECOMPRESS_TOOL_GOOGLE", "google"],
-    ["ABSORB_TOOL_RESPONSES", "responses"],
     ["RULE_TOOL", "anthropic"], ["RULE_TOOL_OPENAI", "openai-chat"], ["RULE_TOOL_RESPONSES", "responses"], ["RULE_TOOL_GOOGLE", "google"],
 ];
 
@@ -281,7 +279,7 @@ const BILI_CONSTANTS: Record<string, unknown> = {
     BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_READONLY_TOOLS_RESPONSES,
     BILI_SEARCH_CONTEXT_TOOL, BILI_SEARCH_CONTEXT_TOOL_OPENAI, BILI_SEARCH_CONTEXT_TOOL_RESPONSES, BILI_SEARCH_CONTEXT_TOOL_GOOGLE,
     BILI_DECOMPRESS_TOOL, BILI_DECOMPRESS_TOOL_OPENAI, BILI_DECOMPRESS_TOOL_RESPONSES, BILI_DECOMPRESS_TOOL_GOOGLE,
-    ABSORB_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, RULE_TOOL_GOOGLE,
+    RULE_TOOL, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, RULE_TOOL_GOOGLE,
     RETRIEVE_TOOLS: retrieveToolsFor("acp_retrieve"),
 };
 
@@ -347,25 +345,25 @@ test("wire-contract C: default manifest serves only legal base tools", () => {
     assertManifestLegal(m, "default");
     const anthNames = new Set(m.tools.anthropic.map((t) => t.name));
     for (const n of BILI_ACP_TOOLS_ANTHROPIC.map((t) => t.name)) assert.ok(anthNames.has(n), `default manifest: base tool ${n} present`);
-    for (const optIn of ["absorb", "acp_retrieve"]) assert.ok(!anthNames.has(optIn), `default manifest: ${optIn} absent when disabled (#1192)`);
-    assert.ok(!anthNames.has("acp_rule"), "default manifest: acp_rule absent — opt-in like absorb (#1192 discipline)");
+    for (const optIn of ["acp_retrieve"]) assert.ok(!anthNames.has(optIn), `default manifest: ${optIn} absent when disabled (#1192)`);
+    assert.ok(!anthNames.has("acp_rule"), "default manifest: acp_rule absent — opt-in extra (#1192 discipline)");
     const offM = captureManifest({ ...defaultConfig(100_000), rules: { enabled: false } });
     assert.ok(!new Set(offM.tools.anthropic.map((t) => t.name)).has("acp_rule"), "disabled manifest: acp_rule absent (#1192)");
     assertCompressFormsKept(m.tools.anthropic.find((t) => t.name === "compress") as ToolShape, "manifest-default");
 });
 
-test("wire-contract C: opt-in manifest advertises absorb/acp_rule/acp_retrieve legally", () => {
-    const config = { ...defaultConfig(100_000), absorb: { ...K.DEFAULT_ABSORB_CONFIG, enabled: true }, rules: { enabled: true }, ccr: { ...K.DEFAULT_CCR_CONFIG, enabled: true } };
+test("wire-contract C: opt-in manifest advertises acp_rule/acp_retrieve legally", () => {
+    const config = { ...defaultConfig(100_000), rules: { enabled: true }, ccr: { ...K.DEFAULT_CCR_CONFIG, enabled: true } };
     const m = captureManifest(config);
     assertManifestLegal(m, "optin");
     const anthNames = new Set(m.tools.anthropic.map((t) => t.name));
     const openAiNames = new Set(m.tools.openai.map((t) => toolNameOf("openai-chat", t)));
     const respNames = new Set(m.tools.responses.map((t) => t.name));
-    for (const n of ["absorb", "acp_rule", "acp_retrieve"]) {
+    for (const n of ["acp_rule", "acp_retrieve"]) {
         assert.ok(anthNames.has(n), `optin manifest: anthropic advertises ${n}`);
         assert.ok(openAiNames.has(n), `optin manifest: openai advertises ${n}`);
     }
-    for (const n of ["absorb", "acp_rule"]) assert.ok(respNames.has(n), `optin manifest: responses advertises ${n}`);
+    assert.ok(respNames.has("acp_rule"), "optin manifest: responses advertises acp_rule");
     assert.ok(!respNames.has("acp_retrieve"), "optin manifest: responses does NOT advertise acp_retrieve (#1271)");
     assertCompressFormsKept(m.tools.anthropic.find((t) => t.name === "compress") as ToolShape, "manifest-optin");
 });
@@ -519,12 +517,12 @@ for (const lane of LANES) {
     });
 }
 
-test("wire-contract D: opt-in lane (absorb+rules+ccr) forwards the extended surface legally", async () => {
+test("wire-contract D: opt-in lane (rules+ccr) forwards the extended surface legally", async () => {
     const lane = LANES[0];
     const fake = await startFakeUpstream(lane.wire);
     let rig: Rig | undefined;
     try {
-        rig = await startRig(fake.url, lane.model, { absorb: { enabled: true }, rules: true, ccr: { enabled: true } });
+        rig = await startRig(fake.url, lane.model, { rules: true, ccr: { enabled: true } });
         const res = await fetch(`${rig.proxyUrl}${lane.path}`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-api-key": "test", "x-acp-session": "wc-anth-optin" },
@@ -534,8 +532,8 @@ test("wire-contract D: opt-in lane (absorb+rules+ccr) forwards the extended surf
         await res.text();
         assert.equal(fake.violations.length, 0, `opt-in fake violations:\n${fake.violations.join("\n")}`);
         const fwdNames = extractForwardedNames(lane.wire, fake.requests[0].body);
-        const expected = [...BASE_EXPECTED[lane.wire], ...lane.clientToolNames, "acp_rule", "absorb", "acp_retrieve"].sort();
-        assert.deepEqual(fwdNames.sort(), expected, "opt-in lane forwards base + acp_rule (rules:true) + absorb/acp_retrieve + client tools");
+        const expected = [...BASE_EXPECTED[lane.wire], ...lane.clientToolNames, "acp_rule", "acp_retrieve"].sort();
+        assert.deepEqual(fwdNames.sort(), expected, "opt-in lane forwards base + acp_rule (rules:true) + acp_retrieve + client tools");
         const fwdTools = (fake.requests[0].body as ToolShape).tools;
         const compress = (Array.isArray(fwdTools) ? fwdTools : []).find((t) => (t as ToolShape).name === "compress") as ToolShape;
         assert.ok(compress, "opt-in forwarded body carries compress");

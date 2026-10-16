@@ -102,7 +102,7 @@ bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home*
 
 三种故障形态共享 `src/session-self-heal.ts` 里的同一族检测器,每请求评估一次(prepare 之后,仅有 nudge 的主车道;旁路/侧请求车道不积累信用):
 
-- **D2 僵尸插件车道** —— 插件已卸载(或 MCP 子进程已死)但已开着的客户端窗口仍带着插件绑定(粘滞 `metadata.pluginAgent`)。信号:连续 5 轮(`SELF_HEAL_WINDOW`)被 nudge、**无** `x-bili-plugin` 头、线上**无** bili 工具声明、**零**压缩缩减。补救:**降级为代理模式** —— 单点 `pluginMode` 翻转(`pluginAgent !== undefined && !pluginLaneDegraded(session)`)线上回注 ACP 工具、重新接管压缩 rewriter/CCR 盖章/absorb,并**保留 nudge**(工具回来了)。线上注入不可用时(`compress.injectTool=false` → `degradeAvailable=false`)退为**静默 nudge**。恢复:**活的**插件头(`pluginLaneRestore`,在 `pluginMode` 翻转**之前**调用,首个带头请求即恢复 plugin 模式 —— 恢复信号绝不能用粘滞 `pluginAgent`,否则降级一轮后即被自己清掉)。绑定保留、永不抹除。
+- **D2 僵尸插件车道** —— 插件已卸载(或 MCP 子进程已死)但已开着的客户端窗口仍带着插件绑定(粘滞 `metadata.pluginAgent`)。信号:连续 5 轮(`SELF_HEAL_WINDOW`)被 nudge、**无** `x-bili-plugin` 头、线上**无** bili 工具声明、**零**压缩缩减。补救:**降级为代理模式** —— 单点 `pluginMode` 翻转(`pluginAgent !== undefined && !pluginLaneDegraded(session)`)线上回注 ACP 工具、重新接管压缩 rewriter/CCR 盖章,并**保留 nudge**(工具回来了)。线上注入不可用时(`compress.injectTool=false` → `degradeAvailable=false`)退为**静默 nudge**。恢复:**活的**插件头(`pluginLaneRestore`,在 `pluginMode` 翻转**之前**调用,首个带头请求即恢复 plugin 模式 —— 恢复信号绝不能用粘滞 `pluginAgent`,否则降级一轮后即被自己清掉)。绑定保留、永不抹除。
 - **D1 nudge 空转**(非插件泛化)—— 连续 5 轮被 nudge 却零缩减、零 bili 工具调用。补救:在全部四处 `willInjectNudge` 门加 `&& !nudgeSuppressed(session)`(覆盖 emergency 路径)。恢复:任一次压缩缩减或 bili 工具调用即解除——或者在 `SELF_HEAL_SUPPRESS_CAP_MS`(10 分钟)内两者皆无时,抑制到时自解并重新武装(#3004/#3008:上下文单调增长时永远产生不了恢复证据,纯证据式解除曾把建议通道锁死一个多小时而用量停在 ~75%)。重新武装是有界的:再空转完整一个 `SELF_HEAL_WINDOW`(5 轮)才会再次抑制;决策梯的 fallback 逃逸在抑制期间仍可打出一次性 legacy 建议(`consumeFallback` 重置计数)。
 - **D3 网关杀摘要** —— **非流式** preflight 摘要以 HTTP 524/504(Cloudflare 类)死亡时不再原地重试(旧的 transient 重试对着死网关每次烧 ~100 秒);会话在**首次**命中即学习 `metadata.preflightStreamSummary = true` 并改用 SSE 重取摘要 —— 与手动 `compress.streamSummary` 旋钮(#2133)同一学习存储,自动武装。级联双向被尊重:任一级显式 `streamSummary: false`(global → provider → model)即操作员 opt-out —— 两条学习路径都不武装、已学习的旧标志被忽略(`PreflightDeps.streamSummaryOff`)。
 
@@ -113,7 +113,7 @@ bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home*
 一个 PR 把三条整治腿合并(refs-run 残留 #2023、退化闭名剥离+出口审计网 #2190、emission 整段丢弃+签名思考 verbatim #2066),并统一受四条硬规则约束 —— 覆盖**所有**文本改写面(loop 适配器、插件直通、JSON strip 函数、出口审计):
 
 1. **思考通道逐字节不动。** Anthropic `thinking`、Google `thought`、OpenAI `reasoning_content`/`reasoning`、Responses reasoning summaries 原样透传 —— 哪怕长得像标签回声。理由:reasoning 回放(DeepSeek 式)与签名校验验证的就是这些字节,任何改写都会让它们失步并卡死会话(#1960/KDD#10)。适配器侧走 `createIdentityStreamFilter`,strip 函数(`stripOpenaiChatText`、`stripResponsesText`)同样不动它们(纵深防御)。**注意:这翻转了 #1881 时代的 reasoning 回声剥离 —— 思考通道不再清洗。**
-2. **模型的正文输出可以治理。** 渲染标签回声、marker 行、bili 内部文本、退化开/闭名残骸,以及(absorb 受指令时)整段工具调用 emission,只在可见文本通道剥离。
+2. **模型的正文输出可以治理。** 渲染标签回声、marker 行、bili 内部文本、退化开/闭名残骸,以及(受指令时)整段工具调用 emission,只在可见文本通道剥离。
 3. **模型写入文件的内容逐字节不变(#1039)。** 工具调用 arguments 无论携带什么字节都不进任何过滤器。
 4. **用户发送的消息永不被改写。** 用户自己片段的逐字回声在武装清洗下也保留(#463 豁免,按请求文本匹配,不按形状)。
 
