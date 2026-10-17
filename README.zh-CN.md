@@ -338,6 +338,16 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 该检查默认 fail-open:公告源不可达或格式错误只产生警告,绝不阻断模型流量。禁用方式:配置(`"advisoryCheck": false`)或环境变量(`BILI_ADVISORY_CHECK=0`);可用 `"advisoryUrl"` / `BILI_ADVISORY_URL` 指向自定义文档。
 
+### 运行多个实例(#3633)
+
+所有状态都**严格本地于每个实例**:会话文件在会话目录下(默认 `~/.local/share/billion-context/sessions`,可用 `BILI_SESSIONS_DIR` 迁移)、统一 SQLite 索引(`index.db`,WAL 模式 —— `BILI_STORAGE_UNIFIED` 见 [CONFIGURATION.md](CONFIGURATION.zh-CN.md#环境变量))、以及前缀亲和链(XDG state 目录下的 `prefix-affinity.json`)。**没有复制、没有共享存储、没有主从选举** —— 多实例部署可以工作,但把粘滞(pinning)的责任交给了你的负载均衡器。让它安全运行的规则:
+
+- **每实例一个卷,绝不共享文件系统。** Kubernetes 语境下:StatefulSet + ReadWriteOnce PVC,每个 ordinal 一个。不要把会话目录挂到网络文件系统上(ReadWriteOnceMany/NFS/CIFS):WAL 模式需要一致的 `-shm` 伴随文件加字节级锁,NFS 类文件系统不提供;而 store 的 `busy_timeout=5000` 会把由此产生的硬失败变成**静默损坏**,而不是干净报错。两个进程写同一个本地目录同理 —— 该单机共存场景及其安全边界见 [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md#shared-state-dir-and-multi-instance-security-boundary-394--1724)。
+- **每个客户端在其会话生命周期内固定到一个实例。** 落在从未见过它的实例上的会话是**冷**的 —— 没有索引行、没有会话文件、没有前缀亲和链 —— 压缩历史与前缀缓存亲和对该实例不可见(并未丢失:它们仍留在持有它的实例上)。基于 ClientIP 的粘滞对 NAT 后或地址会漂移的客户端会失效;按 session id(或稳定的客户端令牌)做粘滞才是稳健形态。
+- **没有故障转移。** 缩容会让活跃会话滞留在被移除的实例上,直到流量回来;扩容能恢复它们,因为 StatefulSet 会把同一 ordinal 的卷重新绑定(PVC retention `Retain`),前缀亲和链会在启动时从磁盘水合。这是「钉住且不丢」,不是「任意副本可服务任意会话」——容量规划请据此进行。
+
+命名说明:管理端点 `GET/POST /__bili/checkpoints[/<cpId>]`(及其弃用别名 `/__bili/replicas/…`)指的是**会话检查点** —— 把一个会话的持久化状态冻结下来、再物化为一个新会话 —— 与 pod 副本或对等实例无关。同理,`BILI_STORAGE_UNIFIED=shadow|full` 启用的是**本机**双写(同一台机器的 `index.db`)并解锁检查点 API,它不向任何地方复制状态。`GET /__bili/status` 报告 `instanceId`(每进程身份)与 `sessionsOnDisk`(本实例可服务的会话数),便于负载均衡器或运维区分「会话去了别的实例」与「会话被逐出」。
+
 ## 配置
 
 完整的配置参考 —— 配置文件位置、顶层键、providers、压缩调参、环境变量 ——
