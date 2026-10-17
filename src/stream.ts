@@ -997,7 +997,11 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // rebuilds to plain folds: a real usage report supersedes it
         // immediately and the bounded prepare budget falls back to legacy
         // sizing for never-reporting upstreams.
-        setPostRebuildAnchor(ctx.session, postCtx);
+        // Degenerate full-coverage folds (marathon strategy, #1911) can leave
+        // postCtx === 0; the setter no-ops on <=0 and the ghost decision would
+        // survive one more prepare. Anchor to 1 instead — the preflight fit
+        // gate stays the hard backstop either way.
+        setPostRebuildAnchor(ctx.session, Math.max(1, postCtx));
         const ceiling = postCtx > 0 ? Math.floor((100 * anchorTok) / postCtx) : 0;
         ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% (~${r.tokensCompressed}/${viewTokens} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated} anchor≈${anchorTok} tok (${activeBlockCount} active blocks, sys excluded) postCtx≈${postCtx} → next-request cache ceiling ≥${ceiling}%`);
         // #1911: a fold covering most of the live context is a degenerate reset —

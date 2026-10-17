@@ -94,6 +94,45 @@ test("#3573: a fold that out-sizes the meter anchors the next read to the post-f
     assert.ok(meter.tokens < WINDOW, `folded context meters inside the window (got ${meter.tokens}/${WINDOW}, pre-fix ghost was ${raw})`);
 });
 
+test("#3573: a STALE per-turn local estimate (the field's 564% shape) is outranked by the anchor", () => {
+    const ctx = makeCtx();
+    ctx.session.stats.lastInputTokens = 11_579;
+    ctx.session.stats.lastInputTokensSource = "estimate";
+    // The field signature: localInputEstimate lags one turn (#1820 lag note), so
+    // at decision time it still holds the PREVIOUS turn's raw-resent char mass —
+    // ~430K here, ≈215% of the window. Pre-fix the ladder's min(est, raw) branch
+    // returned exactly this ghost and lit EMERGENCY on the freshly-folded session.
+    ctx.session.stats.localInputEstimate = 430_000;
+
+    const out = applyRanges(parseCompressInput(COMPRESS_ARGS), ctx);
+    const text = typeof out === "string" ? out : out.text;
+    assert.ok(text.startsWith("[Compressed"), `fold succeeded (got: ${text})`);
+
+    const anchor = postRebuildAnchorTokens(ctx.session);
+    assert.ok(anchor > 0, "the fold stamped the post-rebuild anchor");
+    const meter = effectiveTokenCount(ctx.session, ctx.messages);
+    assert.equal(meter.tokens, anchor, "anchor branch outranks the stale min(est, raw) ghost branch");
+    assert.ok(meter.tokens < WINDOW, `folded context meters inside the window (got ${meter.tokens}/${WINDOW}, pre-fix ghost was 430000)`);
+});
+
+test("#3573: a degenerate full-coverage fold still stamps an anchor (postCtx=0 edge)", () => {
+    const ctx = makeCtx();
+    ctx.config.preserveRecentMessages = 0;
+    ctx.config.preserveRecentTokens = 0;
+    ctx.config.compress.minCompressRange = 0;
+    ctx.config.compress.minSummaryLength = 0;
+    ctx.session.stats.lastInputTokens = 11_579;
+    ctx.session.stats.lastInputTokensSource = "estimate";
+
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00007", summary: "ISSUE3573-DEGENERATE-FULL-COVERAGE-SUMMARY-LONG-ENOUGH-FOR-MIN-LENGTH" }] }), ctx);
+    const text = typeof out === "string" ? out : out.text;
+    assert.ok(text.startsWith("[Compressed"), `degenerate fold succeeded (got: ${text})`);
+
+    // tokensCompressed covers the whole view -> postCtx === 0 -> the setter's
+    // <=0 no-op would leave NO anchor and one ghost decision would survive.
+    assert.ok(postRebuildAnchorTokens(ctx.session) > 0, "anchor stamped even when the fold leaves nothing behind");
+});
+
 test("#3573: a usage-grade baseline still outranks the post-fold anchor (no behavior change for healthy sessions)", () => {
     const ctx = makeCtx();
     ctx.session.stats.lastInputTokens = 300_000;
