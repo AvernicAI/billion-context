@@ -56,6 +56,7 @@ import {
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled, piPackageStrings } from "./plugin-install.js";
 import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
 import { logHostEvent } from "./agent/host-log.js";
+import { compactionDisablePatchRows } from "./agent/dsh-compaction-disable.js";
 import { log as teeLog } from "./logger.js";
 import { VERSION } from "./version.js";
 import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
@@ -71,6 +72,7 @@ import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHo
 import { allowDshCompactionState, loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveNativeAttachLanePriority, resolveNativeAttachPolicy, resolveNativeAttachUrl, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
+import { normalizeVertexModelId, stripBiliWrappers, vertexBaseUrlForLocation, vertexBaseUrlLacksV1 } from "./vertex.js";
 
 export {
     type ClaudeSettings,
@@ -332,17 +334,41 @@ export function healthUrl(origin: string): string {
     return origin + HEALTH_PATH;
 }
 
-export function wrapUpstream(origin: string, upstream: string): string {
+/** Protocol segments the proxy's /bili/ parser understands, mirrored from
+ *  KNOWN_PROTOCOLS (src/server.ts:251-262). Duplicated instead of imported:
+ *  server.ts sits downstream of launcher.ts, and importing it here would close
+ *  the cycle. A segment pins the wire explicitly for clients whose path shape
+ *  the suffix ladder cannot classify (Vertex's `:rawPredict` /
+ *  `:streamRawPredict` matches no arm, so the request would otherwise be relayed
+ *  with no protocol: no session, no compression). */
+const BILI_URL_PROTOCOLS = ["responses", "anthropic", "openai", "google"] as const;
+type BiliUrlProtocol = (typeof BILI_URL_PROTOCOLS)[number];
+
+/** `<origin>/bili/<upstream>`, or `<origin>/bili/<protocol>/<upstream>` when a
+ *  protocol is given. Protocol-less calls are byte-identical to the previous
+ *  behaviour (all existing call sites). */
+export function wrapUpstream(origin: string, upstream: string, protocol?: BiliUrlProtocol): string {
     const u = upstream.replace(/\/+$/, "");
-    const prefix = origin + "/bili/";
+    const prefix = origin + "/bili/" + (protocol ? `${protocol}/` : "");
     if (u.startsWith(prefix)) return u;
     return prefix + u;
 }
 
-/** Inverse of wrapUpstream: recover the real upstream from a `<…>/bili/<real>` URL. */
+/** Inverse of wrapUpstream: recover the real upstream from a `<…>/bili/<real>`
+ *  or `<…>/bili/<protocol>/<real>` URL. The protocol segment must be stripped
+ *  too, or re-wrapping an already-wrapped value yields
+ *  `/bili/anthropic/anthropic/https://…`. Only the four known segments are
+ *  stripped, so an upstream whose path legitimately begins with a word like
+ *  `google/` survives. */
 export function unwrapUpstream(url: string): string {
     const idx = url.indexOf("/bili/");
-    return idx >= 0 ? url.slice(idx + "/bili/".length) : url;
+    if (idx < 0) return url;
+    const rest = url.slice(idx + "/bili/".length);
+    const slash = rest.indexOf("/");
+    if (slash > 0 && (BILI_URL_PROTOCOLS as readonly string[]).includes(rest.slice(0, slash))) {
+        return rest.slice(slash + 1);
+    }
+    return rest;
 }
 
 /** Loopback destinations (localhost / ::1 / 127.x). dsh's fetch stack bypasses
@@ -359,6 +385,9 @@ export function isLoopbackHost(host: string): boolean {
 export interface HttpRewrite {
     key: string;
     realUpstream: string;
+    /** Wire to pin for this route, emitted as the /bili/<protocol>/ segment.
+     *  Absent for every route the suffix ladder already classifies. */
+    protocol?: BiliUrlProtocol;
 }
 
 export interface DiscoveredRoutes {
@@ -414,20 +443,43 @@ interface DiscoverAcc {
     rewriteKeys: Set<string>;
 }
 
+/** Vertex AI is Claude Code's third-party lane: with `CLAUDE_CODE_USE_VERTEX=1`
+ *  the client ignores ANTHROPIC_BASE_URL and posts to ANTHROPIC_VERTEX_BASE_URL,
+ *  so a launcher that rewrites only the former routes nothing and Vertex traffic
+ *  reaches Google uncompressed. Returns the upstream to route, or null when the
+ *  lane is not on Vertex or no host is derivable (the caller warns loudly — an
+ *  unrouted Vertex lane is a silent bypass, not a degraded mode). */
+function claudeVertexUpstream(settings: ClientConfig["claude"]): string | null {
+    if (!settings?.vertexEnabled) return null;
+    // The configured value may be bili's OWN output: the managed settings block, or
+    // the child env of an earlier launch (readClaudeSettings falls back to the
+    // process env, where Claude Code exports the settings block). Wrap that as-is
+    // and every launch nests another /bili/anthropic/ layer — the extra hop then
+    // targets the proxy's own port, which the tunnel guard denies (403
+    // detail:"self"). Unwrap first, then re-wrap against THIS origin: that is also
+    // the drift repair, since the lane's port can move between launches.
+    const configured = typeof settings.vertexBaseUrl === "string" ? settings.vertexBaseUrl.trim() : "";
+    return vertexBaseUrlForLocation(settings.vertexRegion, configured.length > 0 ? stripBiliWrappers(configured) : undefined);
+}
+
 /** Family F1 — relay wrap for single-base-URL clients (claude, codebuddy's
  *  base-URL leg, gemini, iflow, antigravity): unwrap the configured base URL
  *  (the built-in `fallback` when unset/blank) and route it through the /bili/
  *  URL form as a single httpRewrites entry under `key`, for any http(s)
  *  upstream. Unparseable base URLs leave routes empty. Semantics extracted
- *  byte-for-byte from those five branches. */
-function relayWrapRoute(acc: DiscoverAcc, cfgRaw: string | undefined, fallback: string, key: string): void {
+ *  byte-for-byte from those five branches.
+ *
+ *  `protocol` is the one addition: an entry may pin the wire via the
+ *  /bili/<protocol>/ segment (see BILI_URL_PROTOCOLS). Only claude's Vertex
+ *  route passes it; every other caller keeps the protocol-less form. */
+function relayWrapRoute(acc: DiscoverAcc, cfgRaw: string | undefined, fallback: string, key: string, protocol?: BiliUrlProtocol): void {
     const raw = nonEmpty(cfgRaw) ? cfgRaw : fallback;
     const real = unwrapUpstream(raw);
     try {
         const url = new URL(real);
         if ((url.protocol === "https:" || url.protocol === "http:") && !acc.rewriteKeys.has(key)) {
             acc.rewriteKeys.add(key);
-            acc.httpRewrites.push({ key, realUpstream: real });
+            acc.httpRewrites.push({ key, realUpstream: real, ...(protocol !== undefined ? { protocol } : {}) });
         }
     } catch {
         // Unparseable base URL: leave routes empty (proxy still runs; the
@@ -544,6 +596,11 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         // Unparseable base URL: leave routes empty (proxy still runs; claude
         // falls back to its own default endpoint).
         relayWrapRoute(acc, config.claude?.anthropicBaseUrl, "https://api.anthropic.com", "ANTHROPIC_BASE_URL");
+        // Vertex is a second route on the same lane, not a replacement: under
+        // CLAUDE_CODE_USE_VERTEX=1 the variable above is dead and this one is
+        // live. Keys are deduped per name, so both entries coexist.
+        const claudeVertex = claudeVertexUpstream(config.claude);
+        if (claudeVertex !== null) relayWrapRoute(acc, claudeVertex, claudeVertex, "ANTHROPIC_VERTEX_BASE_URL", "anthropic");
     } else if (client === "codebuddy") {
         // codebuddy (Tencent CodeBuddy Code CLI) honors CODEBUDDY_BASE_URL
         // natively; its ModelProvider is the OpenAI SDK, so model traffic is
@@ -898,8 +955,15 @@ interface EnvClientPreset {
     httpProxyOnRouteHttp: boolean;
     /** extra static key/value pairs appended after BILLION_CONTEXT_PROXY, in order. */
     extras?: readonly (readonly [string, string])[];
-    /** base-URL override env(s) filled from rewrites — first entry is the rewrite lookup key, the rest are mirrors set to the same value. */
+    /** base-URL override env(s) filled from rewrites — first entry is the
+     *  rewrite lookup key, the rest are mirrors set to the same value. */
     baseUrlKeys?: readonly string[];
+    /** base-URL keys resolved against their OWN rewrite only, never mirrored
+     *  from baseUrlKeys[0], and left unset when no rewrite exists for them.
+     *  Vertex's second variable needs this: mirroring ANTHROPIC_BASE_URL's value
+     *  onto ANTHROPIC_VERTEX_BASE_URL would aim Vertex traffic at
+     *  api.anthropic.com, and with Vertex off nothing must be set at all. */
+    ownBaseUrlKeys?: readonly string[];
 }
 
 const LAUNCHER_LOOPBACK_NO_PROXY = "localhost,127.0.0.1,::1";
@@ -935,7 +999,7 @@ const ENV_CLIENTS: Record<LauncherEnvClient, EnvClientPreset> = {
     copilot: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
     // #1049: amp is a Go binary like copilot — same cert-MITM contract.
     amp: { caKeys: ["SSL_CERT_FILE"], proxy: true, httpProxyOnRouteHttp: false },
-    claude: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false, baseUrlKeys: ["ANTHROPIC_BASE_URL"] },
+    claude: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false, baseUrlKeys: ["ANTHROPIC_BASE_URL"], ownBaseUrlKeys: ["ANTHROPIC_VERTEX_BASE_URL"] },
     codebuddy: { caKeys: ["NODE_EXTRA_CA_CERTS"], proxy: true, httpProxyOnRouteHttp: false, baseUrlKeys: ["CODEBUDDY_BASE_URL"] },
     /** #653: qoder's model endpoint scheme is hardcoded https (no base-URL
      *  override env), so the launcher can only route it via cert MITM: its
@@ -989,11 +1053,29 @@ function buildClientEnv(
     env.BILLION_CONTEXT_PROXY = origin;
     for (const [k, v] of preset.extras ?? []) env[k] = v;
     const baseUrlKeys = preset.baseUrlKeys ?? [];
+    // Each mirror key is resolved against its OWN rewrite first and only falls
+    // back to the primary's, so an alias pair (iFlow's IFLOW_BASE_URL /
+    // IFLOW_baseUrl, where only the first ever gets an entry) still fans out.
+    // The primary is iterated first as well: it is the one whose absence means
+    // "this lane is not routed at all".
     if (baseUrlKeys.length > 0 && rewrites !== undefined) {
-        const r = rewrites.httpRewrites.find((rw) => rw.key === baseUrlKeys[0]);
-        if (r) for (const k of baseUrlKeys) env[k] = wrapUpstream(origin, r.realUpstream);
-        const hr = rewrites.httpsRewrites.find((rw) => rw.key === baseUrlKeys[0]);
-        if (hr) for (const k of baseUrlKeys) env[k] = hr.realUpstream;
+        const primary = baseUrlKeys[0];
+        for (const k of baseUrlKeys) {
+            const own = { http: rewrites.httpRewrites.find((rw) => rw.key === k), https: rewrites.httpsRewrites.find((rw) => rw.key === k) };
+            const pick = own.http !== undefined || own.https !== undefined ? own : { http: rewrites.httpRewrites.find((rw) => rw.key === primary), https: rewrites.httpsRewrites.find((rw) => rw.key === primary) };
+            // Same precedence as before: an https rewrite wins over http.
+            if (pick.http) env[k] = wrapUpstream(origin, pick.http.realUpstream, pick.http.protocol);
+            if (pick.https) env[k] = pick.https.realUpstream;
+        }
+    }
+    // Independent keys never borrow the primary's value: with Vertex off there is
+    // no ANTHROPIC_VERTEX_BASE_URL rewrite, and the variable must stay unset
+    // rather than name api.anthropic.com.
+    for (const k of preset.ownBaseUrlKeys ?? []) {
+        const r = rewrites?.httpRewrites.find((rw) => rw.key === k);
+        if (r) env[k] = wrapUpstream(origin, r.realUpstream, r.protocol);
+        const hr = rewrites?.httpsRewrites.find((rw) => rw.key === k);
+        if (hr) env[k] = hr.realUpstream;
     }
     return env;
 }
@@ -1397,10 +1479,17 @@ export function buildMcpConfig(origin: string): { mcpServers: { bili: { command:
  *  settings file, no hooks. Session registration happens inside the MCP
  *  shell (CLAUDE_CODE_SESSION_ID is passed to MCP children by claude
  *  itself, verified 2.1.227). */
-export function buildClaudePluginEnv(origin: string, directUrl: boolean, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function buildClaudePluginEnv(origin: string, directUrl: boolean, baseEnv: NodeJS.ProcessEnv, vertexUpstream?: string | null): NodeJS.ProcessEnv {
     if (!directUrl) return baseEnv;
+    // Vertex (decision 7): additive, never a replacement — ANTHROPIC_BASE_URL keeps
+    // its value so a session that flips CLAUDE_CODE_USE_VERTEX off still works.
+    // The upstream is pinned to the `anthropic` wire: Vertex's :rawPredict matches
+    // no suffix-ladder arm, so an unqualified /bili/<url> would be relayed with no
+    // protocol at all.
     const upstream = baseEnv.BILI_CLAUDE_UPSTREAM?.trim() || "https://api.anthropic.com";
-    return { ...baseEnv, ANTHROPIC_BASE_URL: wrapUpstream(origin, upstream) };
+    const env: NodeJS.ProcessEnv = { ...baseEnv, ANTHROPIC_BASE_URL: wrapUpstream(origin, upstream) };
+    if (vertexUpstream) env.ANTHROPIC_VERTEX_BASE_URL = wrapUpstream(origin, vertexUpstream, "anthropic");
+    return env;
 }
 
 /** #1292: native-install ANTHROPIC_BASE_URL override as --settings args.
@@ -1411,8 +1500,8 @@ export function buildClaudePluginEnv(origin: string, directUrl: boolean, baseEnv
  *  as codex's #681 overlay); claude accepts a file path for --settings with
  *  identical precedence to the inline string. POSIX keeps the inline form —
  *  no shell re-parses argv there. */
-export function buildClaudeSettingsArg(platform: NodeJS.Platform, override: string): { clientArgs: string[]; tmpFile?: string } {
-    const payload = JSON.stringify({ env: { ANTHROPIC_BASE_URL: override } });
+export function buildClaudeSettingsArg(platform: NodeJS.Platform, override: string, extraEnv?: Record<string, string>): { clientArgs: string[]; tmpFile?: string } {
+    const payload = JSON.stringify({ env: { ANTHROPIC_BASE_URL: override, ...(extraEnv ?? {}) } });
     if (platform !== "win32") return { clientArgs: ["--settings", payload] };
     const tmpFile = path.join(os.tmpdir(), `bili-claude-settings-${Date.now()}.json`);
     fs.writeFileSync(tmpFile, payload);
@@ -2996,7 +3085,9 @@ export function prepareCodexHome(opts: {
  *  plus the compaction-basic auto:false override so dsh's native
  *  auto-compaction stands down for the bili proxy (a patch replaces the
  *  target row's whole config, and dsh-base ships compaction-basic with no
- *  config, so {auto:false} is complete). Lives in the persistent
+ *  config, so {auto:false} is complete), plus the #3354 Web-preset gate rows
+ *  that make the agent presets wait for the load-time compaction-disable
+ *  overlay the injected plugin registers. Lives in the persistent
  *  `<dshHome>-bili` dir, INDEPENDENT of the settings.yaml rewrite — the
  *  plugin is injected even when the user has no custom providers (pure
  *  built-in deepseek route). Returns the patch file path (undefined when it
@@ -3082,7 +3173,7 @@ export function writeDshAcpPatch(dshHome: string, entryName?: string): string | 
     writeOverlayFileAtomic(
         dir,
         ".bili-acp.patch.yml",
-        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n- id: compaction-basic\n  config:\n    auto: false\n# #2605: keep in sync with dsh.bundle.patch.yml — a patch replaces the row's whole config, so every default code is restated\n- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n`,
+        `- insert:\n    - id: bili-native\n      name: ${pluginUrl}\n- id: compaction-basic\n  config:\n    auto: false\n# #3354: keep in sync with dsh.bundle.patch.yml — web-profile presets run their own compaction-basic in nested rows no patch layer can address by id (#1772); these gates make them wait for the load-time overlay the injected plugin registers (vendored from deshark42/dsh-compaction-basic-disable, MIT)\n${compactionDisablePatchRows()}# #2605: keep in sync with dsh.bundle.patch.yml — a patch replaces the row's whole config, so every default code is restated\n- id: llm-deepseek\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n- id: llm-deepseek-account\n  config:\n    retryPolicy:\n      mode: normal\n      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]\n`,
     );
     const file = path.join(dir, ".bili-acp.patch.yml");
     try {
@@ -5368,12 +5459,33 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             console.error(`bili: codebuddy budget aligned — CODEBUDDY_AUTO_COMPACT_WINDOW=${codebuddyBudget.CODEBUDDY_AUTO_COMPACT_WINDOW}`);
         }
     } else {
+        // Vertex AI: computed before the env builders because direct-URL mode
+        // proves the variable from here (MITM mode resolves it out of the route
+        // table in buildClientEnv, per-key).
+        const claudeVertex = claudeVertexUpstream(config.claude);
         env = directUrl
-            ? buildClaudePluginEnv(origin, true, process.env)
+            ? buildClaudePluginEnv(origin, true, process.env, claudeVertex)
             : buildClaudeEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
         if (directUrl) env.BILLION_CONTEXT_PROXY = origin;
+        // An unroutable Vertex lane is a warning, not a silent downgrade: the
+        // client would call Google directly and bili would see nothing at all.
+        if (config.claude?.vertexEnabled && claudeVertex === null) {
+            console.error(
+                "bili: CLAUDE_CODE_USE_VERTEX=1 but neither ANTHROPIC_VERTEX_BASE_URL nor a usable CLOUD_ML_REGION is set — Vertex traffic will bypass bili entirely (no compression, no session); set CLOUD_ML_REGION (global or your region) or ANTHROPIC_VERTEX_BASE_URL and relaunch.",
+            );
+        } else if (claudeVertex !== null) {
+            console.error(`bili: claude on Vertex AI — ANTHROPIC_VERTEX_BASE_URL routed via bili (${claudeVertex})`);
+            const explicit = config.claude?.vertexBaseUrl?.trim();
+            if (explicit && vertexBaseUrlLacksV1(explicit)) {
+                console.error(`bili: ANTHROPIC_VERTEX_BASE_URL=${explicit} carries no /v1 segment — Vertex serves /v1/projects/… and 404s the version-less path unless your endpoint adds it.`);
+            }
+        }
+        const claudeModel = nonEmpty(process.env.ANTHROPIC_MODEL) ? process.env.ANTHROPIC_MODEL : config.claude?.model;
         const claudeBudget = await resolveClaudeBudgetEnv({
-            model: nonEmpty(process.env.ANTHROPIC_MODEL) ? process.env.ANTHROPIC_MODEL : config.claude?.model,
+            // Vertex ids may carry a date suffix (`claude-haiku-4-5@20251001`) that
+            // the model tables do not key on; normalize for the lookup only — the
+            // request keeps whatever the user configured.
+            model: config.claude?.vertexEnabled && claudeModel ? normalizeVertexModelId(claudeModel) : claudeModel,
             userAutoCompactWindow: config.claude?.autoCompactWindow,
             shellAutoCompactWindow: process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW,
             routes: biliRoutes,
@@ -5398,8 +5510,18 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             const relay = (env.BILI_CLAUDE_UPSTREAM?.trim() || undefined) ?? unwrapUpstream(config.claude?.anthropicBaseUrl ?? "https://api.anthropic.com");
             const override = wrapUpstream(origin, relay);
             env.ANTHROPIC_BASE_URL = override;
+            // A native install pins a STATIC ANTHROPIC_BASE_URL in user settings
+            // (#964); a Vertex session ignores that pin, so the same override has
+            // to be mirrored onto the Vertex variable or the pinned port is never
+            // dialed on that lane.
+            let vertexSettings: Record<string, string> | undefined;
+            if (claudeVertex !== null) {
+                const vertexOverride = wrapUpstream(origin, claudeVertex, "anthropic");
+                env.ANTHROPIC_VERTEX_BASE_URL = vertexOverride;
+                vertexSettings = { ANTHROPIC_VERTEX_BASE_URL: vertexOverride };
+            }
             env.BILLION_CONTEXT_PROXY = origin;
-            const settingsArg = buildClaudeSettingsArg(deps.platform ?? process.platform, override);
+            const settingsArg = buildClaudeSettingsArg(deps.platform ?? process.platform, override, vertexSettings);
             if (settingsArg.tmpFile) tmpFiles.push(settingsArg.tmpFile);
             clientArgs = [...settingsArg.clientArgs, ...clientArgs];
             console.error(`bili: claude native install detected — overriding its static ANTHROPIC_BASE_URL with this launcher's proxy (${override}); the SessionStart hook stays dormant for this session.`);

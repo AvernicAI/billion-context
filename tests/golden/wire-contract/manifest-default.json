@@ -9,7 +9,8 @@
     "decompress",
     "search_context",
     "acp_status",
-    "acp_cache"
+    "acp_cache",
+    "read_original_image"
   ],
   "tools": {
     "anthropic": [
@@ -202,6 +203,22 @@
               "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
             }
           }
+        }
+      },
+      {
+        "name": "read_original_image",
+        "description": "Read the ORIGINAL full-resolution image of a message whose picture was downscaled before reaching you. Beside each shrunken image there is a [bili] note quoting its mNNNNN ref and both sizes — pass that ref here. The original bytes are returned as an image attached to this result. The original can be much larger than the downscaled copy, so call this only when you actually need full-resolution detail (small text, colors, pixel alignment); the downscaled version is enough for most work.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "ref": {
+              "type": "string",
+              "description": "The mNNNNN message ref quoted in the [bili] downsample note beside the shrunken image."
+            }
+          },
+          "required": [
+            "ref"
+          ]
         }
       }
     ],
@@ -411,6 +428,25 @@
             }
           }
         }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "read_original_image",
+          "description": "Read the ORIGINAL full-resolution image of a message whose picture was downscaled before reaching you. Beside each shrunken image there is a [bili] note quoting its mNNNNN ref and both sizes — pass that ref here. The original bytes are returned as an image attached to this result. The original can be much larger than the downscaled copy, so call this only when you actually need full-resolution detail (small text, colors, pixel alignment); the downscaled version is enough for most work.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "ref": {
+                "type": "string",
+                "description": "The mNNNNN message ref quoted in the [bili] downsample note beside the shrunken image."
+              }
+            },
+            "required": [
+              "ref"
+            ]
+          }
+        }
       }
     ],
     "responses": [
@@ -608,6 +644,23 @@
               "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
             }
           }
+        }
+      },
+      {
+        "type": "function",
+        "name": "read_original_image",
+        "description": "Read the ORIGINAL full-resolution image of a message whose picture was downscaled before reaching you. Beside each shrunken image there is a [bili] note quoting its mNNNNN ref and both sizes — pass that ref here. The original bytes are returned as an image attached to this result. The original can be much larger than the downscaled copy, so call this only when you actually need full-resolution detail (small text, colors, pixel alignment); the downscaled version is enough for most work.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "ref": {
+              "type": "string",
+              "description": "The mNNNNN message ref quoted in the [bili] downsample note beside the shrunken image."
+            }
+          },
+          "required": [
+            "ref"
+          ]
         }
       }
     ]

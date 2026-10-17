@@ -275,6 +275,14 @@ test("launcher injection builders: direct-URL env, MCP config JSON, codex -c arg
     assert.equal(env.HOME, "/h", "base env preserved");
     assert.equal(buildClaudePluginEnv("http://127.0.0.1:8787", false, { HOME: "/h" }).ANTHROPIC_BASE_URL, undefined, "MITM mode leaves the base URL alone");
 
+    // Vertex port, phase 1 (decisions 1/7): additive second variable, pinned to the
+    // `anthropic` wire because Vertex's :rawPredict matches no classifier arm.
+    const vxEnv = buildClaudePluginEnv("http://127.0.0.1:8787", true, { HOME: "/h" }, "https://aiplatform.googleapis.com/v1");
+    assert.equal(vxEnv.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/https://api.anthropic.com", "ANTHROPIC_BASE_URL keeps its value");
+    assert.equal(vxEnv.ANTHROPIC_VERTEX_BASE_URL, "http://127.0.0.1:8787/bili/anthropic/https://aiplatform.googleapis.com/v1");
+    assert.equal(buildClaudePluginEnv("http://127.0.0.1:8787", true, { HOME: "/h" }, null).ANTHROPIC_VERTEX_BASE_URL, undefined, "Vertex off → no second key");
+    assert.equal(buildClaudePluginEnv("http://127.0.0.1:8787", false, { HOME: "/h" }, "https://aiplatform.googleapis.com/v1").ANTHROPIC_VERTEX_BASE_URL, undefined, "MITM mode leaves the Vertex key alone too");
+
     const mcp = buildMcpConfig("http://127.0.0.1:8787");
     assert.equal(mcp.mcpServers.bili.command, process.execPath);
     assert.match(mcp.mcpServers.bili.args[0]!, /mcp\.js$/);
@@ -330,7 +338,7 @@ test("mcp stdio shell: manifest → tools/list → tools/call forwards to the pl
     const init = byId(1) as { result?: { serverInfo?: { name?: string } } };
     assert.equal(init.result?.serverInfo?.name, "bili");
     const tools = byId(2) as { result?: { tools?: { name: string }[] } };
-    assert.deepEqual(tools.result?.tools?.map((t) => t.name).sort(), ["acp_cache", "acp_status", "compress", "decompress", "search_context"]);
+    assert.deepEqual(tools.result?.tools?.map((t) => t.name).sort(), ["acp_cache", "acp_status", "compress", "decompress", "read_original_image", "search_context"]);
     const call = byId(3) as { result?: { content?: { text?: string }[]; isError?: boolean } };
     assert.equal(call.result?.isError, false);
     assert.match(call.result?.content?.[0]?.text ?? "", /CONTEXT BREAKDOWN/, "acp_status result forwarded verbatim");
@@ -401,7 +409,7 @@ test("mcp stdio shell (codex style): BILI_CONVERSATION_ID self-register → head
 
     const byId = (n: number): Record<string, unknown> => JSON.parse(lines.find((l) => (JSON.parse(l) as { id?: number }).id === n) ?? "{}");
     const tools = byId(2) as { result?: { tools?: { name: string }[] } };
-    assert.deepEqual(tools.result?.tools?.map((t) => t.name).sort(), ["acp_cache", "acp_status", "compress", "decompress", "search_context"], "tools listed");
+    assert.deepEqual(tools.result?.tools?.map((t) => t.name).sort(), ["acp_cache", "acp_status", "compress", "decompress", "read_original_image", "search_context"], "tools listed");
     const call = byId(3) as { result?: { content?: { text?: string }[]; isError?: boolean } };
     assert.equal(call.result?.isError, false, `tools/call succeeded (self-registered conversation bound)${call.result?.isError ? ": " + (call.result?.content?.[0]?.text ?? "") : ""}`);
     assert.match(call.result?.content?.[0]?.text ?? "", /CONTEXT BREAKDOWN/);

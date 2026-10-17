@@ -125,14 +125,23 @@ function collectDumps(root: string): DumpMeta[] {
 function parseDumpFile(file: string): DumpContent | null {
     let buf: Buffer;
     try { buf = fs.readFileSync(file); } catch { return null; }
-    const sep = buf.indexOf("\n\n");
-    if (sep < 0) return null;
+    // #3331: the request-line + headers block can be terminated by \r\n\r\n as
+    // well as \n\n (dump files written on Windows / by CRLF-emitting clients);
+    // a bare \n\n probe misses the header block entirely on such files.
+    const lf = buf.indexOf("\n\n");
+    const crlf = buf.indexOf("\r\n\r\n");
+    let sep: number;
+    let sepLen: number;
+    if (crlf >= 0 && (lf < 0 || crlf < lf)) { sep = crlf; sepLen = 4; }
+    else if (lf >= 0) { sep = lf; sepLen = 2; }
+    else return null;
     const head = buf.subarray(0, sep).toString("utf8");
-    const body = buf.subarray(sep + 2);
+    const body = buf.subarray(sep + sepLen);
     const headers: Record<string, string> = {};
     const lines = head.split("\n");
     for (let i = 1; i < lines.length; i++) {
-        const line = lines[i]!;
+        let line = lines[i]!;
+        if (line.endsWith("\r")) line = line.slice(0, -1); // CRLF header lines
         if (!line.trim()) continue;
         const c = line.indexOf(": ");
         if (c > 0) headers[line.slice(0, c).toLowerCase()] = line.slice(c + 2);

@@ -34,6 +34,7 @@ import {
     buildPiEnv,
     buildCodexEnv,
     buildClaudeEnv,
+    buildIflowEnv,
     buildCodexArgs,
     prepareOpencodeHttpRewrite,
     opencodeMajorVersion,
@@ -244,6 +245,32 @@ test("unwrapUpstream: recovers real upstream from a /bili/ wrap", () => {
 test("unwrapUpstream: returns non-wrapped url as-is", () => {
     assert.equal(unwrapUpstream("https://api.openai.com/v1"), "https://api.openai.com/v1");
     assert.equal(unwrapUpstream("https://api.anthropic.com"), "https://api.anthropic.com");
+});
+
+// Vertex port, phase 1 (decision 1): one optional protocol segment on the pair
+// rather than a second pair of helpers, so every existing call site stays as it is.
+test("wrapUpstream: protocol segment pins the wire, and round-trips through unwrapUpstream", () => {
+    const o = "http://127.0.0.1:8787";
+    const vx = "https://aiplatform.googleapis.com/v1";
+    assert.equal(wrapUpstream(o, vx, "anthropic"), `${o}/bili/anthropic/${vx}`);
+    assert.equal(unwrapUpstream(`${o}/bili/anthropic/${vx}`), vx);
+    // No segment: byte-identical to the previous behaviour.
+    assert.equal(wrapUpstream(o, "https://api.anthropic.com"), `${o}/bili/https://api.anthropic.com`);
+    assert.equal(unwrapUpstream(`${o}/bili/https://api.anthropic.com`), "https://api.anthropic.com");
+});
+
+test("unwrapUpstream: strips only the four known protocol segments", () => {
+    assert.equal(unwrapUpstream("http://127.0.0.1:8787/bili/google/https://aiplatform.googleapis.com/v1"), "https://aiplatform.googleapis.com/v1");
+    // A path that merely begins with a protocol-shaped word survives: an unknown
+    // segment is part of the upstream, not a marker.
+    assert.equal(unwrapUpstream("http://127.0.0.1:8787/bili/upstream.example/x"), "upstream.example/x");
+    assert.equal(unwrapUpstream("http://127.0.0.1:8787/bili/vertex/https://x.example"), "vertex/https://x.example");
+});
+
+test("wrapUpstream: protocol form is idempotent on a second wrap", () => {
+    const o = "http://127.0.0.1:8787";
+    const once = wrapUpstream(o, "https://aiplatform.googleapis.com/v1", "anthropic");
+    assert.equal(wrapUpstream(o, once, "anthropic"), once);
 });
 
 test("buildPiEnv: sets HTTPS_PROXY + NODE_EXTRA_CA_CERTS, preserves baseEnv", () => {
@@ -2876,6 +2903,68 @@ test("discoverRoutes: claude /bili/-wrapped base_url unwraps to real upstream fo
     ]);
 });
 
+test("discoverRoutes: claude Vertex-on → second route keyed ANTHROPIC_VERTEX_BASE_URL, protocol-pinned", () => {
+    // Vertex port, phase 1 (decision 2): registered ONLY when the client's own
+    // switch is on, and it pins the `anthropic` wire — Vertex's :rawPredict
+    // matches no suffix-ladder arm, so an unqualified /bili/<url> would be relayed
+    // with no protocol at all.
+    const config: ClientConfig = { claude: { vertexEnabled: true, vertexRegion: "global" } };
+    const routes = discoverRoutes("claude", config);
+    assert.deepEqual(routes.httpsDomains, []);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+        { key: "ANTHROPIC_VERTEX_BASE_URL", realUpstream: "https://aiplatform.googleapis.com/v1", protocol: "anthropic" },
+    ]);
+});
+
+test("discoverRoutes: claude Vertex-on with an explicit base URL → that URL wins over the region", () => {
+    const config: ClientConfig = {
+        claude: { vertexEnabled: true, vertexRegion: "us-east5", vertexBaseUrl: "https://gateway.example/vertex/v1" },
+    };
+    const routes = discoverRoutes("claude", config);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+        { key: "ANTHROPIC_VERTEX_BASE_URL", realUpstream: "https://gateway.example/vertex/v1", protocol: "anthropic" },
+    ]);
+});
+
+test("discoverRoutes: claude Vertex-on with an already-managed base URL → unwrapped, not nested", () => {
+    // The managed block writes ANTHROPIC_VERTEX_BASE_URL and the next launch reads
+    // it back (readClaudeSettings falls back to the process env, where Claude Code
+    // exports the settings block). Wrapping that value as-is nested a
+    // /bili/anthropic/ layer per launch, and the extra hop targeted the proxy's own
+    // port — the tunnel guard denies it with 403 detail:"self".
+    const config: ClientConfig = {
+        claude: {
+            vertexEnabled: true,
+            vertexBaseUrl: "http://127.0.0.1:40000/bili/anthropic/https://aiplatform.googleapis.com/v1",
+        },
+    };
+    const routes = discoverRoutes("claude", config);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+        { key: "ANTHROPIC_VERTEX_BASE_URL", realUpstream: "https://aiplatform.googleapis.com/v1", protocol: "anthropic" },
+    ]);
+});
+
+test("discoverRoutes: claude Vertex-on without a usable region → no Vertex route (no guessed region)", () => {
+    // Decision 3: never substitute a default region — a wrong one 404s every
+    // request, while an absent route only means the launcher must warn.
+    const config: ClientConfig = { claude: { vertexEnabled: true } };
+    const routes = discoverRoutes("claude", config);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+    ]);
+});
+
+test("discoverRoutes: vertex keys present but switch off → byte-identical to pre-port discovery", () => {
+    const config: ClientConfig = { claude: { vertexRegion: "global", vertexProjectId: "p", vertexBaseUrl: "https://gateway.example/v1" } };
+    const routes = discoverRoutes("claude", config);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+    ]);
+});
+
 test("discoverRoutes: pi with one http provider → rewrite keyed by provider name", () => {
     const config: ClientConfig = {
         pi: {
@@ -3071,6 +3160,41 @@ test("buildClaudeEnv: no ANTHROPIC_BASE_URL rewrite → env.ANTHROPIC_BASE_URL u
     const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], [], { PATH: "/usr/bin" });
     assert.equal(env.ANTHROPIC_BASE_URL, undefined);
     assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+});
+
+// Vertex port, phase 1 (decision 7): the Vertex variable is ADDITIVE. Both keys
+// are set so a session that flips CLAUDE_CODE_USE_VERTEX off still finds a valid
+// ANTHROPIC_BASE_URL, and each is resolved against its OWN rewrite — the old
+// baseUrlKeys[0] fan-out would have aimed the Vertex key at api.anthropic.com.
+test("buildClaudeEnv: Vertex route → ANTHROPIC_VERTEX_BASE_URL protocol-wrapped, ANTHROPIC_BASE_URL unchanged", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+        { key: "ANTHROPIC_VERTEX_BASE_URL", realUpstream: "https://aiplatform.googleapis.com/v1", protocol: "anthropic" },
+    ];
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
+    assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/https://api.anthropic.com");
+    assert.equal(env.ANTHROPIC_VERTEX_BASE_URL, "http://127.0.0.1:8787/bili/anthropic/https://aiplatform.googleapis.com/v1");
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+});
+
+test("buildClaudeEnv: Vertex off (no Vertex rewrite) → the key stays unset, never mirrored from the primary", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+    ];
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
+    assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/https://api.anthropic.com");
+    assert.equal(env.ANTHROPIC_VERTEX_BASE_URL, undefined);
+});
+
+// The mirror fan-out the per-key resolution has to preserve: iFlow accepts two
+// case variants and only the first ever gets a rewrite entry.
+test("buildIflowEnv: alias key still mirrors the primary rewrite (no per-key regression)", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "IFLOW_BASE_URL", realUpstream: "https://apis.iflow.cn/v1" },
+    ];
+    const env = buildIflowEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
+    assert.equal(env.IFLOW_BASE_URL, "http://127.0.0.1:8787/bili/https://apis.iflow.cn/v1");
+    assert.equal(env.IFLOW_baseUrl, env.IFLOW_BASE_URL);
 });
 
 test("buildPiEnv: http rewrites → BILI_PROVIDER_REWRITES manifest (#535 file-free routing)", () => {

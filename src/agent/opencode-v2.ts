@@ -48,7 +48,7 @@
 // openai tool list, src/compress-tool.ts) because reload-based refresh is not
 // available on all observed surfaces.
 
-import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
+import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
@@ -140,7 +140,7 @@ const TOOL_DELTA_RETRY_MS = 15000;
 // Kill switch = fully inert (same semantics as detectProxyBase): gates header stamping, tool forwarding, compaction reporting.
 const pluginDisabled = (): boolean => process.env.BILLION_CONTEXT_PLUGIN === "0";
 
-const V2_BILI_TOOLS = ACP_TOOLS_OPENAI.map((t) => ({
+const V2_BILI_TOOLS = [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI].map((t) => ({
     name: t.function.name,
     description: t.function.description,
     input: t.function.parameters,
@@ -344,6 +344,17 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             const url = e.request?.url;
             if (typeof url !== "string") return;
             if (options.route !== undefined) {
+                // #3308: prime the window map BEFORE the route decides — its
+                // degrade branch needs the model's context window to refuse a
+                // provably-oversized body locally instead of sending it direct
+                // into a guaranteed upstream 400. The harvest commits on
+                // microtasks, so with a slow catalog the first request still
+                // sees an empty map and keeps the documented fail-open; from
+                // the second request on the guard is armed even when bootstrap
+                // never landed. Launcher mode keeps today's ordering: harvesting
+                // without a detected proxy would only warn about headers bili
+                // never stamps there.
+                refreshWindows(ctx, state);
                 // Native mode: route owns discovery + rewriting (it is called
                 // per request even once state.proxyBase is known, because the
                 // URL rewrite must happen per request and env detection alone

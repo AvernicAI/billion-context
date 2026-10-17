@@ -297,11 +297,25 @@ const HOST_TO_PROVIDER: Record<string, string> = {
     "api.minimax.chat": "minimax",
     "api.minimaxi.com": "minimax",
     "api.minimax.io": "minimax",
+    // Anthropic-on-Vertex is served from a host whose shape depends on the
+    // location: this bare global host, a regional
+    // `us-east5-aiplatform.googleapis.com`, or a multi-region
+    // `aiplatform.us.rep.googleapis.com`. All three carry the same publisher
+    // models, so all three answer `anthropic` (#3323).
+    "aiplatform.googleapis.com": "anthropic",
 };
+
+/** Vertex's location-shaped hosts. The region is a PREFIX in one shape and a
+ *  sub-domain in the other, and its label may itself contain dashes
+ *  (`us-east5`) — so neither the exact map above nor the "."-delimited suffix
+ *  scan below can reach them. Matched before the scan so a regional host is
+ *  classified instead of falling through to the cross-provider guess. */
+const VERTEX_REGIONAL_HOST_RE = /^(?:[a-z0-9]+(?:-[a-z0-9]+)*)-aiplatform\.googleapis\.com$|^aiplatform\.[a-z0-9]+(?:-[a-z0-9]+)*\.rep\.googleapis\.com$/;
 
 export function providerFromHost(host: string): string | undefined {
     const lower = host.toLowerCase();
     if (HOST_TO_PROVIDER[lower]) return HOST_TO_PROVIDER[lower];
+    if (VERTEX_REGIONAL_HOST_RE.test(lower)) return "anthropic";
     for (const [h, p] of Object.entries(HOST_TO_PROVIDER)) {
         // Boundary-safe suffix match: "api.openai.com" must NOT match a key
         // like "penai.com". Require an exact host match or a "."-delimited

@@ -68,9 +68,16 @@ export interface NativeInterceptState {
      *  readable without consuming the stream. Native hosts use it to read
      *  x-bili-applied-seq (the ack channel). Always fires with the
      *  HOST-REQUESTED url (the fetch argument) — never a rerouted or retried
-     *  target: consumers key their in-flight plans by the url they saw in
-     *  beforeSend/the hook. Best-effort: never throws into the request path. */
-    onResponse?: (url: string, response: Response) => void;
+     *  target. #3329: the optional third argument carries THIS DISPATCH'S
+     *  outgoing headers (lowercase-name record; init.headers wins over a
+     *  Request-object input's own headers, exactly as fetch itself resolves
+     *  them) — consumers correlate a response back to THE REQUEST that
+     *  produced it via their per-request correlation id stamped on send,
+     *  because several conversations share one provider URL and keying by
+     *  url alone mis-attributes a late response to whichever conversation
+     *  happened to plan last on that URL. Undefined for a dispatch with no
+     *  readable headers. Best-effort: never throws into the request path. */
+    onResponse?: (url: string, response: Response, headers?: Record<string, string>) => void;
     /** #1117: attribution gate — called per model-API request with the
      *  (pre-rewrite) target URL. Returning false means the caller is NOT the
      *  host itself (e.g. a third-party in-process plugin riding the host's
@@ -300,6 +307,23 @@ function withHeaders(input: string | URL | Request, init: RequestInit | undefine
         return { input, init: { ...init, headers: { ...(init.headers as Record<string, string>), ...extra } } };
     }
     return { input, init };
+}
+
+/** #3329: the outgoing headers of a dispatch exactly as fetch resolves them —
+ *  init.headers wins over a Request-object input's own headers (spec: init
+ *  overrides), normalized to a lowercase-name record so response-time
+ *  consumers can look up their per-request correlation id without re-deriving
+ *  the merge rules. undefined when no headers exist or none can be read. */
+function outgoingHeadersOf(input: string | URL | Request, init?: RequestInit): Record<string, string> | undefined {
+    try {
+        const src = init?.headers !== undefined ? init.headers : input instanceof Request ? input.headers : undefined;
+        if (src === undefined) return undefined;
+        const out: Record<string, string> = {};
+        for (const [k, v] of new Headers(src)) out[k.toLowerCase()] = v;
+        return out;
+    } catch {
+        return undefined;
+    }
 }
 
 /** #2592/#2709: client-side mirror of the passthrough lane's cheap ASCII
@@ -717,7 +741,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 state.onDispatch?.(target, target === url ? "self" : "retry");
                 const resp = await send(stamped.input, stamped.init);
                 try {
-                    state.onResponse?.(url, resp);
+                    state.onResponse?.(url, resp, outgoingHeadersOf(stamped.input, stamped.init));
                 } catch {
                     // observability hook only — never break the response
                 }
@@ -757,7 +781,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                     state.onDispatch?.(retried, "retry");
                     const resp = await send(restamped.input, restamped.init);
                     try {
-                        state.onResponse?.(url, resp);
+                        state.onResponse?.(url, resp, outgoingHeadersOf(restamped.input, restamped.init));
                     } catch {
                         // observability hook only — never break the response
                     }
@@ -914,7 +938,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             const stamped = withHeaders(first, init, resignExtra !== undefined ? { ...(state.headersFor?.(url) ?? {}), ...resignExtra } : state.headersFor?.(url));
             const resp = await send(stamped.input, stamped.init);
             try {
-                state.onResponse?.(url, resp);
+                state.onResponse?.(url, resp, outgoingHeadersOf(stamped.input, stamped.init));
             } catch {
                 // observability hook only — never break the response
             }
@@ -935,7 +959,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                     const stamped = withHeaders(retried, init, resignExtra !== undefined ? { ...(state.headersFor?.(url) ?? {}), ...resignExtra } : state.headersFor?.(url));
                     const resp = await send(stamped.input, stamped.init);
                     try {
-                        state.onResponse?.(url, resp);
+                        state.onResponse?.(url, resp, outgoingHeadersOf(stamped.input, stamped.init));
                     } catch {
                         // observability hook only — never break the response
                     }

@@ -94,6 +94,11 @@ export class UnifiedShadow {
         let store: UnifiedStore;
         try {
             store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+            // #3285: watermark trust does not cross process boundaries — a
+            // restart-handoff overlap leaves the previous writer's rows AND
+            // watermark behind; drop them all so this process's first save
+            // per session re-establishes trust from its own view.
+            store.resetAllIngestWatermarks();
         } catch (err) {
             // #2771: a corrupt/unreadable index.db must degrade to legacy-only
             // (same shape as the encryption opt-out), never brick SessionStore
@@ -167,7 +172,9 @@ export class UnifiedShadow {
             // a full ingest, never a corrupt one.
             if (!this.ingestDelta(legacy, hasRawTail)) {
                 const plan = planIngest(legacy);
-                this.store.ingestSession(plan);
+                // #3285: only a raw-tail plan is the complete log — that is
+                // what lets the full path sweep foreign rows as stale.
+                this.store.ingestSession(plan, undefined, { completeLog: hasRawTail });
             }
             this.stats.ingests++;
             // #3133 sampled verification: ingest integrity is already guarded
@@ -188,8 +195,9 @@ export class UnifiedShadow {
                     deadRefs: this.store.getDeadRefs(legacy.id),
                     refs: this.store.getRefs(legacy.id),
                 };
-                const expect = shadowDigest({ ...legacy, blockContents: completeBlockContents(legacy.blockContents, legacy.state.blocks) });
-                const got = shadowDigest(loadLegacyView(rows));
+                const loaded = loadLegacyView(rows);
+                const expect = shadowDigest({ ...legacy, blockContents: orderedBlockContents(completeBlockContents(legacy.blockContents, legacy.state.blocks)) });
+                const got = shadowDigest({ ...loaded, blockContents: orderedBlockContents(loaded.blockContents) });
                 if (got !== expect) {
                     this.stats.verifyDrift++;
                     this.driftBySession.set(legacy.id, (this.driftBySession.get(legacy.id) ?? 0) + 1);
@@ -468,4 +476,11 @@ export class UnifiedShadow {
 
 function shadowDigest(view: unknown): string {
     return sha256(JSON.stringify(canonicalize(view)));
+}
+
+// #3407: the parity digest must compare blockContents CONTENTS, not insertion order —
+// the expect leg keeps the live Map's order (completeBlockContents appends synthesized
+// entries at the end) while the got leg lays blocks out in state.blocks array order.
+function orderedBlockContents<T>(m: Map<string, T>): Map<string, T> {
+    return new Map([...m.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
 }

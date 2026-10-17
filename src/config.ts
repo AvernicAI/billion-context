@@ -1,5 +1,6 @@
 import { defaultConfig, DEFAULT_CCR_CONFIG, type Config, type Prompts } from "acp-kernel";
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname } from "node:path";
 import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
@@ -388,6 +389,36 @@ export type CompressSettings = {
      *  builtin (`default`, `lean`)]. Deepest-wins like every other field;
      *  unknown names fall back to the identity surface. Kernel >= 0.0.66. */
     promptPack?: string;
+    /** Instant tool-result absorption (kernel absorb API, acp-kernel >= 0.0.54).
+     *  When `enabled`, eligible large tool results carry a forced [ACP absorb]
+     *  instruction and the model distills them via the injected `absorb` tool;
+     *  the original output is then hidden from every wire view until the next
+     *  fold round (and its token cost is netted out of usage credits, like
+     *  compress). Maps to kernel `Config.absorb`. Off unless explicitly
+     *  enabled at some level. NOT supported on Responses marker/text-protocol
+     *  routes (no native tool surface there). */
+    absorb?: {
+        /** Enable absorb for this scope. Absent/false = off (kernel semantics). */
+        enabled?: boolean;
+        /** Tool results smaller than this many tokens never get the absorb
+         *  instruction (kernel default 1000). */
+        minToolTokens?: number;
+        /** Only emit instructions once context usage reaches this fraction of
+         *  the model window (kernel `contextThresholdPct`). Accepts a ratio
+         *  (0.5) or percent string ("50%"); 0 = size gate alone (kernel
+         *  default). */
+        contextThresholdPct?: number | string;
+        /** Tool names whose results are never absorbable (glob-suffix
+         *  patterns, e.g. "read"). Kernel default: none. */
+        excludeTools?: string[];
+        /** Rename the wire tool (default "absorb"). Must stay unique against
+         *  the client's own tool names or the agent will call its own tool. */
+        toolName?: string;
+        /** [#3402] When true (default), only image-bearing tool results are
+         *  absorb candidates and they bypass minToolTokens; false restores the
+         *  old behavior of marking any result ≥ minToolTokens. */
+        mediaOnly?: boolean;
+    };
     /** [#1097] Kernel CCR content store (kernel `Config.ccr`, acp-kernel
      *  0.0.84). When `enabled`, oversized tool results (>= minToolTokens) are
      *  ID-referenced at arrival by the kernel's ccr-store node (prune →
@@ -397,7 +428,7 @@ export type CompressSettings = {
      *  Lossless by default — a retrieve not made costs one cheap tool call,
      *  whereas a distilled-away detail is gone for good. ID-reference wins
      *  over absorb (kernel ordering). Off unless explicitly enabled at some
-     *  level. Merged sub-field-wise across the three levels like `prompts`. */
+     *  level. Merged sub-field-wise across the three levels like `absorb`. */
     ccr?: {
         /** Enable CCR for this scope. Absent/false = off (kernel semantics). */
         enabled?: boolean;
@@ -423,7 +454,7 @@ export type CompressSettings = {
      *  are all reused unchanged. Disabled or no plan state in context ⇒
      *  byte-identical output to the plain lexical ranking. Off by default;
      *  measure before enabling in shared configs. Merged sub-field-wise across
-     *  the three levels like `ccr`. See src/decompress-shared.ts. */
+     *  the three levels like `absorb`/`ccr`. See src/decompress-shared.ts. */
     search?: {
         /** Enable plan-aware re-ranking + steering for search_context.
          *  Absent/false = off (byte-identical output). */
@@ -447,7 +478,7 @@ export type CompressSettings = {
      *  billion-context-pi #336/#339 and opencode-acp #377). Compress turns
      *  are hard-exempt from compression, so their reasoning is otherwise an
      *  unreclaimable context floor. Merged sub-field-wise across the three
-     *  config levels like `prompts`. */
+     *  config levels like `absorb`. */
     reasoning?: {
         /** Master switch (default true). Set `drop: false` per-provider for
          *  models whose reasoning must round-trip unmodified. */
@@ -462,7 +493,7 @@ export type CompressSettings = {
      *  hits the lattice AND carries an encrypted_content blob, bili buffers the
      *  response, replays its own reasoning plus a continue nudge (up to maxContinue
      *  rounds), and folds to ONE response with true summed usage. Merged sub-field-wise
-     *  across the three levels like `reasoning`; off unless enabled at some
+     *  across the three levels like `absorb`/`reasoning`; off unless enabled at some
      *  level. See src/reasoning-guard.ts. */
     reasoningGuard?: ReasoningGuardConfig;
     /** [#1093] Output-side compression levers — verbosity steering (a conciseness
@@ -484,7 +515,7 @@ export type CompressSettings = {
      *  unset profile yields byte-identical reports to pre-#1279 behavior. The
      *  last request's effective value is stamped onto the session and used by
      *  every report face. Merged sub-field-wise across the three levels like
-     *  `prompts`. */
+     *  `absorb`. */
     priceProfile?: { w?: number; r?: number; q?: number };
     /** [#1921] Fold-state reconciliation — how the proxy reacts when the
      *  resent history no longer contains a folded message's content-hash id
@@ -889,7 +920,7 @@ export interface DshFileSettings {
 const NAMED_PROVIDER_ROUTING_FIELDS = ["compress", "models", "proxy", "passthrough", "compressProtocol", "protocol", "compat", "imageBilling", "imageTokenCap"] as const;
 
 // Once-per-signature dedup so hot-reload / repeated launcher loads don't spam
-// the same named-provider warning.
+// the same named-provider warning (same pattern as the absorb warnings below).
 const seenNamedProviderWarnings = new Set<string>();
 
 function warnNamedProviderOnce(signature: string, message: string): void {
@@ -1145,6 +1176,45 @@ export function allowDshCompactionState(env: NodeJS.ProcessEnv): { enabled: bool
     return { enabled: fileAllow, source: fileAllow ? "file" : null };
 }
 
+// #1359: provider/model absorb.* overrides apply only to the proxy lane (plugin
+// lane follows the base block). Warn once per load so the divergence isn't silent.
+const ABSORB_DIVERGENCE_FIELDS = ["enabled", "toolName", "minToolTokens", "contextThresholdPct", "excludeTools", "mediaOnly"] as const;
+const seenAbsorbDivergenceWarnings = new Set<string>();
+
+function normAbsorbValue(field: string, v: unknown): unknown {
+    if (field === "contextThresholdPct" && typeof v === "string") {
+        const m = v.match(/^(-?\d+(?:\.\d+)?)\s*%$/);
+        if (m) return Number(m[1]) / 100;
+    }
+    return v;
+}
+
+export function findAbsorbPluginDivergences(routes: ProviderRoutes, baseAbsorb?: CompressSettings["absorb"]): string[] {
+    const out: string[] = [];
+    const check = (scope: string, level?: CompressSettings["absorb"]) => {
+        if (!level) return;
+        for (const field of ABSORB_DIVERGENCE_FIELDS) {
+            if (level[field] === undefined) continue;
+            if (JSON.stringify(normAbsorbValue(field, level[field])) !== JSON.stringify(normAbsorbValue(field, baseAbsorb?.[field]))) {
+                out.push(`${scope}.absorb.${field}=${JSON.stringify(level[field])} (base=${JSON.stringify(baseAbsorb?.[field])})`);
+            }
+        }
+    };
+    for (const [url, route] of Object.entries(routes)) {
+        check(url, route.compress?.absorb);
+        for (const [model, entry] of Object.entries(route.models ?? {})) check(`${url}/${model}`, entry.compress?.absorb);
+    }
+    return out;
+}
+
+function warnAbsorbPluginDivergences(routes: ProviderRoutes, baseAbsorb?: CompressSettings["absorb"]): void {
+    const divs = findAbsorbPluginDivergences(routes, baseAbsorb);
+    if (divs.length === 0) return;
+    const sig = divs.join("\u0000");
+    if (seenAbsorbDivergenceWarnings.has(sig)) return;
+    seenAbsorbDivergenceWarnings.add(sig);
+    loggerLog("warn", `[acp-config] provider/model absorb override diverges from base [${divs.join("; ")}] — plugin-mode sessions follow the base value, proxy-mode sessions honor the override (#1359)`);
+}
 
 
 /** [#1345] A provider/model-level `ccr` field that diverges from what plugin
@@ -1249,6 +1319,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const upstream = (env.ACP_UPSTREAM ?? fileConfig.upstream ?? "https://api.anthropic.com").replace(/\/$/, "");
     const routes = loadRoutes(env);
     const namedProviders = loadNamedProviders(env);
+    warnAbsorbPluginDivergences(routes, fileConfig.compress?.absorb);
     warnCcrPluginDivergences(routes, fileConfig.compress);
     const passthrough = passthroughState(env);
     const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
@@ -1659,6 +1730,23 @@ type FileConfig = {
      *  BILI_ROLLOUT_<FEATURE>=0/1 (UPPER_SNAKE name) wins over everything,
      *  including `enabled`. */
     rollout?: RolloutFileConfig;
+    /** Security posture block (#3373) — knobs that WIDEN a trust boundary
+     *  live here so the exposure surface is auditable in one place.
+     *  `adminRelay` (default false, fail-closed): allow an embedding host
+     *  (dsh web today) to relay the ENTIRE /__bili/ admin surface — including
+     *  config editing and credential writes, not just the read-only panel —
+     *  through its own entry origin: the host registers a /__bili prefix
+     *  route forwarding to the loopback proxy, so a browser on another
+     *  machine opens the panel through the same origin it already reached
+     *  the host by. The admin gate itself is unchanged: the relayed hop is a
+     *  local non-browser client (loopback source + loopback Host + no
+     *  Origin header), so #1538 DNS-rebinding protection holds verbatim.
+     *  Enabling it means whoever can reach the host web entry can reach the
+     *  admin surface — protect the entry (auth/reverse proxy) accordingly.
+     *  File-only, no env var (#2030). */
+    security?: {
+        adminRelay?: boolean;
+    };
      /** Native-hook attach behavior.
       *  `attachExternal` (#1335): set `true` to let native hooks attach to
       *  lifecycle-less listeners (a manually started `bili start` daemon — no
@@ -1827,10 +1915,30 @@ type FileConfig = {
     codexCompact?: string;
     /** Auto-mode classifier local-forge switch (#2740) — env BILI_AUTO_MODE_FORGE. */
     autoModeForge?: { enabled?: boolean };
+    /** pi/omp plugin tool-output guardrails (#3066) plus the proxy-side
+     *  text-run stream guard (#3406 item 1). `bashTimeout` injects N
+     *  seconds as the bash `timeout` when the model omits it — default 60
+     *  (#3066 owner intent, re-affirmed #3366: unsupervised bash could hang a
+     *  pi session for a whole day); 0 disables injection (pi-native).
+     *  `maxOutputBytes` caps combined text tool output (default 50000, 0 = no
+     *  cap). `repetition: false` disables the identical-call loop-breaker.
+     *  `textRunThreshold` is the single-codepoint repetition breaker over
+     *  decoded model text (default 200, 0 = off). Env
+     *  BILI_GUARDRAIL_BASH_TIMEOUT / BILI_GUARDRAIL_MAX_OUTPUT_BYTES /
+     *  BILI_GUARDRAIL_REPETITION / BILI_GUARDRAIL_TEXT_RUN_THRESHOLD win over
+     *  all. */
+    guardrails?: {
+        bashTimeout?: number;
+        maxOutputBytes?: number;
+        repetition?: boolean;
+        textRunThreshold?: number;
+    };
     /** CCR retrieval TTL in ms (#2030) — was BILI_CCR_RETRIEVAL_TTL_MS (default 600000). */
     ccrRetrievalTtlMs?: number;
     /** Large-decompress temp-file cap (#2030) — was BILI_DECOMPRESS_TMP_CAP (default 50). */
     decompressTmpCap?: number;
+    /** Image rescale egress pass on/off (#3400) — env BILI_IMAGE_RESCALE (default: on). */
+    imageRescale?: boolean;
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -1875,11 +1983,11 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "rollout",
     "dsh",
     "compat", "imageBilling", "imageTokenCap", "claude", "native", "resign",
-    "pi", "storage",
+    "pi", "storage", "security",
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "plugin", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
-    "autoModeForge",
+    "autoModeForge", "imageRescale",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:
@@ -1893,13 +2001,13 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
     "visibilityMarkers", "rules", "injectTool", "injectNudge",
-    "acknowledgePromptsRisk", "ccr", "search",
+    "acknowledgePromptsRisk", "absorb", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
     "reconcile", "streamSummary",
 ]);
 
 // Deduped per unique key set per process (same pattern as
-// seenNamedProviderWarnings): loadConfigFile() runs on every config read,
+// seenAbsorbDivergenceWarnings): loadConfigFile() runs on every config read,
 // so without this one startup would log the same warning several times.
 const seenUnknownTopLevelKeySignatures = new Set<string>();
 
@@ -1946,6 +2054,7 @@ export function loadConfigFile(): FileConfig {
             warnUnknownTopLevelKeys(obj);
             warnInertResignPassthrough(obj);
             warnInertStripImages(obj);
+            warnInertRemovedCompressKeys(obj);
             value = obj as FileConfig;
         } else {
             value = {};
@@ -1962,6 +2071,27 @@ export function loadConfigFile(): FileConfig {
     if (raw === undefined || value === undefined) return {};
     configFileCache = { raw, value };
     return value;
+}
+
+/** #2960⑥ (config epoch): stable identity of the config FILE SOURCE right now —
+ *  sha256(raw text). Sessions stamp this next to their effectiveConfig snapshot
+ *  so readers can detect that the snapshot was resolved from a source that no
+ *  longer exists (file edited since the last wire request) and re-resolve from
+ *  the live file instead of serving the stale cascade. Content-only hash:
+ *  identical bytes at different BILI_CONFIG_FILE paths are the same settings
+ *  (so cross-instance stamps validate — and that is correct, the resolved
+ *  file tier is identical), while any edit diverges the hash. Deliberately
+ *  NOT path-keyed: golden drives run in mkdtemp dirs and a path component
+ *  would make every run's metadata digest unique. Cost mirrors
+ *  loadConfigFile()'s own per-call read (page-cache hit, ~µs). */
+export function configFileEpoch(): string {
+    let raw: string;
+    try {
+        raw = readFileSync(configFile(), "utf8").replace(/^\uFEFF/, "");
+    } catch {
+        raw = "";
+    }
+    return createHash("sha256").update(raw).digest("hex");
 }
 
 
@@ -2065,6 +2195,46 @@ function warnInertStripImages(obj: Record<string, unknown>): void {
     loggerLog("warn", `[acp-config] compress.${hit.join("/compress.")} is INERT — compress.stripImages was removed: media now folds by default (#2640) and decompress({ imageRef }) recovers folded pixels; nothing is stripped from the wire anymore. Remove the key(s) from the config.`);
 }
 let seenInertStripImagesSignature = "";
+
+// #3344: compress.imageCompression was REMOVED wholesale (#3266, image
+// pre-compression + the image_full restore channel). Old configs that still set
+// it get a one-time inert notice instead of a silent no-op: the parse whitelist
+// (COMPRESS_SETTING_FIELDS) no longer carries the field, so it is dropped at
+// EVERY compress level it can appear (global / provider / model). (`absorb` was
+// removed by #3293 but REVIVED by #3402/#3422 — it parses again and is NOT inert.)
+// Dedup by dead-key path signature (#1815 style): re-warn when the set changes.
+const INERT_REMOVED_COMPRESS_KEYS = ["imageCompression"] as const;
+let seenInertRemovedCompressKeysSignature = "";
+function warnInertRemovedCompressKeys(obj: Record<string, unknown>): void {
+    const hits: string[] = [];
+    const scanBlock = (block: unknown, pathPrefix: string): void => {
+        if (!block || typeof block !== "object" || Array.isArray(block)) return;
+        for (const key of INERT_REMOVED_COMPRESS_KEYS) {
+            if ((block as Record<string, unknown>)[key] !== undefined) hits.push(`${pathPrefix}.${key}`);
+        }
+    };
+    scanBlock(obj.compress, "compress");
+    const providers = obj.providers;
+    if (providers && typeof providers === "object" && !Array.isArray(providers)) {
+        for (const [url, entry] of Object.entries(providers as Record<string, unknown>)) {
+            if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+            const p = entry as Record<string, unknown>;
+            scanBlock(p.compress, `providers["${url}"].compress`);
+            const models = p.models;
+            if (models && typeof models === "object" && !Array.isArray(models)) {
+                for (const [model, mEntry] of Object.entries(models as Record<string, unknown>)) {
+                    if (!mEntry || typeof mEntry !== "object" || Array.isArray(mEntry)) continue;
+                    scanBlock((mEntry as Record<string, unknown>).compress, `providers["${url}"].models["${model}"].compress`);
+                }
+            }
+        }
+    }
+    hits.sort();
+    const sig = hits.join(",");
+    if (sig === "" || sig === seenInertRemovedCompressKeysSignature) return;
+    seenInertRemovedCompressKeysSignature = sig;
+    loggerLog("warn", `[acp-config] ${hits.join(", ")} is INERT — compress.imageCompression was removed and no longer does anything at any level (image pre-compression + image_full restore channel, #3266). Remove it from the config; images pass through byte-identical.`);
+}
 
 function warnInertResignPassthrough(obj: Record<string, unknown>): void {
     const inert: string[] = [];
@@ -2183,6 +2353,13 @@ export function resolveNativeAttachLanePriority(): string[] {
         if (t.length > 0 && !out.includes(t)) out.push(t);
     }
     return out;
+}
+
+/** #3373: the /__bili/ admin relay gate (fail-closed). Read per use — the
+ *  config file cache makes this cheap and hot edits apply without a host
+ *  restart. */
+export function adminRelayEnabled(): boolean {
+    return loadConfigFile().security?.adminRelay === true;
 }
 
 /** #2877: the native-hook discovery policy. "own-lane" (default) rides only a
@@ -2491,6 +2668,37 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("acknowledgePromptsRisk" in obj) {
         if (typeof obj.acknowledgePromptsRisk !== "boolean") ok = false;
         else out.acknowledgePromptsRisk = obj.acknowledgePromptsRisk;
+    }
+    if ("absorb" in obj && obj.absorb !== undefined) {
+        const a = obj.absorb;
+        if (!a || typeof a !== "object" || Array.isArray(a)) {
+            ok = false;
+        } else {
+            const ao = a as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["absorb"]> = {};
+            for (const key of ["enabled", "minToolTokens", "contextThresholdPct", "excludeTools", "toolName", "mediaOnly"] as const) {
+                if (!(key in ao)) continue;
+                const v = ao[key];
+                if (key === "enabled" || key === "mediaOnly") {
+                    if (typeof v !== "boolean") { ok = false; continue; }
+                    if (key === "enabled") cleaned.enabled = v;
+                    else cleaned.mediaOnly = v;
+                } else if (key === "minToolTokens") {
+                    if (typeof v !== "number" || !Number.isFinite(v)) { ok = false; continue; }
+                    cleaned.minToolTokens = v;
+                } else if (key === "contextThresholdPct") {
+                    if (!numberOrPercent(v)) { ok = false; continue; }
+                    cleaned.contextThresholdPct = typeof v === "string" ? v.trim() : v;
+                } else if (key === "excludeTools") {
+                    if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) { ok = false; continue; }
+                    cleaned.excludeTools = [...v] as string[];
+                } else {
+                    if (typeof v !== "string" || v.trim().length === 0) { ok = false; continue; }
+                    cleaned.toolName = v.trim();
+                }
+            }
+            if (ok) out.absorb = cleaned;
+        }
     }
     if ("ccr" in obj && obj.ccr !== undefined) {
         const c = obj.ccr;

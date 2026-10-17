@@ -23,13 +23,75 @@ import { createHash } from "node:crypto";
  * helper must not import server modules. Keep the two in sync. */
 export const INCREMENTAL_TURN_MARKER_HEADER = "x-bili-plugin-turn";
 
+/** #3329: per-request correlation id stamped on each planned incremental
+ * turn. The ack channel (native-intercept's onResponse) only carries the URL,
+ * and several conversations share one provider URL — keying the pending-ack
+ * table by URL mis-attributes a late response to whichever conversation
+ * planned last on that URL. The id rides the outgoing request and is read
+ * back from THAT dispatch's own headers when its response lands, so
+ * attribution is exact per request. It never travels to the proxy for any
+ * purpose (the lane ignores it) — pure in-process correlation. */
+export const INCREMENTAL_TURN_ID_HEADER = "x-bili-turn-id";
+
+let turnIdCounter = 0;
+
+/** Fresh per-request turn id: time base + process counter + random tail.
+ * Uniqueness only needs to hold inside this process (the id never crosses a
+ * wire boundary for correlation purposes). */
+export function newIncrementalTurnId(): string {
+    return `${Date.now().toString(36)}-${(turnIdCounter++).toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** #3329: drop pending entries older than `ttlMs` — a planned turn whose
+ * response never comes (network-dead request) must not pin its slot forever.
+ * Memory hygiene only since attribution is exact per request: correctness no
+ * longer depends on how long an entry survives. */
+export function sweepStale<T extends { at: number }>(map: Map<string, T>, ttlMs: number): void {
+    const now = Date.now();
+    for (const [key, entry] of map) if (now - entry.at >= ttlMs) map.delete(key);
+}
+
 /** Same allowlist the lane accepts in `request` (mirror of
  * REQUEST_PARAM_KEYS in src/incremental-lane.ts — keep in sync). */
 const REQUEST_PARAM_KEYS = [
     "model", "max_tokens", "temperature", "top_p", "top_k", "stop_sequences",
     "stream", "tools", "tool_choice", "metadata", "thinking", "service_tier",
     "parallel_tool_calls",
+    // Anthropic-on-Vertex has no `model` in the body — `anthropic_version`
+    // carries the wire revision instead (live capture 2026-10-15). Must stay
+    // identical to the lane's copy in src/incremental-lane.ts.
+    "anthropic_version",
 ] as const;
+const REQUEST_PARAM_KEY_SET = new Set<string>(REQUEST_PARAM_KEYS);
+
+/** Keys the lane assembles from the wire's top level — hosts pass the full
+ *  anthropic body as `request`, so these are by-design, not dropped. */
+const LANE_OWNED_REQUEST_KEYS = new Set(["messages", "system"]);
+
+/** #3406 item 6: params dropped here never reach the lane (its own warn
+ *  cannot fire for helper-planned turns), so surface them once per
+ *  conversation+key. Bounded: past the pair budget the map resets and the
+ *  next epoch warns again. */
+const droppedParamWarned = new Map<string, Set<string>>();
+let droppedParamWarnPairs = 0;
+const DROPPED_PARAM_WARN_BUDGET = 4096;
+
+function warnDroppedRequestParams(conversationId: string, request: Record<string, unknown>): void {
+    const fresh = Object.keys(request).filter((key) => !REQUEST_PARAM_KEY_SET.has(key) && !LANE_OWNED_REQUEST_KEYS.has(key));
+    if (fresh.length === 0) return;
+    const seen = droppedParamWarned.get(conversationId) ?? new Set<string>();
+    const unwarned = fresh.filter((key) => !seen.has(key));
+    if (unwarned.length === 0) return;
+    if (droppedParamWarnPairs + unwarned.length > DROPPED_PARAM_WARN_BUDGET) {
+        droppedParamWarned.clear();
+        droppedParamWarnPairs = 0;
+        seen.clear();
+    }
+    droppedParamWarnPairs += unwarned.length;
+    for (const key of unwarned) seen.add(key);
+    droppedParamWarned.set(conversationId, seen);
+    console.error(`[bili-incremental] ${conversationId}: request parameter(s) outside the incremental allowlist are not sent: ${unwarned.join(", ")} — extend REQUEST_PARAM_KEYS (src/agent/incremental-client.ts) if they must reach the upstream (#3406)`);
+}
 
 export interface IncrementalWireMessage {
     role: string;
@@ -118,6 +180,7 @@ function buildBody(args: PlanArgs, sinceSeq: number, messages: IncrementalWireMe
     const src = args.request ?? {};
     const request: Record<string, unknown> = {};
     for (const key of REQUEST_PARAM_KEYS) if (key in src) request[key] = src[key];
+    warnDroppedRequestParams(args.conversationId, src);
     const body: Record<string, unknown> = {
         conversationId: args.conversationId,
         sinceSeq,
@@ -175,14 +238,44 @@ export function planIncrementalTurn(args: PlanArgs, forceResync = false): Increm
 }
 
 /** Record a 200 ack: `appliedSeq` is the response's x-bili-applied-seq and
- * `messages` the wire set the server just acknowledged. */
+ * `messages` the wire set the server just acknowledged. An ack clears the
+ * rejection circuit — the conversation is healthy again. */
 export function noteIncrementalAck(conversationId: string, appliedSeq: number, messages: IncrementalWireMessage[], system: unknown): void {
+    rejectionCircuit.delete(conversationId);
     convs.set(conversationId, {
         sinceSeq: appliedSeq,
         sent: messages.map(wireHash),
         systemJson: system === undefined ? undefined : JSON.stringify(system),
         dead: false,
     });
+}
+
+/** Consecutive 409s (no intervening ack) that trip the sticky kill switch.
+ * A SINGLE 409 just resets the conversation state — the next turn re-seeds
+ * with a full resync:true body, which cannot 409 — so transient drift (sidecar
+ * degraded at boot, one upstream 5xx between apply and forward, a sibling host
+ * re-seeding) self-heals on the very next turn instead of permanently
+ * downgrading the conversation (#3369). */
+const REJECTION_CIRCUIT = 3;
+
+/** Consecutive rejections per conversation, OUTSIDE `convs` — a reset deletes
+ * the wire state, but the circuit counter must survive it. */
+const rejectionCircuit = new Map<string, number>();
+
+/** Record a lane rejection (409 seq drift). Returns "reset" when the next
+ * turn re-seeds (transient drift — the common case) and "dead" when the
+ * sticky kill switch tripped (persistent drift: full resend for the rest of
+ * the process lifetime, exactly the pre-#3369 behavior). */
+export function noteIncrementalRejection(conversationId: string): "reset" | "dead" {
+    const strikes = (rejectionCircuit.get(conversationId) ?? 0) + 1;
+    if (strikes >= REJECTION_CIRCUIT) {
+        rejectionCircuit.delete(conversationId);
+        convs.set(conversationId, { sinceSeq: 0, sent: [], systemJson: undefined, dead: true });
+        return "dead";
+    }
+    rejectionCircuit.set(conversationId, strikes);
+    convs.delete(conversationId); // next turn re-seeds: full set, resync:true, sinceSeq 0
+    return "reset";
 }
 
 /** Sticky per-conversation fallback after an unrecoverable lane failure —
@@ -201,4 +294,7 @@ export function clearIncrementalProbe(proxyBase: string): void {
 export function __resetIncrementalClientForTests(): void {
     convs.clear();
     probeCache.clear();
+    rejectionCircuit.clear();
+    droppedParamWarned.clear();
+    droppedParamWarnPairs = 0;
 }

@@ -43,15 +43,9 @@ defineConfig({
     // billion-context-pi-subagents (#2384): vendored under pi-subagents/,
     // consumed via file:, and its own build already inlines its typebox peer,
     // so its dist is self-contained too.
-    noExternal: ["acp-kernel", "billion-context-pi-subagents", "fzstd", "node-forge", "semver", "tar", "undici", "jsonc-parser", "ws"],
-    // sharp is an OPTIONAL runtime dependency (native module): it must stay
-    // EXTERNAL so dist keeps a real lazy `import("sharp")` that Node resolves
-    // at runtime from node_modules — missing ⇒ clean pass-through, and the
-    // bundle stays independent of which sharp version npm resolved (the caret
-    // range in optionalDependencies would otherwise bake that version into
-    // dist and break reproducible builds). tsup does not auto-externalize
-    // optionalDependencies, hence the explicit entry.
-    external: ["sharp"],
+    // jimp (#3400): pure-JS image encoder, devDependency inlined like every
+    // other bundled dep — dist stays self-contained, zero native modules.
+    noExternal: ["acp-kernel", "billion-context-pi-subagents", "fzstd", "jimp", "node-forge", "semver", "tar", "undici", "jsonc-parser", "ws"],
     banner: {
         // node-forge is a CommonJS dependency that calls require("crypto") etc.
         // inlined into our ESM output, esbuild's __require shim throws in an

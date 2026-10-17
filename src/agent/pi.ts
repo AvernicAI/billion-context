@@ -14,7 +14,7 @@ import { disposeSubagentSelfReg, selfRegisterForSession, type SubagentSelfRegSta
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
 import { wirePiSubagents } from "./pi-subagents.js";
 import { wireToolGuardrails } from "./tool-guardrails.js";
-import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, markIncrementalDead, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, type IncrementalWireMessage } from "./incremental-client.js";
 import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
@@ -1320,28 +1320,39 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 if (sid === undefined || sid.length === 0) return;
                 const pending = pendingIncrementalAcks.get(sid);
                 if (pending === undefined) return;
-                pendingIncrementalAcks.delete(sid);
                 const status = (event as { status?: unknown }).status;
                 const headers = (event as { headers?: Record<string, unknown> }).headers;
+                const seq = headers?.["x-bili-applied-seq"];
+                if (status === 200 && !(typeof seq === "string" && /^\d+$/.test(seq))) {
+                    // 200 without an ack header CANNOT be the marker'd response —
+                    // the lane stamps x-bili-applied-seq on every diverted
+                    // response that reaches the forward (incremental-lane.ts
+                    // writeHead wrap). It is a concurrent full-resend response
+                    // for this conversation: keep the pending entry for the
+                    // marker'd response still in flight.
+                    return;
+                }
+                pendingIncrementalAcks.delete(sid);
                 if (status === 200) {
-                    const seq = headers?.["x-bili-applied-seq"];
-                    if (typeof seq === "string" && /^\d+$/.test(seq)) {
-                        noteIncrementalAck(sid, Number(seq), pending.messages, pending.system);
-                        return;
-                    }
-                    // No ack header = the request did NOT ride the incremental
-                    // divert (marker raced the probe) — leave state untouched.
+                    noteIncrementalAck(sid, Number(seq), pending.messages, pending.system);
                     return;
                 }
                 if (status === 409) {
-                    markIncrementalDead(sid);
-                    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): incremental turn rejected (seq drift) for ${sid} — falling back to full resend for this conversation`);
+                    // #3369: one 409 resets the conversation state — the next
+                    // turn re-seeds with resync:true (never 409s) instead of
+                    // permanently downgrading to full resend. Only a streak of
+                    // consecutive 409s (no ack between) trips the sticky kill.
+                    const verdict = noteIncrementalRejection(sid);
+                    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): incremental turn rejected (seq drift) for ${sid} — ${verdict === "dead" ? "sticky fallback to full resend (rejection circuit)" : "re-seeding with a full resync next turn"} (#3369)`);
                     return;
                 }
                 if (status === 503) {
-                    markIncrementalDead(sid);
+                    // #3369: 503 means the lane is temporarily unavailable
+                    // (sidecar boot / rollout flip) — the conversation's ack
+                    // state is still valid, so do NOT kill it. Just drop the
+                    // probe cache; the next turn re-probes and resumes.
                     clearIncrementalProbe(pending.base);
-                    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): incremental turns unavailable on the lane — re-probing next turn`);
+                    logHostEvent("warn", "[native-client]", `bili-plugin(${agent}): incremental turns unavailable on the lane — re-probing next turn (conversation state preserved, #3369)`);
                 }
             } catch (err) {
                 logHostEvent("error", "[native-client]", `bili-plugin(${agent}): incremental ack handling failed (${err instanceof Error ? err.message : String(err)})`);

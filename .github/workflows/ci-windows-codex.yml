@@ -1,7 +1,11 @@
 name: CI Windows codex overlay (#686)
 
 on:
-  # #3085: runs on every master PR + push by default (reverts #2637's hot-file gate, which let untested changes ship).
+  # three-layer CI (#3295): NO push trigger by design — master's signal is
+  # ci.yml core runs + the gated 30-min cron below (the pre-#3295 "#3085:
+  # every master PR + push" default no longer holds). pull_request events
+  # exist only to feed the ci:full label gate; the gate job skips everything
+  # else, so a plain PR never runs this lane.
   pull_request:
     types: [opened, synchronize, reopened, labeled]
     branches: [master]
@@ -15,7 +19,11 @@ concurrency:
   # #2637 plan #3: schedule-safe group — master pushes must not cancel the
   # day's nightly run; same-ref pushes still supersede each other.
   group: windows-codex-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
-  cancel-in-progress: true
+  # #3331: cancel-in-progress applies WITHIN the group too — a 30-min cron whose
+  # run outlives the interval would kill its predecessor mid-suite (tokens spent,
+  # no green recorded, gate can never skip). Cancel only same-ref superseded
+  # runs; scheduled runs queue behind each other instead.
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 # Real-machine layer for issue #686: on a hosted Windows runner, confirm codex
 # accepts the `<CODEX_HOME>-bili` overlay from `bili codex` and registers bili.

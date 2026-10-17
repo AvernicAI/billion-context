@@ -110,7 +110,7 @@ test("restoreOutputBudget: high-water learning + starved-budget restore (#546)",
     assert.equal(s.metadata.outputBudgetHighWater, 8000, "non-starved value recorded verbatim as high-water");
     const starved2 = { max_tokens: 200, tools: [{ name: "t" }] } as { max_tokens: number };
     restoreOutputBudget(starved2, s, noopLog);
-    assert.equal(starved2.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "boundary 200 starve floored to the absolute minimum (#3071)");
+    assert.equal(starved2.max_tokens, 8000, "boundary 200 starve restored to the session's own high-water, never raised to the floor above it (#3406)");
     restoreOutputBudget({ max_tokens: 32768 }, s, noopLog);
     assert.equal(s.metadata.outputBudgetHighWater, 32768, "a later healthy value wins as high-water");
     // Field-name fidelity: restore writes the SAME field the client used.
@@ -155,11 +155,51 @@ test("restoreOutputBudget: configured-output-limit floor for poisoned or missing
     restoreOutputBudget({ max_tokens: 234 }, s5, noopLog);
     const tinyFloor = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
     restoreOutputBudget(tinyFloor, s5, noopLog, 200);
-    assert.equal(tinyFloor.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "limit <= 200 is not a usable ceiling — absolute floor applies");
+    assert.equal(tinyFloor.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "limit <= 200 is not a usable ceiling; rattle high-water 234 is below the trust line — absolute floor applies (#3071/#3406)");
     // Side requests (no tools) never receive the floor.
     const side = { max_tokens: 100 } as { max_tokens: number };
     restoreOutputBudget(side, s3, noopLog, 32768);
     assert.equal(side.max_tokens, 100, "side request untouched even with a floor available");
+});
+
+test("restoreOutputBudget: no-ceiling restore never exceeds the session's proven high-water (#3406 hard-cap providers)", () => {
+    // A provider hard-caps maxOutputTokens at 8192 — below the 32K absolute
+    // floor — and bili has NO ceiling source for it (no runtime-info, no
+    // launcher, no config, no registry row). The session ran HEALTHY at 8000
+    // (the provider accepted that exact value at full size), then the client's
+    // budget starved. Raising to the 32K floor would hard-reject the request;
+    // the restore must return the session's own proven budget instead.
+    const s = metaSession("hardcap");
+    restoreOutputBudget({ max_tokens: 8000 }, s, noopLog);
+    const starved = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
+    restoreOutputBudget(starved, s, noopLog);
+    assert.equal(starved.max_tokens, 8000, "restored to the proven high-water, never raised above it (#3406)");
+    // A high-water ABOVE the floor keeps passing untouched (unchanged).
+    const s2 = metaSession("hardcap2");
+    restoreOutputBudget({ max_tokens: 49152 }, s2, noopLog);
+    const starved2 = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
+    restoreOutputBudget(starved2, s2, noopLog);
+    assert.equal(starved2.max_tokens, 49152, "high-water above the floor is still restored as-is");
+    // Without ANY high-water the #3071 floor still guarantees a lower bound
+    // (born-starved / fork-inherited rattle — nothing was ever proven legal).
+    const s3 = metaSession("hardcap3");
+    const born = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
+    restoreOutputBudget(born, s3, noopLog);
+    assert.equal(born.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "born-starved keeps the absolute floor (#3071)");
+    // A rattle high-water BELOW the trust line still gets the floor — the
+    // #3071 death spiral must stay fixed (decay chains end in exactly this
+    // state, and a few hundred tokens cannot emit a compress call).
+    const s4 = metaSession("hardcap4");
+    restoreOutputBudget({ max_tokens: 2061 }, s4, noopLog);
+    const rattle = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
+    restoreOutputBudget(rattle, s4, noopLog);
+    assert.equal(rattle.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "high-water below the trust line (2061) is overridden by the floor (#3071)");
+    // Boundary: exactly at the trust line the high-water is a proven bound.
+    const s5 = metaSession("hardcap5");
+    restoreOutputBudget({ max_tokens: 4096 }, s5, noopLog);
+    const atLine = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
+    restoreOutputBudget(atLine, s5, noopLog);
+    assert.equal(atLine.max_tokens, 4096, "high-water at the trust line (4096) is restored as-is, not raised (#3406)");
 });
 
 test("restoreOutputBudget: warns once per SESSION+model when no output ceiling backs the restore (#1840/#3071)", () => {
@@ -176,7 +216,7 @@ test("restoreOutputBudget: warns once per SESSION+model when no output ceiling b
     assert.equal(s.metadata.outputBudgetHighWater, 583, "non-starved learning is silent and tracked verbatim");
     const starved = { max_tokens: 1, tools, model: A } as { max_tokens: number };
     restoreOutputBudget(starved, s, log);
-    assert.equal(starved.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "ceiling-less starve floored to the absolute minimum (#3071)");
+    assert.equal(starved.max_tokens, OUTPUT_RESTORE_ABSOLUTE_FLOOR, "ceiling-less starve with a rattle high-water (583 < trust line) floored to the absolute minimum (#3071)");
     let warns = lines.filter((l) => l.includes("NO known output ceiling"));
     assert.equal(warns.length, 1, "one warn per session+model (on the starve, not the silent learning)");
     assert.match(warns[0] ?? "", /model=stepfun\/step-5-preview/, "names the model");

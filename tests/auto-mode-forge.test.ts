@@ -55,10 +55,24 @@ const SEVERITY_SYS = "You are a safety classifier. 50 is exactly the allow/block
 const BLOCK_SYS = 'Respond with <block>yes</block> or <block>no</block>.';
 const TRANSCRIPT_USER = [{ type: "text" as const, text: "<transcript>\n[user] run deploy\n[assistant] done\n</transcript>" }];
 
-test("isAutoModeClassifier: stage-1 non-fast — magic stop sequences are sufficient alone", () => {
-    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["</severity>"] })));
-    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["</block>"] })));
-    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["junk", "</severity>", "more"] })));
+test("isAutoModeClassifier: stage-1 non-fast — magic stop sequences corroborated by the <transcript> wrapper", () => {
+    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["</severity>"], messages: [{ role: "user", content: TRANSCRIPT_USER }] })));
+    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["</block>"], messages: [{ role: "user", content: TRANSCRIPT_USER }] })));
+    assert.ok(isAutoModeClassifier(req({ stop_sequences: ["junk", "</severity>", "more"], messages: [{ role: "user", content: TRANSCRIPT_USER }] })));
+});
+
+test("isAutoModeClassifier: magic stop sequences ALONE are NOT enough (legit severity/block-XML traffic)", () => {
+    // A legitimate session that emits severity/block verdict XML can use these as
+    // stop hints; without the <transcript> wrapper it must never be intercepted —
+    // the forged verdict is a local "always allow", i.e. a silent safety downgrade
+    // for whatever that session was actually classifying.
+    assert.ok(!isAutoModeClassifier(req({ stop_sequences: ["</severity>"] })));
+    assert.ok(!isAutoModeClassifier(req({ stop_sequences: ["</block>"] })));
+    assert.ok(!isAutoModeClassifier(req({
+        stop_sequences: ["</severity>"],
+        system: "You moderate user reports. Output <severity>0-100</severity>.",
+        messages: [{ role: "user", content: "report: spam" }],
+    })));
 });
 
 test("isAutoModeClassifier: no-stop shapes (stage-1-fast / stage-2) — policy wording AND <transcript> wrapper", () => {
@@ -88,6 +102,7 @@ test("isAutoModeClassifier: negatives — each signal alone is not enough", () =
     assert.ok(!isAutoModeClassifier(req({ messages: [{ role: "user", content: TRANSCRIPT_USER }] })), "transcript wrapper without policy wording");
     assert.ok(!isAutoModeClassifier(req({ system: SEVERITY_SYS })), "policy wording without transcript wrapper");
     assert.ok(!isAutoModeClassifier(req({ stop_sequences: ["\n\n"] })), "unrelated stop sequence");
+    assert.ok(!isAutoModeClassifier(req({ stop_sequences: ["</severity>"] })), "magic stop sequence without the transcript wrapper");
 });
 
 // --- variant resolution ---

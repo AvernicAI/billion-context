@@ -47,14 +47,21 @@ on:
 # the release-v0.1.191 CI queue piled up behind same-ref reruns.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  # #3331: cancel-in-progress applies WITHIN the group too — a 30-min cron whose
+  # run outlives the interval would kill its predecessor mid-suite (tokens spent,
+  # no green recorded, gate can never skip). Cancel only same-ref superseded
+  # runs; scheduled runs queue behind each other instead.
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 jobs:
   # Three-layer CI (#3295) plan: decide the matrix scope BEFORE paying for
   # legs. One cheap ubuntu job picks one of three scopes:
   #   core — every PR (push) and master push: 6 test legs (ubuntu 22 full 3-shard
-  #          suite, ubuntu 24 single-leg whole suite, windows 22 2-shard) + 1
-  #          static leg. The blocking layer; branch protection requires exactly
+  #          suite, ubuntu 24 single-leg whole suite, windows 22 2-shard) + 2
+  #          static legs (ubuntu 24, windows 22 — #3406 item 8: the windows
+  #          static leg keeps typecheck/build + the kernel/pi-subagents
+  #          suites covered on windows for EVERY PR, not only ci:full/nightly).
+  #          The blocking layer; branch protection requires exactly
   #          these 6 test leg names.
   #   full — `ci:full` label on a PR, workflow_dispatch full=true, or the 30-min
   #          cron when master moved since the last green scheduled run: the
@@ -95,7 +102,7 @@ jobs:
             {"os":"ubuntu-latest","node-version":24,"shard":1,"shardTotal":1},
             {"os":"windows-latest","node-version":22,"shard":1,"shardTotal":2},
             {"os":"windows-latest","node-version":22,"shard":2,"shardTotal":2}]}'
-          CORE_STATIC='{"include":[{"os":"ubuntu-latest","node-version":24}]}'
+          CORE_STATIC='{"include":[{"os":"ubuntu-latest","node-version":24},{"os":"windows-latest","node-version":22}]}'
           FULL_TEST='{"include":[
             {"os":"ubuntu-latest","node-version":22,"shard":1,"shardTotal":3},
             {"os":"ubuntu-latest","node-version":22,"shard":2,"shardTotal":3},
@@ -471,3 +478,53 @@ jobs:
       - run: npm install --package-lock-only --ignore-scripts --no-fund --no-audit
       - name: Fail on lockfile version drift
         run: git diff --exit-code -- package-lock.json
+
+  # Scheduled full-matrix red signal (#3295 follow-up, owner-approved
+  # 2026-10-16): a red scheduled run auto-opens a tracking issue; a later
+  # GREEN scheduled run auto-closes it. Owner opted out of email — the issue
+  # IS the notification. Title deliberately avoids "ci" because the triage
+  # bot does not auto-dispatch titles containing it.
+  red-signal:
+    needs: [test, static-gates]
+    if: ${{ !cancelled() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Open or resolve the red tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          HEAD_SHA: ${{ github.sha }}
+          TEST_RESULT: ${{ needs.test.result }}
+          STATIC_RESULT: ${{ needs.static-gates.result }}
+        run: |
+          set -euo pipefail
+          LABEL=scheduled-red
+          gh label create "$LABEL" --color b60205 --description "定时全量失败的自动跟踪" 2>/dev/null || true
+          RUN_URL="https://github.com/$REPO/actions/runs/$RUN_ID"
+          SHORT="${HEAD_SHA:0:8}"
+          if [ "$TEST_RESULT" = "failure" ] || [ "$STATIC_RESULT" = "failure" ]; then
+            FAILS=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" --jq '[.jobs[] | select(.conclusion=="failure") | .name] | unique | .[]' | sed 's/^/  - /')
+            TITLE="定时全量测试失败: ${SHORT}"
+            N=$(gh issue list -R "$REPO" --label "$LABEL" --state open --json number,title --jq '.[] | "\(.number)\t\(.title)"' | grep -F "定时全量测试失败: ${SHORT}" | cut -f1 | head -1 || true)
+            if [ -n "$N" ]; then
+              echo "open issue #$N already tracks this head — commenting instead"
+              gh issue comment "$N" -R "$REPO" --body "定时全量仍在 ${SHORT} 上红着: ${RUN_URL}"
+            else
+              printf '%s\n\n%s\n%s\n%s\n\n%s\n' \
+                "自动跟踪:定时全量矩阵在 ${SHORT} 上挂了(红灯每个定时 tick 会重试,直到转绿或被新提交取代)。" \
+                "失败的腿:" "$FAILS" \
+                "run: ${RUN_URL}" \
+                "此 issue 会在下一次定时全量转绿时自动关闭。" > /tmp/red-body.md
+              gh issue create -R "$REPO" --title "$TITLE" --body-file /tmp/red-body.md --label "$LABEL"
+            fi
+          elif [ "$TEST_RESULT" = "success" ] && [ "$STATIC_RESULT" = "success" ]; then
+            for N in $(gh issue list -R "$REPO" --label "$LABEL" --state open --json number --jq '.[].number'); do
+              gh issue close "$N" -R "$REPO" --comment "定时全量已在 ${SHORT} 恢复绿: ${RUN_URL}"
+            done
+          else
+            echo "results: test=$TEST_RESULT static=$STATIC_RESULT — nothing to report"
+          fi

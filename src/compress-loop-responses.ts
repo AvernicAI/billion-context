@@ -6,7 +6,9 @@ import {
 import { lastCompressSuffix, withSessionLock, type Session } from "./session.js";
 import { extractResponsesTextTriggers, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS } from "./compress-tool.js";
 import { log as loggerLog } from "./logger.js";
-import { drainPendingRetrievals } from "./store.js";
+import { drainPendingRetrievals, imageRescaleToolArmed } from "./store.js";
+import { imageRescaleMaxDim } from "./knobs.js";
+import { applyImageRescaleItems } from "./image-rescale.js";
 import { executeProxyToolAsync, buildVisibilityMarker } from "./loop/core.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { mergeAdjacentConfigurationUpdates } from "./responses-tool-output.js";
@@ -169,7 +171,18 @@ export async function compressLoopResponsesJson(
             }
             return current;
         }
-        const inputItems: ResponseInputItem[] = Array.isArray(requestBody.input) ? [...requestBody.input] : [];
+        let inputItems: ResponseInputItem[] = Array.isArray(requestBody.input) ? [...requestBody.input] : [];
+        // #3400: the loop re-request resends the client's RAW input items (big
+        // images intact) — run the same egress pass the steady path applies so
+        // the upstream keeps seeing the identical downscaled bytes (the shared
+        // encode cache makes this byte-stable across rounds).
+        inputItems = (await applyImageRescaleItems(inputItems, {
+            session: ctx.session,
+            sessionId: ctx.session.id,
+            log: (lvl, msg) => ctx.log(`[${lvl}] ${msg}`),
+            maxDim: imageRescaleMaxDim(),
+            toolArmed: imageRescaleToolArmed(ctx.session),
+        })) as ResponseInputItem[];
         if (extracted.clean.trim()) {
             inputItems.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: extracted.clean }] });
         }

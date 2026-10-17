@@ -130,6 +130,8 @@ export interface AbsorbConfig {
   contextThresholdPct: number;
   /** Tool-name patterns (glob suffix allowed) never absorbable, independent of protectedTools. */
   excludeTools: string[];
+  /** #3402: when true, only image-bearing tool results are candidates, and they bypass minToolTokens. */
+  mediaOnly?: boolean;
 }
 
 /** Emitted when the session's irreducible floor (system prompt + block
@@ -467,6 +469,11 @@ export interface CompressibleRange {
   startIndex?: number;
   /** Messages-array index of this range's last message. */
   endIndex?: number;
+  /** #3192/#3205: buildCompressibleRanges sets this when the range opens right
+   *  after a dead-ref hole. A dropped message leaves NO array slot, so the hole
+   *  has no index gap and the index check alone would let mergeRangesToThreshold
+   *  bridge back into one doomed span bracketing the dead ref. */
+  noMergeBefore?: boolean;
 }
 
 export interface ProtectedRange {
@@ -479,6 +486,10 @@ export interface ProtectedRange {
   startIndex?: number;
   /** Messages-array index of last message. */
   endIndex?: number;
+  /** #3192/#3205: see CompressibleRange.noMergeBefore — set when this protected
+   *  range opens right after a dead-ref hole, so formatRanges does not bridge a
+   *  preceding compressible range across the hole into one doomed span. */
+  noMergeBefore?: boolean;
 }
 
 export interface ContextRanges {

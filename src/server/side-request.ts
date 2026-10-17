@@ -3,7 +3,8 @@ import { estimateRawBodyTokens } from "../preflight.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
 import { reserveOutputHeadroom, shouldReserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
-import { ACP_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
+import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
+import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../compress-tool.js";
 
 // #388: side requests (title-gen etc.) share the main session key but must not
 // touch kernel state. Identified by a tiny output budget (same heuristic as
@@ -185,8 +186,10 @@ export function resolveSideLane(s: SideLaneSignals): SideLaneDecision {
 // guaranteed bili-owned, and any host tool vetoes the demotion.
 export const BILI_TOOL_NAMES: ReadonlySet<string> = new Set([
     ...ACP_TOOL_NAMES,
+    ABSORB_TOOL_NAME,
     RULE_TOOL_NAME,
     RETRIEVE_TOOL_NAME,
+    READ_ORIGINAL_IMAGE_TOOL_NAME,
 ]);
 
 /** Tool names declared by `parsed.tools`, proto-agnostically. null when the
@@ -302,6 +305,13 @@ export function writeOutputBudget(parsed: Record<string, unknown>, field: Output
 // this minimum so a ceiling-less model can never truncate every reply below the
 // point where the model can even emit a compress call or short visible text. It is
 // a LOWER bound only — a healthy client value above it passes through untouched.
+// #3406: the floor applies ONLY when the session has no FUNCTIONAL bound of
+// its own (born-starved / fork-inherited rattle, or a high-water below
+// OUTPUT_HIGH_WATER_TRUST_MIN). A high-water at/above the trust line is the
+// session's own proven budget — the healthy branch forwarded it verbatim and the
+// provider accepted it at full value — so it is an explicit smaller legal bound:
+// raising it to this floor trades a degraded-but-working session for a hard 400
+// on any provider whose maxOutputTokens cap sits below 32K.
 // Magnitude is 32K, not 8K (#3071 follow-up, owner decision 2026-10-15): a ceiling-less
 // model generally sustains >=32K of output, while 8K is consumed by a single modest
 // thinking block before any visible text survives, so 8K left the problem unfixed.
@@ -310,6 +320,17 @@ export function writeOutputBudget(parsed: Record<string, unknown>, field: Output
 // reservation (which self-caps at 25% of window) bound the result by real headroom
 // regardless of this floor.
 export const OUTPUT_RESTORE_ABSOLUTE_FLOOR = 32768;
+
+// #3406: a recorded high-water is trusted as the restore target (never raised
+// to the absolute floor) only when it is a FUNCTIONAL budget — at or above the
+// same capability line the #453 downstream clamp already enforces
+// (OUTPUT_CLAMP_MIN_OUTPUT, src/server/budget.ts: "capability floor for the
+// clamped budget", #3071/#2490) and the same magnitude a real host ships as a
+// deliberate preset (dsh bundle 4096, "a ceiling against runaway output"). A
+// high-water below it is the observed #3071 death-rattle zone (decay chains
+// …, 2061, 252): too small to emit a compress call or visible text, so it is
+// NOT treated as a legal bound and the floor still overrides it.
+const OUTPUT_HIGH_WATER_TRUST_MIN = 4096;
 
 // #1840/#3071: one-shot "restore has no ceiling" warnings, keyed by SESSION+MODEL.
 // #1840 keyed them by MODEL alone, but the degradation is SESSION-scoped: the
@@ -366,13 +387,17 @@ function clearNoCeilingDegraded(session: { metadata: Record<string, unknown> }, 
  *  still bounds the result by real window headroom. A ceiling at/below the
  *  side-request threshold is not usable; a healthy water mark above the
  *  ceiling keeps winning (it is a capability floor, not an instruction cap).
- *  #3071: when NO source knows a ceiling, a STARVED / born-starved /
- *  fork-inherited value must never leave the proxy below
- *  OUTPUT_RESTORE_ABSOLUTE_FLOOR — the restore target is floored there so a
- *  ceiling-less model can never pin the session at a death rattle (the client's
- *  own decaying high-water is itself the poisoned quantity). A non-starved value
- *  is always trusted and recorded verbatim as the high-water. The no-ceiling
- *  condition warns once per SESSION+model (the degradation is session-scoped). */
+ *  #3071/#3406: when NO source knows a ceiling, a starved request is floored
+ *  at OUTPUT_RESTORE_ABSOLUTE_FLOOR unless the session's recorded high-water is
+ *  a functional budget (>= OUTPUT_HIGH_WATER_TRUST_MIN) — a fresh/forked
+ *  session with no high-water and a decayed death-rattle high-water both keep
+ *  the floor (#3071), while a proven working high-water is restored to AS-IS
+ *  and never raised above (#3406): it is the budget the provider already
+ *  accepted at full value, and raising it to the 32K floor hard-rejects on
+ *  providers that cap maxOutputTokens below 32K (availability over ideology,
+ *  #3128). A non-starved value is always trusted and recorded verbatim as the
+ *  high-water. The no-ceiling condition warns once per SESSION+model (the
+ *  degradation is session-scoped). */
 export function restoreOutputBudget(
     parsed: unknown,
     session: { id: string; metadata: Record<string, unknown> },
@@ -405,17 +430,29 @@ export function restoreOutputBudget(
     if (ceiling !== undefined && (target === undefined || ceiling > target)) {
         target = ceiling;
     } else if (ceiling === undefined) {
-        // #3071 path 1 + path 2b: a starved budget must never leave the proxy
-        // verbatim. A fresh fork child inherits the parent's rattle with no
-        // high-water of its own, so this branch guarantees max_tokens is always
-        // raised to at least the capability floor when no ceiling is known.
-        if (target === undefined || OUTPUT_RESTORE_ABSOLUTE_FLOOR > target) target = OUTPUT_RESTORE_ABSOLUTE_FLOOR;
+        // #3071 path 1 + path 2b: a starved budget with NO usable bound of its
+        // own must never leave the proxy verbatim — a fresh fork child inherits
+        // the parent's rattle with no high-water, and a death-rattle high-water
+        // (below OUTPUT_HIGH_WATER_TRUST_MIN) is itself the poisoned quantity,
+        // so both fall to the capability floor.
+        // #3406: a high-water AT/ABOVE the trust line is the session's own
+        // proven budget — the healthy branch forwarded it verbatim and the
+        // provider accepted it at full value — so it is an explicit smaller
+        // legal bound. Never raise above it: a provider hard-capping
+        // maxOutputTokens below this floor rejects the raised value outright
+        // (400), trading a degraded-but-working session for a failing one
+        // (availability over ideology, #3128).
+        if (target === undefined || target < OUTPUT_HIGH_WATER_TRUST_MIN) target = OUTPUT_RESTORE_ABSOLUTE_FLOOR;
     }
     if (typeof target === "number") {
         writeOutputBudget(p, field, target);
         const note = ceiling !== undefined && target === ceiling
             ? (highWater === undefined ? "; no healthy high-water yet — using known output ceiling (#1665/#1840)" : `; high-water ${highWater} below known output ceiling — floored (#1665/#1840)`)
-            : (ceiling === undefined ? "; no known output ceiling — floored to the absolute capability minimum (#3071)" : "");
+            : (ceiling === undefined
+                ? (target === highWater
+                    ? "; no known output ceiling — restored to the session's own recorded budget, never raised above it (#3406)"
+                    : "; no known output ceiling — floored to the absolute capability minimum (#3071)")
+                : "");
         log("info", `[${session.id}] output budget restored ${value} -> ${target} (#546: client shrank it from its raw-history estimate${note})`);
     }
     // #2904: persist the no-ceiling degraded state for the user-visible surfaces.

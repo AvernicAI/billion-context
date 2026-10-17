@@ -3,6 +3,7 @@ import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, 
 import { renderNudgeText, viableRanges } from "acp-kernel";
 import { anthropicToCore, buildSystem, coreToAnthropic, extractSystem, type AnthropicRequestBody, type BiliMessage } from "acp-kernel/wire";
 import { rewriteInboundThreadContinue } from "./thread-tracking.js";
+import { captureThreadsTurn, estimateThreadsTokens, isThreadsBody, threadsReforgeEnabled } from "./threads-lane.js";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
@@ -13,8 +14,9 @@ import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
-import { RULE_TOOL, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
-import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
+import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL, RULE_TOOL, absorbToolsFor, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
+import { applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
+import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
@@ -24,10 +26,13 @@ import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, stampAnt
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
-import { renderNone as knobRenderNone } from "../knobs.js";
+import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
+import { applyImageRescalePass } from "../image-rescale.js";
 import { isAutoModeClassifier } from "../auto-mode-forge.js";
-import { countSystemAndToolsTokens, emergencyNudge, projectThinkingMass } from "./budget.js";
+import { countSystemAndToolsTokens, emergencyNudge, emergencyNudgeArmed, projectThinkingMass } from "./budget.js";
+import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectSystem, injectTool } from "./inject.js";
+import { resolveLaneDecisions } from "./lane-decisions.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -43,14 +48,27 @@ export async function prepareAnthropic(
     upstreamOrigin: string,
     reasoning: CompressReasoningConfig | undefined,
     visibilityMarkers: boolean,
+    /** The route's resolved model, when the caller already has one. On the
+     *  Anthropic-on-Vertex wire the body carries `anthropic_version` and no
+     *  `model`, so the diag line below would otherwise print `undefined`. */
+    resolvedModel?: string,
     decide?: DecideConfig,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
     const injectTools = opts.compress.injectTool && !pluginMode;
-    // #3177: DSH tools are host-scope (the preset agent can't reach them) — suppress the model-side compress surface.
-    const dshCompressSurfaceOff = pluginMode && session.metadata["pluginAgent"] === "dsh";
+    // #3417: lane decisions (profile + per-wire observation) own the
+    // surface gates; the dsh* alias stays for the remaining reads in this
+    // file (Step 3 of #3417 renames the consumers).
+    const laneDecisions = resolveLaneDecisions({
+        protocol: "anthropic",
+        pluginMode,
+        pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined,
+        parsed,
+        shouldInject: opts.compress.injectTool,
+    });
+    const dshCompressSurfaceOff = laneDecisions.compressSurfaceOff;
     // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
     // core.processTurn — see planReasoningDrop for why the post-turn view is too late.
     let reasoningPlan = new Set<string>();
@@ -58,6 +76,50 @@ export async function prepareAnthropic(
     if (isAutoModeClassifier(parsed)) {
         log("info", `[${sessionId}] auto-mode classifier passthrough (skipping compress injection)`);
         return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts, surface } as Prepared;
+    }
+
+    // [#2926] anthropic Threads lane — BEFORE the #2648 global-scope stand-down:
+    // Claude Code's own main loop runs threads with a global-scope system
+    // block, so the ordering decides which lane claims the turn (#2884: the
+    // stand-down swallowed whole CC sessions and silently disabled folding).
+    // Threads state lives server-side; `continue` bodies carry only deltas,
+    // so bili's history-rewrite lever does not exist here. Mirror the turn
+    // into the unified store (capture is always on where the sidecar lives),
+    // forward byte-faithfully, and arm a reforge when the mirror crossed the
+    // window — the only channel that can deliver a fold to a server-side
+    // thread is a fresh `create`. handle.ts executes the plan.
+    if (!pluginMode && isThreadsBody(parsed)) {
+        const mirror = captureThreadsTurn(sessionId, parsed, log);
+        const prepared: Prepared = {
+            body: JSON.stringify(parsed),
+            session,
+            processedMessages: [],
+            originalMessages: [],
+            anthropicSystem: parsed.system,
+            protocol: "anthropic",
+            stream,
+            compressInjected: false,
+            pluginMode,
+            nudge: undefined,
+            prompts,
+            surface,
+            threadsLane: true,
+        } as Prepared;
+        const threadsWindow = opts.modelContextLimit && opts.modelContextLimit > 0 ? opts.modelContextLimit : 200_000;
+        if (
+            mirror.available &&
+            (parsed.thread as { type?: unknown }).type === "continue" &&
+            threadsReforgeEnabled() &&
+            estimateThreadsTokens(mirror.meta, mirror.entries) > threadsWindow
+        ) {
+            prepared.threadsReforge = {
+                sessionId,
+                entries: mirror.entries,
+                meta: mirror.meta,
+                windowTokens: threadsWindow,
+            };
+        }
+        return prepared;
     }
 
     // #2648: when the host pins a system block to cache_control.scope:"global",
@@ -160,14 +222,23 @@ export async function prepareAnthropic(
         // compression trigger fires until overflow. See effectiveTokenCount.
         const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, inboundImageTokens);
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
+        // Absorb markers are injected by the kernel's processTurn from
+        // config.absorb. With no channel to call the tool (injection off),
+        // strip absorb from the loop config so the REQUIRED instruction never
+        // reaches the wire. Hiding recorded absorptions is unaffected
+        // (applyAbsorbView hides regardless of enablement).
+        const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
+        const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
+        const absorbActive = absorbBlock?.enabled === true && opts.compress.injectTool;
         // acp_rule has no processTurn side effect (no markers/instructions are
-        // ever injected into messages) — only tool availability matters.
+        // ever injected into messages), so unlike absorb it needs no loop-
+        // config stripping — only tool availability matters.
         const rulesActive = rulesEnabled(config) && opts.compress.injectTool;
         // [#1097] the kernel ccr-store node ID-references oversized tool results
         // BEFORE absorb (ID-reference wins over distill); armed policy is
         // stamped per-request — strip `ccr` from the loop config when disarmed
         // (plugin mode / no tool channel) so placeholders never hit the wire.
-        const loopConfig = ccrLoopConfig(session, config);
+        const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
         // #2432/#2658: dsh desktop's native compaction can LAND without ever
         // transiting bili — its summarizer calls ctx.llm.stream() directly and
         // manual /compact / idle-session paths have no ALS attribution, so the
@@ -186,7 +257,7 @@ export async function prepareAnthropic(
         // skipped like on the openai lane (same tiny-budget heuristic).
         let dshRebased = false;
         const anthropicTitleGen = typeof parsed.max_tokens === "number" && parsed.max_tokens <= 200;
-        if (!anthropicTitleGen && session.metadata["pluginAgent"] === "dsh" && session.state.blocks.some((b) => b.active)) {
+        if (!anthropicTitleGen && laneDecisions.profile.compactsClientSide && session.state.blocks.some((b) => b.active)) {
             const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
             const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
             if (dshGap && carriesDshLocalCompactionSummary(msgs)) {
@@ -223,7 +294,9 @@ export async function prepareAnthropic(
             const gap = foldCoverage(foldCoveredBefore, msgs.map((m) => m.id));
             if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} covered id(s) missing from resent history — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire); observability complement to the #1328 overflow rescue (#1195)`);
         }
+        storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
+        turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
         turn.messages = attachSubagentSessions(turn.messages, session);
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
@@ -252,8 +325,13 @@ export async function prepareAnthropic(
         // consecutive decision failures.
         const decideTier1Arm = decide !== undefined && !!turn.nudge && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
         const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && !dshCompressSurfaceOff && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride));
+        const nudgeEligible = opts.compress.injectNudge && !!turn.nudge && !dshCompressSurfaceOff && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig));
+        // #3461: pressure admitted by every standing gate but held by the backoff
+        // is still an active nudge round — self-heal credit (#2155/#3004) must
+        // not starve because we chose not to re-inject this round.
+        const emergencyPressureHeld = nudgeEligible && !!turn.nudge && !turn.nudge.shouldInject && emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange);
+        const willInjectNudge = nudgeEligible && !!turn.nudge && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, resolvedModel ?? parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride));
         processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
@@ -300,7 +378,10 @@ export async function prepareAnthropic(
         // map is the fallback the rebuild applies when bili adds no marks of its
         // own (a client-managed session), so its trigger-turn breakpoint survives.
         clientCacheControls = cacheControls;
-        rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], anthropicCacheMarks ?? cacheControls);
+        // #3400: egress image rescale — outbound copies only; the originals
+        // stay in session state/persistence untouched.
+        const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
+        rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? cacheControls);
         if (sysNotes.length > 0) {
             rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
         }
@@ -313,7 +394,7 @@ export async function prepareAnthropic(
         // the compress prompt on round-2, the exact F2 seam the matrix pins).
         systemOut = stampAnthropicSystemCacheControl(systemOut, anthropicCacheMarks !== undefined);
         if (injectTools) {
-            toolsOut = injectTool(parsed.tools, [...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
+            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [absorbTools.anthropic] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
@@ -378,6 +459,8 @@ export async function prepareAnthropic(
                     nudgeOutcome = "skipped";
                 }
             }
+        } else if (emergencyPressureHeld) {
+            nudgeOutcome = "gated";
         }
         // [#1343/#1457] surface any earlier undelivered retrieve as an ephemeral
         // trailing user note (kept last so it never reorders cached messages).

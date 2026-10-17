@@ -426,7 +426,13 @@ async function main() {
       const fold = /acp-compress-obs\] shrink (\d+)%/.exec(s2);
       record("A", "turn 2 completes after window shrink", t2.ok, t2.ok ? "" : t2.why.slice(0, 160));
       record("A", "fold fired mid-session", !!fold, fold ? `shrink ${fold[1]}%` : "no acp-compress-obs line");
-      record("A", "nudge/preflight engaged", /nudge INJECT|preflight compressing/.test(s2), /nudge INJECT/.test(s2) ? "nudge INJECT" : "");
+      // #3416: two INDEPENDENT assertions — the old OR form let a preflight
+      // line alone green this check while the nudge path was silently dead
+      // (exactly the #3401 blind spot: suppression-class bugs passed gate).
+      const nudgeHit = /nudge INJECT/.test(s2);
+      const preflightHit = /preflight compressing/.test(s2);
+      record("A", "nudge injected (hard)", nudgeHit, nudgeHit ? "nudge INJECT" : "no nudge INJECT line — preflight must not substitute");
+      record("A", "preflight engaged", preflightHit, preflightHit ? "preflight compressing" : "no preflight compressing line");
       record("A", "S07 marker recalled from FOLDED context", has(t2.final, CODEWORDS[6]), `final="${t2.final.trim().slice(0, 80)}"`);
       const hitsA = [...s2.matchAll(/cache hit (\d+)%/g)].map((m) => Number(m[1]));
       record("A", "cache recovered after fold", hitsA.length > 0 && Math.max(...hitsA) >= 50, hitsA.length ? `hits=${hitsA.join(",")}%` : "no cache report at all");

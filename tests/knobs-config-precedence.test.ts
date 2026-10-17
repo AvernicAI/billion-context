@@ -412,6 +412,62 @@ test("#2984 allowPrivateHttpProviders: positive env judgment, file tier, env win
     clearConfig();
 });
 
+test("#3331 guardrail knobs: bash-timeout default 60 (#3066 anti-hang), file tier, env wins; 0 disables; cap/repetition defaults on", () => {
+    clearConfig();
+    assert.equal(knobs.guardrailBashTimeout(), 60, "default 60s — #3066 owner intent, unsupervised bash hung pi sessions");
+    assert.equal(knobs.guardrailMaxOutputBytes(), 50_000, "default cap 50KB");
+    assert.equal(knobs.guardrailRepetition(), true, "loop-breaker default on");
+
+    setConfig({ guardrails: { bashTimeout: 45, maxOutputBytes: 12345, repetition: false } });
+    assert.equal(knobs.guardrailBashTimeout(), 45, "file tier");
+    assert.equal(knobs.guardrailMaxOutputBytes(), 12345, "file tier");
+    assert.equal(knobs.guardrailRepetition(), false, "file tier");
+
+    withEnv({ BILI_GUARDRAIL_BASH_TIMEOUT: "120" }, () => {
+        assert.equal(knobs.guardrailBashTimeout(), 120, "env wins");
+    });
+    withEnv({ BILI_GUARDRAIL_BASH_TIMEOUT: "0" }, () => {
+        assert.equal(knobs.guardrailBashTimeout(), undefined, "0 = off (pi-native), even with the file tier on");
+    });
+    withEnv({ BILI_GUARDRAIL_MAX_OUTPUT_BYTES: "0" }, () => {
+        assert.equal(knobs.guardrailMaxOutputBytes(), undefined, "0 disables the cap");
+    });
+    withEnv({ BILI_GUARDRAIL_REPETITION: "0" }, () => {
+        assert.equal(knobs.guardrailRepetition(), false, "env off beats file off/on alike");
+    });
+    clearConfig();
+});
+
+test("#3406 text-run threshold knob: default 200 (#3260 parity), file tier, env wins; 0 disables", () => {
+    clearConfig();
+    assert.equal(knobs.guardrailTextRunThreshold(), 200, "default 200 — unchanged from the pre-knob constant");
+    assert.equal(knobs.DEFAULT_TEXT_RUN_THRESHOLD, 200, "exported default pins the documented 200");
+
+    setConfig({ guardrails: { textRunThreshold: 500 } });
+    assert.equal(knobs.guardrailTextRunThreshold(), 500, "file tier");
+
+    withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "1000" }, () => {
+        assert.equal(knobs.guardrailTextRunThreshold(), 1000, "env wins over the file tier");
+    });
+    withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "250.9" }, () => {
+        assert.equal(knobs.guardrailTextRunThreshold(), 250, "fractional floors");
+    });
+    withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "0" }, () => {
+        assert.equal(knobs.guardrailTextRunThreshold(), 0, "0 = lane off, even with the file tier set");
+    });
+    withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "-5" }, () => {
+        assert.equal(knobs.guardrailTextRunThreshold(), 0, "negative = off (same convention as bashTimeout)");
+    });
+    withEnv({ BILI_GUARDRAIL_TEXT_RUN_THRESHOLD: "garbage" }, () => {
+        assert.equal(knobs.guardrailTextRunThreshold(), 200, "garbage env falls back to the default, not off");
+    });
+    setConfig({ guardrails: { textRunThreshold: 0 } });
+    assert.equal(knobs.guardrailTextRunThreshold(), 0, "file tier 0 disables too");
+    setConfig({ guardrails: { textRunThreshold: "big" } });
+    assert.equal(knobs.guardrailTextRunThreshold(), 200, "garbage file value falls back to the default");
+    clearConfig();
+});
+
 test("teardown", () => {
     if (previousConfigFile === undefined) delete process.env.BILI_CONFIG_FILE;
     else process.env.BILI_CONFIG_FILE = previousConfigFile;

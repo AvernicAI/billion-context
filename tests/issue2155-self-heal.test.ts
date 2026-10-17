@@ -299,20 +299,20 @@ test("integration: nudge-idle loop (non-plugin) suppresses the nudge after the w
     });
     try {
         const body = { model: "m", max_tokens: 20_000, messages: turn2Compressible() };
+        const len = () => ((received[received.length - 1]!.messages as unknown[]) ?? []).length;
         await send({}, body); // r1 baseline — usage lands only after its own response (no nudge yet, no idle credit)
-        for (let i = 0; i < SELF_HEAL_WINDOW - 2; i++) await send({}, body); // r2..r4 — nudged, idle credit 3
-        await send({}, body); // r5 — nudged, idle credit 4
-        const before = ((received[received.length - 1]!.messages as unknown[]) ?? []).length; // nudged count
+        const base = len();
+        await send({}, body); // r2 — first pressure round: the backoff gate opens once, nudged (idle credit 1)
+        assert.equal(len(), base + 1, "the first over-limit round still carries the nudge");
+        for (let i = 0; i < SELF_HEAL_WINDOW - 2; i++) await send({}, body); // r3..r5 — #3461 backoff holds: no repeat injection, but the gated pressure rounds still earn idle credit (2..4)
+        assert.equal(len(), base, "#3461: no storm — the held rounds carry no nudge");
         const sh = listSessions().find((x) => x.id === sessionId)!.metadata.selfHeal;
-        assert.equal(sh, undefined, "not yet armed at window-1 idle rounds");
-        await send({}, body); // r6 — the 5th nudged idle round arms AFTER its own nudge went out
+        assert.equal(sh, undefined, "not yet armed at window-1 idle credits");
+        await send({}, body); // r6 — the 5th credited pressure round arms suppression
         const armed = listSessions().find((x) => x.id === sessionId)!.metadata.selfHeal as { action: string };
         assert.equal(armed.action, "suppress-nudge");
         await send({}, body); // r7 runs suppressed
-        const suppressed = ((received[received.length - 1]!.messages as unknown[]) ?? []).length;
-        const nudged = ((received[received.length - 2]!.messages as unknown[]) ?? []).length;
-        assert.ok(nudged === before + 1 - 1, "the arming round was still nudged (baseline round carried no nudge)");
-        assert.ok(suppressed === before - 1, "nudge message gone once suppression armed (back to the un-nudged count)");
+        assert.equal(len(), base, "suppression keeps the nudge gone");
     } finally {
         proxy.close();
         proxy.closeIdleConnections?.();

@@ -195,7 +195,7 @@ test("#3040 forced none-engine: status+overview report degraded; diagnostics blo
             assert.ok(WEB_CLIENT.includes('t("sys.storage_degraded"'), "client composes the localized sentence with {reason}");
             assert.ok(WEB_CLIENT.includes('t("sys.report_copy")'), "client offers the copy button");
             assert.ok(WEB_CLIENT.includes('t("sys.report_issue")'), "client offers the GitHub button");
-            assert.ok(WEB_CLIENT.includes("/__bili/diagnostics?topic="), "buttons wire to the generic diagnostics endpoint");
+            assert.ok(WEB_CLIENT.includes('API_ROOT + "/diagnostics?topic="'), "buttons wire to the generic diagnostics endpoint (through the #3373 API root)");
             // the overview poll re-renders the banner every 5s while degraded: the
             // diagnostics fetch must be cached per topic, and a failed fetch must
             // toast once — otherwise every poll re-hits the endpoint (full blob

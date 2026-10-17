@@ -17,6 +17,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { driveWire, WIRES } from "./golden-storage-drive.ts";
 
+// #3400: pin the legacy wire shape — the egress image rescale changes
+// these digests by design (its own suite covers it); this suite proves
+// render/storage fidelity against committed references.
+process.env.BILI_IMAGE_RESCALE = "0";
+
 const GOLDEN_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "golden", "storage-render");
 
 test("storage-render goldens: no orphaned snapshot files", () => {

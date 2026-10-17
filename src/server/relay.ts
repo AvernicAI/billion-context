@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens, defaultPrompts, resolveOutputSteeringConfig } from "acp-kernel";
 import { type BiliMessage } from "acp-kernel/wire";
+import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
 import { credentialFingerprint, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleUsageReport } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
@@ -14,7 +15,7 @@ import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } 
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, resolveCompatRoles, type CompatRoles } from "../compat-roles.js";
 import { compressLoopResponsesJson } from "../compress-loop-responses.js";
 import { resolveCompress } from "../compress-settings.js";
-import { buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withProjectAttribution, withSummaryBudgetNote } from "../compress-tool.js";
+import { buildAbsorbSystemPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, withMarkerIntegrityNote, withProjectAttribution, withSummaryBudgetNote } from "../compress-tool.js";
 import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
@@ -52,6 +53,7 @@ import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering
 import { estimateWireOverhead } from "./budget.js";
 import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
+import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
 import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 
@@ -166,6 +168,63 @@ function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) 
     }
 }
 
+// #3434: upstream accepted the request then sent no bytes — the log shows
+// nothing between `forward …` and the outcome (client disconnect / idle-watchdog
+// abort), so an upstream stall reads as proxy-side. Arm a one-shot first-byte
+// watchdog around the initial fetch: headers not arrived by the threshold → ONE
+// warn naming target+method+lane. Additive logging only — deliberately NO
+// fast-fail (would truncate long prefills, cf. #1706/#1714) and NO new config
+// surface (code constant + test seam).
+const UPSTREAM_FIRST_BYTE_WARN_MS = 30_000;
+let firstByteWarnMs = UPSTREAM_FIRST_BYTE_WARN_MS;
+export function _setFirstByteWarnMsForTest(ms?: number): void {
+    firstByteWarnMs = ms ?? UPSTREAM_FIRST_BYTE_WARN_MS;
+}
+// Dedupe once per origin per process (windowSourceLogged pattern) so a
+// long-prefill local model logs at most one line, not one per slow request.
+// Claimed at FIRE time (not arm time) so a fast request never suppresses a
+// later genuine stall on the same origin.
+const firstByteWarnedOrigins = new Set<string>();
+export function _resetFirstByteWarnedOriginsForTest(): void {
+    firstByteWarnedOrigins.clear();
+}
+/**
+ * #3434: arm a one-shot watchdog logging ONE warn if the fetch behind `signal`
+ * is still pending after `firstByteWarnMs`. Returns the timer handle (the caller
+ * clears it when the fetch settles) or undefined when disarmed (threshold
+ * disabled, origin already warned, or signal already aborted).
+ */
+export function armFirstByteWatchdog(o: {
+    url: string;
+    method: string;
+    lane: string;
+    sessionId: string;
+    log: (level: string, msg: string) => void;
+    signal: AbortSignal;
+}): ReturnType<typeof setTimeout> | undefined {
+    const threshold = firstByteWarnMs;
+    if (!Number.isFinite(threshold) || threshold <= 0) return undefined;
+    let origin: string;
+    try {
+        origin = new URL(o.url).origin;
+    } catch {
+        origin = o.url;
+    }
+    if (firstByteWarnedOrigins.has(origin)) return undefined;
+    if (o.signal.aborted) return undefined;
+    const seconds = Math.round(threshold / 1000);
+    const fire = (): void => {
+        // First-to-fire claims the origin; concurrent same-origin timers stay silent.
+        if (firstByteWarnedOrigins.has(origin)) return;
+        firstByteWarnedOrigins.add(origin);
+        o.log("warn", `[${o.sessionId}] upstream awaiting first byte ≥${seconds}s: ${o.method} ${maskUrlForLog(o.url)} (lane=${o.lane})`);
+    };
+    const timer = setTimeout(fire, threshold);
+    timer.unref();
+    o.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });
+    return timer;
+}
+
 export async function forward(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -233,6 +292,11 @@ export async function forward(
             return b;
         }
     };
+    // #3280: in v1internal traffic `body` here is ALREADY the standard inner
+    // request — handle.ts unwrapped the envelope before prepare*, and prepared.body
+    // (the rebuilt inner) is what forward() ships. The retry paths below mutate
+    // that inner body directly, so their egress must be re-nested into the
+    // CloudCode envelope via v1Wrap.
     // #1884 re-sign arm: the native lane tunneled this request with the
     // signing credential (x-bili-resign markers — stripped in
     // buildForwardTarget, they must never reach the upstream). Every egress
@@ -593,9 +657,16 @@ export async function forward(
     }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     try {
-        upstreamResult = await fetchWithTransportRetry(upstreamUrl, init, undefined, clientAbort.signal, (info) => {
+        const lane = prepared?.sidePassthrough ? "side" : prepared ? "main" : "passthrough";
+        const fetchPromise = fetchWithTransportRetry(upstreamUrl, init, undefined, clientAbort.signal, (info) => {
             log("warn", `[${prepared?.session.id ?? "unknown"}] [acp-proxy] upstream ${info.detail}; retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})`);
         });
+        const firstByteTimer = armFirstByteWatchdog({ url: upstreamUrl, method: req.method ?? "UNKNOWN", lane, sessionId: prepared?.session.id ?? "passthrough", log, signal: clientAbort.signal });
+        try {
+            upstreamResult = await fetchPromise;
+        } finally {
+            clearTimeout(firstByteTimer);
+        }
         recordUpstreamConnection(upstreamUrl, proxyUrl);
         // #1682: any resolved response proves the host is reachable again.
         clearUpstreamAlertsForHost(upstreamUrl);
@@ -1232,6 +1303,7 @@ export async function forward(
             const resolvedBuf = await resolveFakeCompletion(upstream.body, {
                 protocol: prepared.protocol,
                 wireBody,
+                wrapBody: v1Active ? v1Wrap : undefined,
                 upstreamUrl,
                 reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                 proxyUrl,
@@ -1359,6 +1431,7 @@ export async function forward(
                     makeContinuationRefetch({
                         protocol: p.protocol,
                         body,
+                        wrapBody: v1Active ? v1Wrap : undefined,
                         upstreamUrl,
                         reqHeaders: buildForwardHeaders(headers), resign: applyResign,
                         proxyUrl,
@@ -1421,13 +1494,30 @@ export async function forward(
             // Same absorb gate as prepare*: the section only exists where the
             // tool is callable, keeping loop re-requests byte-consistent with
             // the first request (prefix-cache anchor).
-            const loopConfig = ccrLoopConfig(prepared.session, config);
-            const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model, opts.compress).visibilityMarkers ?? true;
+            const absorbBlock = effectiveAbsorbBlock(prepared.pluginMode === true, config, opts.compress.absorb);
+            const absorbActive = absorbBlock?.enabled === true && opts.compress.injectTool && !textProtocol;
+            const loopConfig = ccrLoopConfig(prepared.session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+            // Cache-seam: the compress<->absorb join must be byte-identical to
+            // the steady prepare* paths. Every steady wire joins the absorb
+            // section with a plain "\n\n" (sysParts.join / injectSystem parts
+            // join); the historical "---" divider here existed ONLY on round-2
+            // and broke the system-element prefix on every fold while absorb
+            // was armed (probe: cache-seam-probes P1+P2, chat wire diverged at
+            // the absorb boundary char).
+            const absorbSection = absorbActive
+                ? `\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
+                : "";
+            const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model ?? prepared.model, opts.compress).visibilityMarkers ?? true;
             // #3298 cache-seam parity: every steady prepare* path appends the
             // project-attribution outermost, so the round-2 rebuild must too or
             // the head bytes drift at every fold.
-            const systemPrompt = withProjectAttribution(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers));
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, false);
+            // absorbSection sits OUTSIDE withProjectAttribution: every steady
+            // prepare* path appends the attribution to the compress prompt and
+            // only THEN pushes the absorb section (sysParts order). Nesting it
+            // inside flipped the two sections on round-2 and broke the
+            // system-element prefix at every fold (cache-seam-probes P1+P2/P3).
+            const systemPrompt = withProjectAttribution(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers)) + absorbSection;
+            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {
                     // #422: mirror the prepare's fold with the post-compress state so
@@ -1462,7 +1552,7 @@ export async function forward(
                     // crossings — absorb prompts appeared/disappeared mid-history
                     // and broke the prefix cache on every fold while the
                     // threshold was being straddled (probe: cache-seam-probes).
-                    const viewed = turn.messages;
+                    const viewed = applyAbsorbView(turn.messages, turn.state, loopConfig, effectiveTokenCount(prepared.session, turn.messages).tokens);
                     const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
                     // #1548: strip only when the compress call rides INBOUND history (client persists
                     // it). Ephemeral acp_loop_* pairs are never re-sent by proxy-mode clients; stripping
@@ -1492,7 +1582,10 @@ export async function forward(
                 responseBody,
                 { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, skippedProxy, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
                 parsedReq,
-                { url: upstreamUrl, headers: reqHeaders, wireTransform, resign: applyResign },
+                // #3280: egress goes out enveloped via wireTransform, so every
+                // round-2+ response comes back enveloped too — unwrap at the loop's
+                // single adoption point or parseStream sees no candidates.
+                { url: upstreamUrl, headers: reqHeaders, wireTransform, resign: applyResign, responseStreamTransform: v1Active ? v1UnwrapStream : undefined },
                 adapter,
                 systemPrompt,
                 clientAbort.signal,
@@ -1533,8 +1626,18 @@ export async function forward(
         // this, a thrown arrayBuffer() leaks the timeout and skips markDirty(),
         // losing the persistence of any block this turn's compress created.
         try {
-            const buf = await upstream.arrayBuffer();
-            const text = Buffer.from(buf).toString("utf8");
+            // #3280: read responseBody, not upstream — in v1 mode the Round-1
+            // unwrap above replaced responseBody with a TransformStream that
+            // LOCKS upstream.body, so upstream.arrayBuffer() threw "Body is
+            // unusable" and every non-streaming CloudCode turn responded 200
+            // with an empty body. Non-v1 traffic is unaffected: both pre-branch
+            // body swaps (fake-completion, dumpSse tee) are stream-gated, so
+            // responseBody === upstream.body there. When v1Active, responseBody
+            // is already the unwrapped standard shape (usageMetadata visible to
+            // the accounting below); res.end hands the bare JSON to the v1
+            // framer, which re-wraps it for the client.
+            const buf = responseBody ? Buffer.from(await new Response(responseBody).arrayBuffer()) : Buffer.alloc(0);
+            let text = Buffer.from(buf).toString("utf8");
             try {
                 let json = JSON.parse(text) as Record<string, unknown>;
                 if (prepared.protocol === "responses" && prepared.responsesTextProtocol) {
@@ -1649,6 +1752,10 @@ async function resolveFakeCompletion(
         /** #1884: re-sign the retry body before it hits the wire (armed
          *  re-sign lane only; undefined on unsigned traffic). */
         resign?: (headers: Record<string, string>, body: string | Buffer) => void;
+        /** #3280: v1internal egress re-wrap — wireBody above is the INNER
+         *  request (the hint needs top-level contents), so the hinted retry
+         *  must go back out inside the CloudCode envelope. */
+        wrapBody?: (body: string | Buffer) => string | Buffer;
     },
 ): Promise<Buffer> {
     let buffer = await readStreamToBuffer(stream, fakeBufCap());
@@ -1659,16 +1766,17 @@ async function resolveFakeCompletion(
         for (let attempt = 1; attempt <= max && !opts.signal.aborted; attempt++) {
             const hinted = injectFakeCompletionHint(opts.protocol, opts.wireBody);
             if (hinted === null) break;
+            const wireHinted = opts.wrapBody ? opts.wrapBody(hinted) : hinted;
             opts.log("warn", `[${sid}] fake completion (tool-call XML, no tool block); retry ${attempt}/${max} with corrective hint`);
             let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
             try {
-                opts.resign?.(opts.reqHeaders, hinted);
+                opts.resign?.(opts.reqHeaders, wireHinted);
                 r = await fetchWithTimeout(
                     opts.upstreamUrl,
                     {
                         method: "POST",
                         headers: opts.reqHeaders,
-                        body: hinted,
+                        body: wireHinted,
                         ...(opts.proxyUrl ? { dispatcher: proxyDispatcher(opts.proxyUrl) } : {}),
                     },
                     undefined,

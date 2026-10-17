@@ -4,6 +4,7 @@ import { isStoredPlaceholderText } from "./ccr.js";
 import {
   collectLatestProtected,
   collectProtectedToolCallIds,
+  hasMediaPayload,
   isMessageLatestProtected,
   isMessageProtectedWithPairing,
   matchToolPattern,
@@ -108,6 +109,7 @@ export function isAbsorbCandidate(
   for (const pattern of cfg.excludeTools) {
     if (msg.toolName && matchToolPattern(msg.toolName, pattern)) return false;
   }
+  if (cfg.mediaOnly && !hasMediaPayload(msg)) return false;
   return true;
 }
 
@@ -170,7 +172,10 @@ export function appendAbsorbPrompts(
     const text = msg.text ?? "";
     if (text.includes(ABSORB_PROMPT_MARKER)) return msg;
     const tokens = countTokens(text);
-    if (tokens < cfg.minToolTokens) return msg;
+    // #3402: image bytes are not in msg.text, so countTokens(text) never reaches
+    // minToolTokens for a media result — exempt it or the feature is dead.
+    const mediaExempt = cfg.mediaOnly && hasMediaPayload(msg);
+    if (!mediaExempt && tokens < cfg.minToolTokens) return msg;
     const ref = refForRaw(state.messageRefs, msg.id);
     if (!ref || ref === BLOCKED_REF) return msg;
     promptedCount++;
@@ -303,6 +308,15 @@ export function applyAbsorb(input: AbsorbInput): AbsorbOutcome {
       state: input.state,
       ok: false,
       resultText: `absorb failed: ref ${input.ref} is a ${target.contentType}, not a tool result.`,
+    };
+  }
+  // #3371 discipline: screening and execution must share one judgment — a
+  // mediaOnly session never absorbs a target that isAbsorbCandidate would skip.
+  if (cfg.mediaOnly && !hasMediaPayload(target)) {
+    return {
+      state: input.state,
+      ok: false,
+      resultText: `absorb failed: ${input.ref} carries no media payload — absorb is scoped to image-bearing results (compress.absorb.mediaOnly).`,
     };
   }
   if (isAcpOrConfiguredTool(target.toolName, cfg)) {

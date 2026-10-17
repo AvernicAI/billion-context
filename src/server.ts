@@ -73,7 +73,8 @@ import {
     type GoogleSystemInstruction,
     type GoogleTool,
 } from "acp-kernel/wire";
-import { COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, COMPRESS_TOOL_NAME, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, retrieveToolsFor, buildAcpTagsOnlyPrompt } from "./compress-tool.js";
+import { ABSORB_TOOL_NAME, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, COMPRESS_TOOL_NAME, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, absorbToolsFor, retrieveToolsFor, buildAcpTagsOnlyPrompt } from "./compress-tool.js";
+import { absorbEnabled, storeEffectiveAbsorb } from "./absorb.js";
 import { ccrEnabled, ccrLoopConfig, ccrPluginWireOk, contentStoreOf, executeRetrieve, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes, storeEffectiveCcr, type CcrSettings } from "./store.js";
 import { buildIncomingImageIndex, pruneRetrieveImgExports } from "./image-restore.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
@@ -410,6 +411,29 @@ export function googlePathKind(urlPath: string): GooglePathKind | null {
  *  undecodable one. */
 export function googleModelFromPath(urlPath: string): string | undefined {
     const m = /\/models\/([^/:?]+):(?:streamGenerateContent|generateContent|countTokens)\b/.exec(urlPath);
+    if (!m || !m[1]) return undefined;
+    try {
+        return decodeURIComponent(m[1]);
+    } catch {
+        return m[1];
+    }
+}
+
+/** Anthropic-on-Vertex carries the model in the URL path and never in the body:
+ *  `POST /v1/projects/<project>/locations/<loc>/publishers/anthropic/models/
+ *  <model>:rawPredict` (and `:streamRawPredict`). The Vertex Messages body has
+ *  no `model` field at all — `anthropic_version` replaces it — so this is the
+ *  only place every model-keyed decision on that wire can learn the id
+ *  (window resolution, compress thresholds, price profile, fallback logging).
+ *
+ *  Deliberately a sibling of googleModelFromPath rather than a widening of it:
+ *  that one's contract is Gemini, and its `:countTokens` arm must not start
+ *  matching Anthropic paths. Anthropic's `:countTokens` is not served on
+ *  Vertex (the endpoint 404s for any model id), so it is not matched here and
+ *  such a path yields no model. Returns undefined when the path carries no
+ *  publishers/anthropic/models segment or an undecodable id. */
+export function vertexAnthropicModelFromPath(urlPath: string): string | undefined {
+    const m = /\/publishers\/anthropic\/models\/([^/:?]+):(?:streamRawPredict|rawPredict)\b/.exec(urlPath);
     if (!m || !m[1]) return undefined;
     try {
         return decodeURIComponent(m[1]);
@@ -1419,6 +1443,12 @@ export type Prepared = {
      *  openai hoist (0.0.37). The fold space no longer carries it, so every
      *  rebuilt payload and compress-loop round must re-inject it. */
     openaiSystemText?: string;
+    /** The route's resolved model — read off the body on most wires, off the
+     *  URL path where the body carries none (Gemini, and Anthropic-on-Vertex
+     *  whose `publishers/anthropic/models/<model>:rawPredict` path is the only
+     *  source). The relay's compress-loop rebuild keys its system prompt on it,
+     *  so a wire without this field would rebuild against `undefined`. */
+    model?: string;
     /** Google wire: the client's own `systemInstruction` text (the kernel hoists
      *  it out of the fold space) and the path-derived model. Both are needed to
      *  rebuild `systemInstruction` and to synthesize chunks on every compress
@@ -1443,13 +1473,16 @@ export type Prepared = {
      * ACTUALLY reached the payload, not the pre-gate intent. The model-decided
      * gate runs asynchronously between diagNudge's label and the rebuild, so
      * consumers that need truth (self-heal streaks, log labels) read this.
-     * "injected": an advisory/directive/fallback message landed; "vetoed":
-     * the decision gate ran and nothing was injected (model declined or the
-     * answer was unusable); "skipped": armed but nothing renderable (empty
-     * nudge text / yes-with-no-live-range). Undefined = no arm this round, or
-     * the arm was gated off before delivery was attempted (suppression /
-     * breaker / gate off) — consumers only ever test for "injected". */
-    nudgeOutcome?: "injected" | "vetoed" | "skipped";
+      * "injected": an advisory/directive/fallback message landed; "vetoed":
+      * the decision gate ran and nothing was injected (model declined or the
+      * answer was unusable); "skipped": armed but nothing renderable (empty
+      * nudge text / yes-with-no-live-range); "gated" (#3461): over-limit
+      * pressure admitted by every standing gate but held by the emergency
+      * backoff this round — a pressure fact for self-heal credit, not a
+      * delivery. Undefined = no arm this round, or the arm was gated off
+      * before delivery was attempted (suppression / breaker / gate off) —
+      * consumers test for "injected" (+ "gated" where pressure counts). */
+     nudgeOutcome?: "injected" | "vetoed" | "skipped" | "gated";
     /** Render strategy the prepare used for processTurn ("none" for codex
      *  compaction triggers / ACP_RENDER_NONE). The #422 fold-refresh hook in
      *  forward() re-runs processTurn with the same strategy so the re-request
@@ -1484,6 +1517,19 @@ export type Prepared = {
      *  locally (BILI_AUTO_MODE_FORGE, default on). forward() serves `body`
      *  without contacting upstream — zero egress, zero billing for the lane. */
     autoModeForge?: { variant: "severity" | "block"; body: string; contentType: string };
+    /** [#2926] anthropic Threads lane: `thread` bodies hold server-side
+     *  state the proxy cannot rewrite in place — prepare forwarded the turn
+     *  byte-faithfully after mirroring it into the unified store
+     *  (`session_ext` threads:mirror:*). Preflight must skip these turns:
+     *  the wire body (a delta-only continue) says nothing about the real
+     *  thread size, and the lane owns the budget via the mirror. */
+    threadsLane?: boolean;
+    /** [#2926] armed by prepare when the mirror estimate crossed the window
+     *  on a continue and the rollout flag is on. handle.ts executes it
+     *  (summary side-call with the client's auth, then swaps the continue
+     *  for a fresh create) before the forward. Fail-open: an unsuccessful
+     *  execution leaves `body` (the original continue) untouched. */
+    threadsReforge?: import("./server/threads-lane.js").ThreadsReforgePlan;
 };
 
 
@@ -1583,8 +1629,15 @@ export function resolveKnownOutputCeiling(
     routes: ProxyOptions["routes"],
     upstreamUrl: string | undefined,
     sessionHeaderName?: string,
+    /** The route's already-resolved model, when the caller has one. Needed on
+     *  wires that carry the model in the URL path and not in the body
+     *  (Anthropic-on-Vertex: `/publishers/anthropic/models/<model>:rawPredict`),
+     *  where reading `parsed.model` alone would floor the restore target. */
+    resolvedModel?: string,
 ): number | undefined {
-    const model = typeof parsed.model === "string" && parsed.model.length > 0 ? parsed.model : undefined;
+    const model = resolvedModel !== undefined && resolvedModel.length > 0
+        ? resolvedModel
+        : typeof parsed.model === "string" && parsed.model.length > 0 ? parsed.model : undefined;
     if (!model) return undefined;
     const agent = pluginAgentHeader(headers);
     const runtimeMax = (pluginHeadersMatchModel(headers, model) ? pluginReportedMaxOutput(headers) : undefined)
@@ -3399,7 +3452,23 @@ export async function preflightCompressIfNeeded(
     }
     // The payload still overflows the window: fail fast with a diagnostic
     // error instead of forwarding a guaranteed-400 payload (#301).
-    const status = f?.kind === "upstream" && f.status === 429 ? 503 : 502;
+    // #3461 problem 2: DETERMINISTIC exhaustion (futile-round math proved no
+    // combination of folds can close the gap regardless of upstream health)
+    // can never succeed for this identical payload — answer it 413 like every
+    // other "can never fit as-is" verdict (#2847 lesson applied to the
+    // exhaustion path; #2921/#3146 doomed-bytes precedent) instead of 502,
+    // which status-code-driven headless hosts read as transient and spin on
+    // forever (field measurement: 5+ doomed rounds). Relay-dependent
+    // exhaustion (empty/truncated/incomplete summaries, budget draws, pool
+    // saturation) stays 502: those walks succeed once the relay recovers.
+    // AND only when bili's own calibrated meter agrees the payload is over the
+    // window (!payloadFitsWindow): when the calibrated estimate FITS but the
+    // walk still ran (char-count trigger arm, overflow-armed baseline), the
+    // doom is a relay-billing artifact bili cannot compute (#496/#767/#857
+    // byte-relay lanes) — bili must not declare structural doom for it; those
+    // lanes keep their 502 fail-fast contract where NOT re-forwarding IS the
+    // protection, not a client spin.
+    const status = f?.kind === "upstream" && f.status === 429 ? 503 : f?.kind === "exhausted" && f.deterministic && !payloadFitsWindow ? 413 : 502;
     // #2189: an explicit retryable=false from preflight (credential-shape
     // rejection — deterministic for the identical payload) overrides the
     // status-based heuristic below; every other path keeps today's mapping.

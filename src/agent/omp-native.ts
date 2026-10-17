@@ -25,7 +25,7 @@ import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
 import { applyOmpFirstEventTimeout, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
-import { INCREMENTAL_TURN_MARKER_HEADER, noteIncrementalAck, markIncrementalDead, planIncrementalTurn, probeIncrementalTurns, clearIncrementalProbe, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
+import { clearIncrementalProbe, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { fetchProxyVersion, waitForProxyVersion } from "./shared.js";
 import { logHostEvent } from "./host-log.js";
 
@@ -73,24 +73,35 @@ const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(
 // `prompt_cache_key` body field the omp extension stamps (pi.ts
 // stampPromptCacheKey — present exactly when the plugin is active). The
 // beforeSend hook reads it as the conversation id, plans the incremental
-// body, swaps init.body and stamps the plugin headers DIRECTLY ON init
-// (per-request, so concurrent sessions on one provider URL cannot cross
-// attributions) — plugin mode is safe here: x-bili-plugin-conversation gets
-// the same value wire mode already resolves to via
-// preferPromptCacheKeyIdentity, so the session id does not fork. One planned
-// in-flight request per URL (onResponse acks are URL-keyed); a second
-// concurrent request on the same URL falls back to full resend.
+// body, swaps init.body and stamps the plugin headers DIRECTLY ON init —
+// plugin mode is safe here: x-bili-plugin-conversation gets the same value
+// wire mode already resolves to via preferPromptCacheKeyIdentity, so the
+// session id does not fork. #3329: each planned turn is keyed by a fresh
+// per-request turn id stamped onto init's headers (x-bili-turn-id) —
+// several sessions share one provider URL, and keying the pending table by
+// URL mis-attributes a late response to whichever session planned last on
+// that URL. The #3378 single-flight guard per URL is KEPT on top of turn-id
+// keying (#3340 rebase decision): while a marker'd request for this URL is
+// still awaiting its ack, later requests on the same URL ride the normal
+// pipeline — attribution answers "which ack consumes which pending", the
+// guard answers "no second conversion on this URL until the first is acked
+// or ages out"; dropping the guard is a separate follow-up.
 interface IncrementalPendingTurn {
     sid: string;
+    url: string;
     messages: IncrementalWireMessage[];
     system: unknown;
     base: string;
     at: number;
 }
+/** Keyed by per-request turn id (#3329); each entry remembers the URL it
+ *  was planned on so the #3378 single-flight guard can scan for live
+ *  same-URL entries. */
 const incPendingOmp = new Map<string, IncrementalPendingTurn>();
 
 /** Planned turns age out (onResponse only fires on successful sends — a
- *  network-dead request must not block the URL forever). Mirrors opencode. */
+ *  network-dead request must not pin its slot forever). Memory hygiene only
+ *  (#3329): attribution is exact per turn id. Mirrors opencode. */
 const INC_PENDING_TTL_MS = 30_000;
 
 /** Test hook: drop all planned turns (module state across suites). */
@@ -101,9 +112,7 @@ export function __resetOmpIncrementalForTests(): void {
 export async function ompIncrementalBeforeSend(url: string, init: RequestInit | undefined): Promise<void> {
     try {
         if (init === undefined || typeof init.body !== "string") { return; }
-        const stale = incPendingOmp.get(url);
-        if (stale !== undefined && Date.now() - stale.at < INC_PENDING_TTL_MS) { return; }
-        incPendingOmp.delete(url);
+        sweepStale(incPendingOmp, INC_PENDING_TTL_MS);
         let parsed: unknown;
         try {
             parsed = JSON.parse(init.body);
@@ -120,13 +129,26 @@ export async function ompIncrementalBeforeSend(url: string, init: RequestInit | 
         if (!(await probeIncrementalTurns(base))) { return; }
         const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown> });
         if (plan.mode === "skip") { return; }
+        // #3378 single-flight (kept over #3329's removal per the rebase
+        // decision): while a marker'd request for this URL is still awaiting
+        // its ack, later requests ride the normal pipeline. Pending entries
+        // are keyed by turn id (#3329), so the guard scans for a live entry
+        // stashed on THIS url (sweepStale above already aged out the stale
+        // ones — an aged entry must not block a fresh conversion).
+        let inflight = false;
+        for (const pending of incPendingOmp.values()) {
+            if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
+        }
+        if (inflight) { return; }
         init.body = plan.body;
         const headers = new Headers(init.headers);
         headers.set("x-bili-plugin", "omp");
         headers.set("x-bili-plugin-conversation", sid);
         headers.set(INCREMENTAL_TURN_MARKER_HEADER, "1");
+        const turnId = newIncrementalTurnId();
+        headers.set(INCREMENTAL_TURN_ID_HEADER, turnId);
         init.headers = headers;
-        incPendingOmp.set(url, { sid, messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, base, at: Date.now() });
+        incPendingOmp.set(turnId, { sid, url, messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, base, at: Date.now() });
     } catch (e) {
         // never break the host's request on adapter failure
     }
@@ -134,20 +156,38 @@ export async function ompIncrementalBeforeSend(url: string, init: RequestInit | 
 
 state.beforeSend = ompIncrementalBeforeSend;
 
-export function ompIncrementalOnResponse(url: string, response: Response): void {
-    const pending = incPendingOmp.get(url);
-    if (pending === undefined) return;
-    incPendingOmp.delete(url);
+export function ompIncrementalOnResponse(_url: string, response: Response, headers?: Record<string, string>): void {
+    const turnId = headers?.[INCREMENTAL_TURN_ID_HEADER];
+    if (turnId === undefined) return; // not an incremental dispatch — nothing to attribute (#3329)
+    const pending = incPendingOmp.get(turnId);
+    if (pending === undefined) return; // unknown/stale turn — nothing to attribute
+    const seq = response.headers.get("x-bili-applied-seq");
+    if (response.status === 200 && (seq === null || !Number.isFinite(Number(seq)))) {
+        // 200 without an ack header CANNOT be the marker'd response — the
+        // lane stamps x-bili-applied-seq on every diverted response that
+        // reaches the forward (incremental-lane.ts writeHead wrap). It is a
+        // concurrent full-resend response on the shared model-endpoint URL:
+        // keep the pending entry for the marker'd response still in flight.
+        return;
+    }
+    incPendingOmp.delete(turnId);
     try {
-        const seq = response.headers.get("x-bili-applied-seq");
-        if (response.status === 200 && seq !== null && Number.isFinite(Number(seq))) {
+        if (response.status === 200) {
             noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
             return;
         }
-        if (response.status === 409 || response.status === 503) {
-            markIncrementalDead(pending.sid);
-            if (response.status === 503) clearIncrementalProbe(pending.base);
-            logHostEvent("warn", "[native-client]", `[omp] incremental turn rejected (${response.status}) — conversation ${pending.sid} falls back to full resend (#3248)`);
+        if (response.status === 409) {
+            // #3369: reset (re-seed next turn) unless the rejection circuit
+            // trips — one drift must not permanently kill the conversation.
+            const verdict = noteIncrementalRejection(pending.sid);
+            logHostEvent("warn", "[native-client]", `[omp] incremental turn rejected (409) — conversation ${pending.sid} ${verdict === "dead" ? "falls back to full resend (rejection circuit)" : "re-seeds with a full resync next turn"} (#3369)`);
+            return;
+        }
+        if (response.status === 503) {
+            // #3369: lane temporarily unavailable — keep the conversation's
+            // ack state; just force a re-probe on the next turn.
+            clearIncrementalProbe(pending.base);
+            logHostEvent("warn", "[native-client]", `[omp] incremental turns unavailable (503) — conversation ${pending.sid} state preserved, re-probing next turn (#3369)`);
         }
     } catch {
         // observability only

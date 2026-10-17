@@ -418,3 +418,11 @@ entries:
     group: envonly
     desc_en: "Spawn channel: marks a plugin-agent process."
     desc_zh: "派生通道：标记插件 agent 进程。"
+  - key: BILI_IMAGE_RESCALE_MAX_DIM
+    type: integer
+    default: "1600"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Longest-edge trigger threshold (px) for the egress image downscale pass (#3400); non-numeric or below 128 ignored (default applies). Env-only by design."
+    desc_zh: "出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。"

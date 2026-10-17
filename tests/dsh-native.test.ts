@@ -5,7 +5,85 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
+import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
+import { BILI_COMPACTION_DISABLE_SERVICE } from "../src/agent/dsh-compaction-disable.ts";
+
+// #3370: the incremental-turn conversion must stamp the marker header on the
+// SAME init as the body swap (atomic, omp pattern) — the old arms-a-flag /
+// consume-in-headersFor split raced concurrent sessions across the awaited
+// hook boundary and could ship a delta body with NO marker (silent history
+// loss upstream). Also pins the single-flight guard + the ack handshake.
+test("#3370: dsh incremental conversion is atomic (marker + body on the same init), single-flighted, ack-driven", async () => {
+    const proxy = await startMockProxy([], undefined, undefined, undefined, true);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-inc-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-inc-state-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            __resetIncrementalClientForTests();
+            const ctx = mockCtx();
+            ctx.setInitiator({ session: { id: "dsh-inc-1" } });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+            await _stateToolsReadyForTest();
+            const beforeSend = _stateBeforeSendForTest();
+            const onResponse = _stateOnResponseForTest();
+            const headersFor = _stateHeadersForTest();
+            assert.ok(beforeSend && onResponse && headersFor, "conversion seams armed");
+            const url = `${proxy.origin}/v1/messages`;
+
+            // 1. first turn: seed conversion — marker and body land on init TOGETHER
+            const msgs1 = [{ role: "user", content: "hello" }];
+            const init1: RequestInit = { method: "POST", body: JSON.stringify({ model: "claude-test", max_tokens: 64, messages: msgs1 }) };
+            await beforeSend(url, init1);
+            const body1 = JSON.parse(init1.body as string) as { conversationId?: string; sinceSeq?: number; resync?: boolean };
+            assert.equal(body1.conversationId, "dsh-inc-1", "seed body swapped in");
+            assert.equal(body1.resync, true);
+            assert.equal(new Headers(init1.headers).get("x-bili-plugin-turn"), "1", "#3370: marker stamped on the same init as the body");
+            const turnId1 = new Headers(init1.headers).get("x-bili-turn-id");
+            assert.ok(turnId1, "#3329: per-request turn id stamped alongside the marker");
+            const extra = headersFor(url) ?? {};
+            assert.equal(extra["x-bili-plugin-turn"], undefined, "headersFor no longer stamps/consumes the marker");
+            assert.equal(extra["x-bili-plugin"], "dsh", "plugin identity headers still stamped");
+
+            // 2. single-flight: while the seed awaits its ack, a second request
+            //    on the same URL rides the NORMAL pipeline untouched
+            const msgs2 = [...msgs1, { role: "assistant", content: "hi" }, { role: "user", content: "again" }];
+            const original2 = JSON.stringify({ model: "claude-test", max_tokens: 64, messages: msgs2 });
+            const init2: RequestInit = { method: "POST", body: original2 };
+            await beforeSend(url, init2);
+            assert.equal(init2.body, original2, "single-flight: un-acked pending blocks conversion");
+            assert.equal(new Headers(init2.headers ?? {}).get("x-bili-plugin-turn"), null);
+
+            // 2b. that skipped request's plain 200 (no ack header) arrives
+            //     BEFORE the marker'd response — it must not consume the
+            //     pending entry, or the seed's ack below is lost and turn 3
+            //     replans a resync instead of a delta (#3378 review). Under
+            //     turn-id keying (#3329) the 2-arg call carries no outgoing
+            //     headers at all — a response with no turn-id header is not
+            //     an incremental ack and consumes nothing, which is exactly
+            //     the no-op this step pins.
+            onResponse(url, new Response("{}", { status: 200 }));
+
+            // 3. ack the seed → the next turn plans a DELTA (sinceSeq advanced).
+            //    #3329: the ack is attributed via the seed's OWN turn id, read
+            //    back from its outgoing headers (what native-intercept threads
+            //    into onResponse in production).
+            onResponse(url, new Response("{}", { status: 200, headers: { "x-bili-applied-seq": String(msgs1.length) } }), { "x-bili-turn-id": turnId1 });
+            const init3: RequestInit = { method: "POST", body: original2 };
+            await beforeSend(url, init3);
+            const body3 = JSON.parse(init3.body as string) as { sinceSeq?: number; messages?: unknown[]; resync?: boolean };
+            assert.equal(body3.sinceSeq, msgs1.length, "delta against the acked base");
+            assert.equal(body3.messages?.length, msgs2.length - msgs1.length, "only the new messages");
+            assert.equal(body3.resync, undefined);
+            assert.equal(new Headers(init3.headers).get("x-bili-plugin-turn"), "1", "delta carries its own marker");
+        });
+    } finally {
+        proxy.close();
+    }
+});
+
 import { rmrf } from "./tmp-rm.ts";
 
 // #1797: drain ALL in-flight attach/recovery chains after each test — defense-in-depth
@@ -345,7 +423,7 @@ type MockTool = { name: string; description?: string; inputSchema: unknown };
 
 type NameCall = { conversationId: string; name: string };
 
-function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number): (req: http.IncomingMessage, res: http.ServerResponse) => void {
+function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean): (req: http.IncomingMessage, res: http.ServerResponse) => void {
     const manifestTools: MockTool[] = [
         {
             name: "compress",
@@ -384,6 +462,13 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
             });
             return;
         }
+        if (url === "/__bili/plugin/turn") {
+            // #3370: the incremental-turn feature probe (GET) — mocked so
+            // suites can drive the conversion seams without a real lane.
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ enabled: turnEnabled === true }));
+            return;
+        }
         if (url.startsWith("/__bili/plugin/status")) {
             const body = statusResponder === undefined ? { panel: "PANEL-OK" } : statusResponder(url);
             if (body === undefined) {
@@ -400,8 +485,8 @@ function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string
     };
 }
 
-function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number): Promise<{ origin: string; close: () => void }> {
-    const server = http.createServer(mockBiliHandler(toolCalls, statusResponder, nameCalls, nameStatus));
+function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown; nativeCaller?: boolean }>, statusResponder?: (url: string) => unknown | undefined, nameCalls?: NameCall[], nameStatus?: number, turnEnabled?: boolean): Promise<{ origin: string; close: () => void }> {
+    const server = http.createServer(mockBiliHandler(toolCalls, statusResponder, nameCalls, nameStatus, turnEnabled));
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
             const addr = server.address() as { port: number };
@@ -464,6 +549,11 @@ function mockCtx() {
     type HostCtx = Parameters<typeof apply>[0];
     type HostListener = Parameters<NonNullable<PluginContext["on"]>>[1];
     const listeners: Record<string, HostListener[]> = {};
+    // #3354: capture the load-time compaction-disable overlay — event order,
+    // provided services, and the internal/config middleware for simulation.
+    const order: string[] = [];
+    const providedServices: Array<{ name: string; value: unknown }> = [];
+    let compactionMiddleware: ((raw: unknown, next: () => unknown) => unknown) | undefined;
     // Stable service identities (like real cordis services: one facade per
     // process whose state mutates underneath); getters gate exposure on the
     // backing fakes so T4's no-services degradation still reads absent.
@@ -487,7 +577,11 @@ function mockCtx() {
         setInitiator: (i: { session?: { id?: unknown; requestHeader?: () => { config?: { provider?: string; model?: string } } | undefined } } | undefined) => (initiator = i),
         registeredTools: tools,
         registeredCommands: commands,
-        on: (event: string, listener: HostListener) => { (listeners[event] ??= []).push(listener); },
+        on: (event: string, listener: HostListener, _options?: { global?: boolean }) => {
+            order.push(`on:${event}`);
+            if (event === "internal/config") compactionMiddleware = listener as (raw: unknown, next: () => unknown) => unknown;
+            (listeners[event] ??= []).push(listener);
+        },
         emit: (event: string, ...args: unknown[]) => { for (const l of listeners[event] ?? []) (l as (...a: unknown[]) => void)(...args); },
         get sessions(): PluginContext["sessions"] { return dshSessions !== undefined ? sessionsService : undefined; },
         get sessionTitle(): PluginContext["sessionTitle"] { return dshTitleFold !== undefined ? titleService : undefined; },
@@ -516,6 +610,10 @@ function mockCtx() {
             agentDefaultModel = a;
         },
         setProfileContext: (pc: { startedBundles?: readonly string[] } | undefined) => (profileContext = pc),
+        reflect: { provide: (name: string, value: unknown) => { order.push(`provide:${name}`); providedServices.push({ name, value }); } },
+        providedServices,
+        registrationOrder: () => [...order],
+        compactionMiddleware: () => compactionMiddleware,
     };
 }
 
@@ -831,6 +929,10 @@ test("apply() is a no-op under the kill switches", async () => {
             apply(ctx);
             assert.equal(ctx.registeredTools.length, 0);
             assert.equal(ctx.registeredCommands.length, 0);
+            // #3354: a kill-switched bili must not register the load-time
+            // overlay either — the lane goes back to stock dsh behavior.
+            assert.ok(!ctx.registrationOrder().some((e) => e.startsWith("on:internal/config")));
+            assert.equal(ctx.providedServices.length, 0);
         });
     } finally {
         rmrf(home);
@@ -858,13 +960,14 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
             apply(ctx);
             assert.equal(warnLines().length, 1);
             assert.match(warnLines()[0], /#1772/);
-            // #2474: the caveat must point at the working exit (full-snapshot
-            // override of preset-standard via cordis.patch.yml), not end in a
-            // dead end — pin the pointer so the correction can't regress.
+            // #3354: the note now states bili disables the preset rows at load
+            // time (vendored overlay, attribution preserved) and keeps the
+            // #2474 full-snapshot recipe as the documented fallback — pin both
+            // pointers so either regression is caught.
+            assert.match(warnLines()[0], /#3354/);
+            assert.match(warnLines()[0], /deshark42\/dsh-compaction-basic-disable/);
             assert.match(warnLines()[0], /#2474/);
             assert.match(warnLines()[0], /cordis\.patch\.yml/);
-            assert.match(warnLines()[0], /WHOLESALE/);
-            assert.match(warnLines()[0], /insert:/);
             // #1791: settle each apply's attach chain while the mock is still
             // open — a deferred probe settling against a closed mock runs the
             // spawn fallback mid-way through a LATER test and clobbers the
@@ -909,6 +1012,57 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
         rmrf(stateHome);
         _resetRegisterForTest(undefined);
         _resetWebProfileWarningForTest();
+    }
+});
+
+test("#3354 apply(): registers the load-time compaction-disable overlay and publishes its gate", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cd-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            // the gate service publishes AFTER the middleware registers — the
+            // preset inject latch can never be satisfied before the transform
+            // is live
+            const iOn = ctx.registrationOrder().indexOf("on:internal/config");
+            const iProvide = ctx.registrationOrder().indexOf(`provide:${BILI_COMPACTION_DISABLE_SERVICE}`);
+            assert.ok(iOn >= 0, "internal/config middleware must be registered");
+            assert.ok(iProvide > iOn, "gate service must publish after the middleware registers");
+            assert.deepEqual(ctx.providedServices.map((s) => s.name), [BILI_COMPACTION_DISABLE_SERVICE]);
+
+            const mw = ctx.compactionMiddleware();
+            assert.equal(typeof mw, "function");
+            const run = (self: unknown, cfg: Record<string, unknown>) =>
+                (mw as (raw: unknown, next: () => unknown) => unknown).call(self, null, () => cfg);
+            // agent-preset entry: both compaction rows disabled, everything else untouched
+            const plugins: Array<Record<string, unknown>> = [
+                { name: "@deepseek-ai/dsh-compaction-basic", config: { auto: true } },
+                { name: "@deepseek-ai/dsh-command-compact" },
+                { name: "@deepseek-ai/dsh-other" },
+            ];
+            const presetCfg: Record<string, unknown> = { plugins, x: 1 };
+            const out = run({ entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } }, presetCfg) as { plugins?: Array<Record<string, unknown>>; x?: number };
+            assert.equal(out.x, 1);
+            assert.deepEqual(out.plugins?.[0]?.config, { auto: true });
+            assert.equal(out.plugins?.[0]?.disabled, true);
+            assert.equal(out.plugins?.[1]?.disabled, true);
+            assert.equal(out.plugins?.[2]?.disabled, undefined);
+            // the original input is not mutated — detached copies only
+            assert.equal(plugins[0].disabled, undefined);
+            // non-preset entries pass through verbatim
+            const otherCfg: Record<string, unknown> = { plugins };
+            assert.equal(run({ entry: { options: { name: "something-else" } } }, otherCfg), otherCfg);
+            // a preset config without a plugins key passes through verbatim
+            const emptyCfg: Record<string, unknown> = {};
+            assert.equal(run({ entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } }, emptyCfg), emptyCfg);
+            await _stateToolsReadyForTest();
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
     }
 });
 

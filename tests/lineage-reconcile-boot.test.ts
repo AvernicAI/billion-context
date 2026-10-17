@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { SessionStore, _setStoreForTest, getStore } from "../src/persist.ts";
 import { listSessions } from "../src/session.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -235,6 +235,12 @@ async function setupForkOnDisk(resumeInheritance?: boolean): Promise<ForkSetup> 
         for (const b of child.state.blocks) child.blockContents.delete(b.blockId);
         child.state.blocks.length = 0;
         delete child.metadata.derivedBlocksAdopted;
+        // Pin the post-strip shape synchronously (#3336): an armed debounce
+        // timer from the request above would otherwise fire later and persist
+        // whichever in-memory snapshot it finds at fire time, leaking pre-strip
+        // state into the simulated restart below. Same for the parent's ledger.
+        assert.ok(getStore().flushSync(child), "post-strip persist of the fork child must land");
+        assert.ok(getStore().flushSync(parent), "parent's folded ledger must be on disk before the restart");
 
         return {
             run,
@@ -446,7 +452,24 @@ test("AC12: a multi-hop grandchild stays eligible when its intermediate parent h
             for (const b of s.state.blocks) s.blockContents.delete(b.blockId);
             s.state.blocks.length = 0;
             delete s.metadata.derivedBlocksAdopted;
+            // Same #3336 pin as in setupForkOnDisk: the boot reconcile above
+            // adopted the child from the root and armed its debounce; without a
+            // sync flush here the final boot below could load the child WITH
+            // blocks and legally adopt the grandchild, closing its gate.
+            assert.ok(getStore().flushSync(s), `post-strip persist of ${id} must land`);
         }
+        // The scenario under test needs the sweep to reach the grandchild
+        // BEFORE the child adopts. listSessions() orders by lastSeen desc, and
+        // the two turns' timestamps are ambient wall-clock: a coarse clock or
+        // a reload path restamping lastSeen can tie or flip them (observed
+        // deterministically on the windows-latest CI lanes). Once the child is
+        // visited first it legitimately adopts from the root, and the
+        // grandchild's adoption from a now-block-bearing parent is CORRECT
+        // behavior (#2807 contract) — failing this assertion for the wrong
+        // reason. Pin the order instead of leaning on clock luck.
+        const pinnedChild = listSessions().find((x) => x.id === childId)!;
+        const pinnedGrandchild = listSessions().find((x) => x.id === grandchildId)!;
+        pinnedGrandchild.lastSeen = Math.max(pinnedGrandchild.lastSeen, pinnedChild.lastSeen + 60_000);
     } finally {
         await close(proxy);
         await close(relay);

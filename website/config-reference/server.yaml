@@ -179,6 +179,17 @@ entries:
     desc_zh: "全局单图 token 上限，叠加在计费口径之上生效；逐请求实时读取。"
     site_en: "<code>imageTokenCap</code> — global per-image token cap; unset = uncapped (BILI_IMAGE_TOKEN_CAP wins, read live)."
     site_zh: "<code>imageTokenCap</code> —— 全局单图 token 上限；未设置 = 不限（BILI_IMAGE_TOKEN_CAP 优先且实时读取）。"
+  - key: imageRescale
+    type: boolean
+    default: "true"
+    env: BILI_IMAGE_RESCALE
+    group: upstream
+    id: tt.ir2
+    site_group: up
+    desc_en: "Egress image downscale master switch (#3295/#3400): large outbound images are sent shrunken while originals stay untouched in session storage. Live-read per request."
+    desc_zh: "出站图片降采样总开关（#3295/#3400）：大图以缩小形态发给模型，原图在会话存储中保持字节级原样。逐请求实时读取。"
+    site_en: "<code>imageRescale</code> — egress downscale switch; large outbound images sent shrunken, originals kept byte-exact in session storage."
+    site_zh: "<code>imageRescale</code> —— 出站图片降采样总开关；大图以缩小形态出站，原图在会话存储中保持字节级原样。"
   - key: maskHosts
     type: boolean
     default: "true"
@@ -190,6 +201,16 @@ entries:
     desc_zh: "日志中把非公开目标主机遮成 <private-host>；凭据头无论此开关如何总是遮盖。"
     site_en: "<code>maskHosts</code> — mask non-public host names in logs as &lt;private-host&gt; (on by default; credentials are always masked)."
     site_zh: "<code>maskHosts</code> —— 日志中把非公开主机名遮成 &lt;private-host&gt;（默认开；凭据总是遮盖）。"
+  - key: security.adminRelay
+    type: boolean
+    default: "false"
+    group: behavior
+    id: tt.adminrelay
+    site_group: beh
+    desc_en: "Let an embedding host (dsh web today) relay the ENTIRE /__bili/ admin surface through its own entry origin so a remote browser can open the panel (#3373). Fail-closed, file-only. The relayed hop reaches the proxy as a local non-browser client (loopback source + loopback Host, no Origin), so the admin gate stays unchanged; enabling it exposes config editing and credential writes to whoever can reach the host web entry — protect that entry (auth / reverse proxy) first."
+    desc_zh: "允许宿主（当前为 dsh web）把它自己入口域名下的整个 /__bili/ 管理面中继到本机代理，使远程浏览器能打开面板（#3373）。默认关闭、仅配置文件。中继跳到达代理时是本机非浏览器客户端（回环源地址 + 回环 Host、无 Origin 头），管理端门槛不变；开启后，凡能访问宿主 web 入口的人都能改配置、写凭据——请先给入口加鉴权/反代。"
+    site_en: "<code>security.adminRelay</code> — relay the /__bili/ admin surface through the embedding host's web entry (off by default; fail-closed)."
+    site_zh: "<code>security.adminRelay</code> —— 将 /__bili/ 管理面经宿主 web 入口中继（默认关；fail-closed）。"
   - key: subagentSplit
     type: boolean
     default: "true"

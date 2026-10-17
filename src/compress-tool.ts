@@ -12,6 +12,9 @@
  */
 import {
     parseCompressArgs,
+    ABSORB_TOOL,
+    ABSORB_TOOL_GOOGLE,
+    ABSORB_TOOL_OPENAI,
     DECOMPRESS_TOOL,
     DECOMPRESS_TOOL_GOOGLE,
     DECOMPRESS_TOOL_NAME,
@@ -85,9 +88,14 @@ export {
     buildCompressSystemPrompt,
     buildCompressTextSystemPrompt,
     buildCompressHybridSystemPrompt,
+    ABSORB_TOOL_NAME,
+    ABSORB_TOOL,
+    ABSORB_TOOL_OPENAI,
+    ABSORB_TOOL_GOOGLE,
+    buildAbsorbSystemPrompt,
     RULE_TOOL_NAME,
 } from "acp-kernel";
-export type { ParsedRange } from "acp-kernel";
+export type { ParsedRange, AbsorbConfig } from "acp-kernel";
 export { ACP_TOOL_NAMES as PROXY_TOOL_NAMES, ACP_MUTATING_TOOLS as MUTATING_PROXY_TOOLS, ACP_READONLY_TOOLS as READONLY_PROXY_TOOLS } from "acp-kernel";
 
 // #1881: the ACP-TAGS NEVER-echo prohibition must not disappear with injectTool.
@@ -328,6 +336,29 @@ export function ptcNoteMode(names: Iterable<string | undefined>): AcpNoteMode {
     return "none";
 }
 
+// The kernel ships no Responses-format absorb const (the four ACP tools have
+// *_RESPONSES variants; absorb is host-registered opt-in). Synthesize it in
+// the same flat shape as SEARCH_CONTEXT_TOOL_RESPONSES.
+export const ABSORB_TOOL_RESPONSES = {
+    type: "function",
+    name: ABSORB_TOOL_OPENAI.function.name,
+    description: ABSORB_TOOL_OPENAI.function.description,
+    parameters: ABSORB_TOOL_OPENAI.function.parameters,
+};
+
+// #1359: absorb wire shapes parameterized by name so registration (manifest +
+// per-request injection) follows the resolved `absorb.toolName` in BOTH lanes —
+// a renamed tool must be advertised, injected, and adjudicated under one name.
+// At the default name this is byte-identical to the static consts above.
+export function absorbToolsFor(name: string) {
+    return {
+        anthropic: { name, description: ABSORB_TOOL.description, input_schema: ABSORB_TOOL.input_schema },
+        openai: { type: "function" as const, function: { name, description: ABSORB_TOOL_OPENAI.function.description, parameters: ABSORB_TOOL_OPENAI.function.parameters } },
+        responses: { type: "function" as const, name, description: ABSORB_TOOL_OPENAI.function.description, parameters: ABSORB_TOOL_OPENAI.function.parameters },
+        google: { name, description: ABSORB_TOOL_GOOGLE.description, parameters: ABSORB_TOOL_GOOGLE.parameters },
+    };
+}
+
 // The reconciled kernel (acp-kernel#332) ships RULE_TOOL_NAME + the rule state
 // helpers but no wire tool objects. Synthesize all four wire shapes here so
 // every injection point (wire helpers, plugin manifest) serves one definition.
@@ -344,6 +375,26 @@ export const RULE_TOOL = { name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPT
 export const RULE_TOOL_OPENAI = { type: "function" as const, function: { name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, parameters: RULE_PARAM_SCHEMA } };
 export const RULE_TOOL_RESPONSES = { type: "function" as const, name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, parameters: RULE_PARAM_SCHEMA };
 export const RULE_TOOL_GOOGLE = { name: RULE_TOOL_NAME, description: RULE_TOOL_DESCRIPTION, parameters: RULE_PARAM_SCHEMA };
+
+// #3400: read_original_image — fetch the ORIGINAL full-resolution bytes of an
+// image whose egress copy was downscaled by the rescale pass (the [bili] note
+// beside the shrunken image quotes the mNNNNN ref). Host-side execution only
+// (never forwarded to the client — see isProxyToolFor); registration is
+// lane-gated at the manifest sites (proxy-injection lanes only, never codex),
+// while the pass itself runs on every lane (codex gets size-only notes).
+export const READ_ORIGINAL_IMAGE_TOOL_NAME = "read_original_image";
+const READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION = "Read the ORIGINAL full-resolution image of a message whose picture was downscaled before reaching you. Beside each shrunken image there is a [bili] note quoting its mNNNNN ref and both sizes — pass that ref here. The original bytes are returned as an image attached to this result. The original can be much larger than the downscaled copy, so call this only when you actually need full-resolution detail (small text, colors, pixel alignment); the downscaled version is enough for most work.";
+const READ_ORIGINAL_IMAGE_PARAM_SCHEMA = {
+    type: "object" as const,
+    properties: {
+        ref: { type: "string", description: "The mNNNNN message ref quoted in the [bili] downsample note beside the shrunken image." },
+    },
+    required: ["ref"],
+};
+export const READ_ORIGINAL_IMAGE_TOOL = { name: READ_ORIGINAL_IMAGE_TOOL_NAME, description: READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION, input_schema: READ_ORIGINAL_IMAGE_PARAM_SCHEMA };
+export const READ_ORIGINAL_IMAGE_TOOL_OPENAI = { type: "function" as const, function: { name: READ_ORIGINAL_IMAGE_TOOL_NAME, description: READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION, parameters: READ_ORIGINAL_IMAGE_PARAM_SCHEMA } };
+export const READ_ORIGINAL_IMAGE_TOOL_RESPONSES = { type: "function" as const, name: READ_ORIGINAL_IMAGE_TOOL_NAME, description: READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION, parameters: READ_ORIGINAL_IMAGE_PARAM_SCHEMA };
+export const READ_ORIGINAL_IMAGE_TOOL_GOOGLE = { name: READ_ORIGINAL_IMAGE_TOOL_NAME, description: READ_ORIGINAL_IMAGE_TOOL_DESCRIPTION, parameters: READ_ORIGINAL_IMAGE_PARAM_SCHEMA };
 
 // #1097: acp_retrieve — resolve a stored ID-referenced message back to its full
 // original. Kernel-owned tool (RETRIEVE_TOOL_NAME); synthesized in all four

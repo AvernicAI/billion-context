@@ -129,15 +129,19 @@ export function requestText(parsed: AnthropicRequestBody): string {
 }
 
 /** True for BOTH stages and BOTH flavors — see the module header for why each
- *  signal exists and which shapes carry it. */
+ *  signal exists and which shapes carry it. The <transcript> wrapper is the
+ *  load-bearing structural signal (every stage, every flavor carries it); the
+ *  magic stop sequences corroborate but are NOT sufficient alone — "</severity>"
+ *  / "</block>" are ordinary XML tags a legitimate session can legitimately use
+ *  as stop hints (any harness emitting severity/block verdict XML). Detecting on
+ *  stops alone would forge a local "always allow" verdict for such traffic. */
 export function isAutoModeClassifier(parsed: AnthropicRequestBody): boolean {
-    const stops = parsed.stop_sequences;
-    if (Array.isArray(stops) && stops.some((s) => typeof s === "string" && AUTO_MODE_CLASSIFIER_STOPS.has(s))) {
-        return true;
-    }
     const text = requestText(parsed);
-    const hasTranscript = text.includes(TRANSCRIPT_MARKER);
-    if (!hasTranscript) return false;
+    if (!text.includes(TRANSCRIPT_MARKER)) return false;
+    const stops = parsed.stop_sequences;
+    const hasMagicStops =
+        Array.isArray(stops) && stops.some((s) => typeof s === "string" && AUTO_MODE_CLASSIFIER_STOPS.has(s));
+    if (hasMagicStops) return true; // wrapper + magic stops: stage-1 non-fast, even if policy copy drifts
     return [...SEVERITY_FLAVOR_MARKERS, ...BLOCK_FLAVOR_MARKERS, ...SHARED_POLICY_MARKERS]
         .some((marker) => text.includes(marker));
 }

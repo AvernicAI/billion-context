@@ -4,6 +4,8 @@ import { log as loggerLog } from "./logger.js";
 import { getStore } from "./persist.js";
 import { VERSION } from "./version.js";
 import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
+import { configFileEpoch, loadConfigFile } from "./config.js";
+import { applyCompressSettings, hasCompressSettings, resolveContextLimitValue } from "./compress-settings.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
@@ -620,10 +622,50 @@ export function storeEffectiveConfig(session: Session, config: Config): void {
         if (typeof cloneSafe[key] === "function") delete cloneSafe[key];
     }
     session.metadata["effectiveConfig"] = cloneSafe;
+    // #2960⑥: identity of the config source this snapshot was resolved from.
+    // effectiveConfig() refuses the snapshot when the source has moved on
+    // (file edited, different BILI_CONFIG_FILE lane) — see the reader below.
+    session.metadata["effectiveConfigEpoch"] = configFileEpoch();
+}
+
+/** True when the session's effectiveConfig stamp was resolved from a config
+ *  source that no longer matches the live file (file edited since the last
+ *  wire request, or a different lane's file whose content diverged — the
+ *  epoch is a content hash, so byte-identical files validate across
+ *  instances). Stamps without an epoch predate the guard and keep the legacy
+ *  behavior (stamp wins). */
+function staleEffectiveStamp(session: Session | undefined): boolean {
+    const stamped = session?.metadata?.["effectiveConfigEpoch"];
+    return typeof stamped === "string" && stamped !== configFileEpoch();
+}
+
+/** Re-resolve the FILE tier of the config (compress.* incl. externalSummary at
+ *  the global level) onto `base` from the live file. Used when a stale stamp is
+ *  refused: the fallback (`deps.config` / opts.kernelConfig) is a bare default
+ *  Config without file settings, so returning it naked would drop every file
+ *  knob between the edit and the session's next wire request. Provider/model
+ *  cascade levels need the request URL and are deliberately NOT re-resolved
+ *  here — the next wire request re-stamps the full cascade. */
+function liveFileOverlayConfig(base: Config): Config {
+    const compress = loadConfigFile().compress;
+    if (!compress || !hasCompressSettings(compress)) return base;
+    const limit = resolveContextLimitValue(compress.modelContextLimit, base.modelContextLimit);
+    return applyCompressSettings(base, limit, compress, {});
 }
 
 export function effectiveConfig(session: Session | undefined, fallback: Config): Config {
     const stored = session?.metadata["effectiveConfig"];
+    // #2960⑥ stale-stamp guard: the snapshot was resolved from a config source
+    // that has since changed (edited file / foreign lane). Serving it would
+    // execute retired settings — the October externalSummary incident ran a
+    // user-disabled summary chain for days off one such stamp. Refuse the
+    // snapshot and resolve the live file tier onto the fallback instead.
+    if (staleEffectiveStamp(session)) {
+        const live = liveFileOverlayConfig(fallback);
+        const lane = typeof session?.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
+        const classifier = lane ? durableMessageToolPaths[lane] : undefined;
+        return classifier && !live.messagePathOf ? withDurableProtection(live, classifier) : live;
+    }
     const base = stored && typeof stored === "object" ? { ...fallback, ...(stored as Partial<Config>) } : fallback;
     // #2446 follow-up (CI regression): the per-lane durable classifier is a
     // FUNCTION and must never be persisted into session.metadata — fork-adoption
@@ -749,7 +791,9 @@ export function reanchorNudgeOnUsageDrop(session: Session): void {
     const ref = nudge.lastNudgeShownTokens > 0 ? nudge.lastNudgeShownTokens : nudge.lastPerMessageNudgeTokens;
     if (ref <= 0) return;
     const stored = session.metadata?.["effectiveConfig"];
-    const margin = nudgeGrowthInterval(stored && typeof stored === "object" ? (stored as Config) : undefined);
+    const margin = nudgeGrowthInterval(
+        staleEffectiveStamp(session) ? undefined : stored && typeof stored === "object" ? (stored as Config) : undefined,
+    );
     if (!(value < ref - margin)) return;
     nudge.lastPerMessageNudgeTokens = value;
     nudge.lastNudgeShownTokens = 0;

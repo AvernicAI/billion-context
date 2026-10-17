@@ -26,7 +26,11 @@ on:
 
 concurrency:
   group: ci-image-${{ github.ref }}
-  cancel-in-progress: true
+  # #3331: cancel-in-progress applies WITHIN the group too — a 30-min cron whose
+  # run outlives the interval would kill its predecessor mid-suite (tokens spent,
+  # no green recorded, gate can never skip). Cancel only same-ref superseded
+  # runs; scheduled runs queue behind each other instead.
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 jobs:
   # three-layer CI: this lane only runs on demand (ci:full label / dispatch)

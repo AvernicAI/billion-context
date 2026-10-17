@@ -48,6 +48,15 @@ function startManifestProxy(): Promise<{ origin: string; close: () => void }> {
     });
 }
 
+// #3373: hermetic config isolation — the relay gate reads the real config
+// file unless pointed elsewhere; a machine with security.adminRelay on must
+// not flip these tests.
+function emptyConfigFile(home: string): string {
+    const file = path.join(home, "bili-config.json");
+    fs.writeFileSync(file, "{}");
+    return file;
+}
+
 type InjectRow = { kind: string; name?: string; value?: unknown };
 type InjectListener = (table: InjectRow[]) => void;
 
@@ -67,7 +76,7 @@ test("#1590: webserver/index-inject publishes __BILI__ while an origin is known 
     const proxy = await startManifestProxy();
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, BILI_CONFIG_FILE: emptyConfigFile(home) }, async () => {
             _resetRegisterForTest(proxy.origin);
             const listeners: InjectListener[] = [];
             apply(uiCtx(listeners) as Parameters<typeof apply>[0]);
@@ -87,7 +96,7 @@ test("#1590: webserver/index-inject publishes __BILI__ while an origin is known 
 test("#1590: index-inject stays silent when no origin is known yet (spawn mode)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: emptyConfigFile(home) }, async () => {
             _resetRegisterForTest(undefined);
             const listeners: InjectListener[] = [];
             apply(uiCtx(listeners) as Parameters<typeof apply>[0]);
@@ -133,15 +142,19 @@ function routeCtx(routes: RouteRow[], listeners: InjectListener[]) {
 test("#1809: live /bili/origin route reflects the bound origin", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: emptyConfigFile(home) }, async () => {
             _resetRegisterForTest("http://127.0.0.1:8787");
             const routes: RouteRow[] = [];
             apply(routeCtx(routes, []) as Parameters<typeof apply>[0]);
-            assert.equal(routes.length, 1);
-            assert.equal(routes[0].kind, "exact");
-            assert.equal(routes[0].path, "/bili/origin");
+            // #3373: the panel now registers two routes — the origin probe and
+            // the /__bili admin relay (fail-closed while the gate is off).
+            assert.equal(routes.length, 2);
+            const originRoute = routes.find((r) => r.path === "/bili/origin")!;
+            const relayRoute = routes.find((r) => r.path === "/__bili")!;
+            assert.equal(originRoute.kind, "exact");
+            assert.equal(relayRoute.kind, "prefix");
             const res = new FakeRes();
-            await routes[0].handler({}, res);
+            await originRoute.handler({}, res);
             assert.equal(res.status, 200);
             assert.equal(res.headers?.["content-type"], "application/json");
             assert.deepEqual(JSON.parse(res.body), { origin: "http://127.0.0.1:8787" });
@@ -154,13 +167,14 @@ test("#1809: live /bili/origin route reflects the bound origin", async () => {
 test("#1809: /bili/origin answers null before binding", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: emptyConfigFile(home) }, async () => {
             _resetRegisterForTest(undefined);
             const routes: RouteRow[] = [];
             apply(routeCtx(routes, []) as Parameters<typeof apply>[0]);
-            assert.equal(routes.length, 1);
+            assert.equal(routes.length, 2);
+            const originRoute = routes.find((r) => r.path === "/bili/origin")!;
             const res = new FakeRes();
-            await routes[0].handler({}, res);
+            await originRoute.handler({}, res);
             assert.deepEqual(JSON.parse(res.body), { origin: null });
         });
     } finally {
@@ -171,7 +185,7 @@ test("#1809: /bili/origin answers null before binding", async () => {
 test("#1809: route registration rides the injected context's effect lifecycle", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
     try {
-        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: emptyConfigFile(home) }, async () => {
             _resetRegisterForTest("http://127.0.0.1:8787");
             const routes: RouteRow[] = [];
             let disposed = 0;
@@ -197,12 +211,15 @@ test("#1809: route registration rides the injected context's effect lifecycle", 
             };
             apply(ctx as Parameters<typeof apply>[0]);
             assert.equal(effects.length, 1, "registration must be wrapped in the context effect");
-            assert.equal(effects[0].label, "bili: /bili/origin route");
+            assert.equal(effects[0].label, "bili: panel routes (origin + admin relay)");
             const cleanup = effects[0].fn();
-            assert.equal(routes.length, 1);
-            assert.equal(typeof cleanup, "function", "the disposer doubles as the effect cleanup");
+            assert.equal(routes.length, 2);
+            // #3373 review: the effect fn must hand back a combined disposer —
+            // dsh calls it on re-run to un-register BOTH routes; returning
+            // undefined lets stale duplicates accumulate in the router table.
+            assert.equal(typeof cleanup, "function", "the combined disposer doubles as the effect cleanup");
             (cleanup as () => void)();
-            assert.equal(disposed, 1);
+            assert.equal(disposed, 2);
         });
     } finally {
         rmrf(home);
@@ -543,6 +560,94 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
         collectText(dtree, dt);
         assert.ok(dt.some((x) => x.includes("/acp")), `${slot}: degraded hint points at /acp: ${JSON.stringify(dt)}`);
         dm.runCleanups();
+    }
+});
+
+test("#3373: relay mode — probe {origin:null,relay:true} binds same-origin; prefix gateways resolve through the base-relative fallback form", async () => {
+    {
+        // Root relay deployment: no response URL ⇒ base "" (same-origin paths).
+        const opened: string[] = [];
+        const m = await mountClient({
+            open: (url: string) => opened.push(url),
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
+                return { ok: true, json: async () => ({ origin: null, relay: true }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        const first = m.component() as ElementNode;
+        // No snapshot here — first paint is the degraded hint until the first
+        // poll resolves (the snapshot path is covered below).
+        assert.equal(findTag(first, "iframe"), undefined, "#3100: the frame still waits for the pre-flight verdict");
+        await tick();
+        m.component();
+        await tick();
+        const second = m.component() as ElementNode;
+        const ft: string[] = [];
+        collectText(second, ft);
+        assert.ok(!ft.some((x) => x.includes("/acp")), "relay mode is bound, not degraded");
+        const frame = findTag(second, "iframe");
+        assert.ok(frame !== undefined, "relay mode renders the frame");
+        assert.equal(frame.props?.src, "/__bili/?embed=1&lang=zh#/overview", "same-origin frame under the entry relay");
+        const buttons = collectButtons(second);
+        (buttons[buttons.length - 1].props!.onClick as () => void)();
+        assert.deepEqual(opened, ["/__bili/"]);
+        m.runCleanups();
+    }
+    {
+        // Prefix gateway (fnOS-style /app/dsh/): the absolute probe path misses;
+        // the base-relative fallback form carries the prefix and its response
+        // URL becomes the absolute UI base.
+        const m = await mountClient({
+            document: { baseURI: "https://dsh.example/app/dsh/" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                const u = String(url);
+                if (u === "/bili/origin") return { ok: false };
+                if (u.endsWith("/bili/origin")) return { ok: true, url: u, json: async () => ({ origin: null, relay: true }) };
+                if (u.endsWith("/__bili/?embed=1")) return htmlOk();
+                throw new Error(`unexpected fetch: ${u}`);
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const frame = findTag(tree, "iframe");
+        assert.ok(frame !== undefined, "prefix gateway resolves through the fallback probe form");
+        assert.equal(frame.props?.src, "https://dsh.example/app/dsh/__bili/?embed=1&lang=zh#/overview");
+        m.runCleanups();
+    }
+    {
+        // Relay snapshot (__BILI__ carries relay:true): first paint is bound.
+        const m = await mountClient({
+            __BILI__: { origin: null, relay: true },
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
+                return { ok: true, json: async () => ({ origin: null, relay: true }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        const first = m.component() as ElementNode;
+        const ft: string[] = [];
+        collectText(first, ft);
+        assert.ok(!ft.some((x) => x.includes("/acp")), "relay snapshot is bound from first paint");
+        await tick();
+        m.component();
+        await tick();
+        const second = m.component() as ElementNode;
+        assert.ok(findTag(second, "iframe") !== undefined, "relay snapshot + live route renders the frame");
+        m.runCleanups();
     }
 });
 

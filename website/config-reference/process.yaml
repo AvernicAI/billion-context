@@ -131,6 +131,44 @@ entries:
     group: process
     desc_en: "Max rebuilt request bytes forwarded upstream (forward-stage 413), counted as UTF-8 bytes of the final body string. Checked before the fetch so an over-budget rebuild never reaches the upstream watchdog allocation."
     desc_zh: "转发到上游的重建请求字节上限（forward 阶段 413），按最终 body 字符串的 UTF-8 字节计。在 fetch 之前检查，超预算的重建不会触发上游看门狗分配。"
+  - key: guardrails
+    type: object
+    default: "{} (all defaults)"
+    group: process
+    id: tt.guardrails
+    site_group: proc
+    desc_en: "Guardrails: tool-output guardrails for the pi/omp plugin bundles (#3066) plus the proxy-side text-run stream guard (#3406)."
+    desc_zh: "守卫集合：pi/omp 插件的工具输出守卫（#3066）及代理侧流式 text-run 守卫（#3406）。"
+    site_en: "<code>guardrails</code> — pi/omp plugin tool-output + stream text-run guardrails: <span class='mech'>bashTimeout 60 · maxOutputBytes 50000 · repetition true · textRunThreshold 200</span>."
+    site_zh: "<code>guardrails</code> —— pi/omp 插件工具输出与流式 text-run 守卫：<span class='mech'>bashTimeout 60 · maxOutputBytes 50000 · repetition true · textRunThreshold 200</span>。"
+  - key: guardrails.bashTimeout
+    type: number
+    default: "60"
+    env: BILI_GUARDRAIL_BASH_TIMEOUT
+    group: process
+    desc_en: "Seconds injected as the bash tool's timeout when the model omits it (#3066 owner intent, re-affirmed #3366: an unsupervised bash call could hang a pi session for a whole day — the host schema provides no default). Set N to tune, 0 to disable injection (pi-native no-default)."
+    desc_zh: "模型未写 timeout 时注入到 bash 工具的秒数（#3066 owner 有意为之，#3366 重申：无人看管的 bash 会把 pi 会话挂死一整天——宿主 schema 本身无默认值）。设 N 调整秒数，设 0 关闭注入（恢复 pi 原生行为）。"
+  - key: guardrails.maxOutputBytes
+    type: number
+    default: "50000"
+    env: BILI_GUARDRAIL_MAX_OUTPUT_BYTES
+    group: process
+    desc_en: "Combined text-output byte cap per tool result in the pi/omp plugin (0 disables the cap). Over-cap output is truncated head-first with a notice pointing at the host-saved full output."
+    desc_zh: "pi/omp 插件中每个工具结果的文本输出合计字节上限（0 禁用）。超限输出从头截断并附指向宿主已存完整输出的提示。"
+  - key: guardrails.repetition
+    type: boolean
+    default: "true"
+    env: BILI_GUARDRAIL_REPETITION
+    group: process
+    desc_en: "Identical-call loop-breaker for the pi/omp plugin (warn at 3, abort at 5 consecutive byte-identical calls). false / env 0 disables it."
+    desc_zh: "pi/omp 插件的同一调用循环破除器（连续 3 次警告、5 次中止，按字节全同判定）。false 或 env 0 关闭。"
+  - key: guardrails.textRunThreshold
+    type: number
+    default: "200"
+    env: BILI_GUARDRAIL_TEXT_RUN_THRESHOLD
+    group: process
+    desc_en: "Single-codepoint repetition breaker over decoded model text on the response stream (#3260; kill switch added by #3406 item 1 after the #3331 review). Trips at N consecutive identical codepoints - legit prose/code stays far below the 200 default, a symbol-loop model does not. Set N to tune, 0 (or negative) to disable: legit long same-char output (code comment separators, ASCII rules) is then never cut mid-stream. The thinking/reasoning channels sit inside this lane too."
+    desc_zh: "响应流上解码后模型文本的单字符重复破除器（#3260；#3331 审查后由 #3406 第 1 项补上开关）。连续 N 个相同码点即触发——正常文本远低于默认 200，符号循环的模型会撞上。设 N 调整阈值，设 0（或负数）关闭：合法的长同字符输出（代码注释分隔线、ASCII 分隔线）不会再被中途掐断。thinking/reasoning 通道也在该守卫内。"
   - key: persist
     type: object
     default: "{} (all defaults)"
@@ -205,8 +243,8 @@ entries:
     default: "true"
     env: BILI_SQLITE_AUTO_DOWNLOAD
     group: process
-    desc_en: "Gate for the one-time SQLite engine self-download (#2833): when no engine is available in-process (no built-in node:sqlite, no host-installed better-sqlite3) and the unified sidecar is wanted on this platform, bili downloads the pinned better-sqlite3 prebuilt tarball from the npm registry once (~11 MB, sha512-verified) into the cache dir and reuses it on every later start. Engine resolution order: built-in node:sqlite (Node >= 22.5) -> host-provided better-sqlite3 -> cached self-download -> self-download (gated by this switch) -> none (legacy-only, the #2825 degrade contract). The switch gates only the network fetch - a cached copy is used even when it is false; unsupported platforms never download."
-    desc_zh: "SQLite 引擎一次性自下载的闸门（#2833）：进程内没有可用引擎（无内置 node:sqlite、宿主未装 better-sqlite3）且本平台希望启用统一边车时，bili 从 npm registry 一次性下载钉死的 better-sqlite3 预编译 tarball（约 11 MB，sha512 校验）到缓存目录，之后每次启动复用。引擎解析顺序：内置 node:sqlite（Node >= 22.5）-> 宿主机已装的 better-sqlite3 -> 缓存的自下载副本 -> 自下载（本开关控制）-> 无引擎（仅 legacy，即 #2825 降级契约）。开关只控制网络下载 —— 为 false 时缓存副本仍会使用；不支持的平台永不下载。"
+    desc_en: "Gate for the one-time SQLite engine self-download (#2833): when no engine is available in-process (no built-in node:sqlite, no host-installed better-sqlite3) and the unified sidecar is wanted on this platform, bili downloads the pinned better-sqlite3 prebuilt tarball from the npm registry once (~11 MB, sha512-verified) into the cache dir and reuses it on every later start. Engine resolution order: built-in node:sqlite (Node >= 22.5) -> host-provided better-sqlite3 -> cached self-download -> self-download (gated by this switch) -> none (legacy-only, the #2825 degrade contract). The switch gates only the network fetch - a cached copy is used even when it is false; unsupported platforms never download. The tarball download walks a builtin mirror list (#3338): the configured registry (BILI_UPDATE_REGISTRY / update.registry) is tried first, then https://registry.npmjs.org, then https://registry.npmmirror.com - the first mirror that yields a sha512-verified tarball wins; a Node < 22.5 with no engine gets an explicit Node upgrade hint in the degrade reason (#3385)."
+    desc_zh: "SQLite 引擎一次性自下载的闸门（#2833）：进程内没有可用引擎（无内置 node:sqlite、宿主未装 better-sqlite3）且本平台希望启用统一边车时，bili 从 npm registry 一次性下载钉死的 better-sqlite3 预编译 tarball（约 11 MB，sha512 校验）到缓存目录，之后每次启动复用。引擎解析顺序：内置 node:sqlite（Node >= 22.5）-> 宿主机已装的 better-sqlite3 -> 缓存的自下载副本 -> 自下载（本开关控制）-> 无引擎（仅 legacy，即 #2825 降级契约）。开关只控制网络下载 —— 为 false 时缓存副本仍会使用；不支持的平台永不下载。 tarball 下载内置镜像列表兜底（#3338）：先试配置的 registry（BILI_UPDATE_REGISTRY / update.registry），再试 https://registry.npmjs.org、https://registry.npmmirror.com —— 第一个通过 sha512 校验的镜像生效；Node < 22.5 且无引擎时，降级原因会给出明确的 Node 升级提示（#3385）。"
   - key: storage.jsonWriter
     type: "on|off"
     default: "on"

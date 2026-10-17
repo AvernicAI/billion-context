@@ -363,6 +363,7 @@ export class UnifiedStore {
     ingestSession(
         input: IngestSessionInput,
         delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
+        opts?: { completeLog?: boolean },
     ): boolean {
         const s = input.session;
         const ok = this.db.transaction((): boolean => {
@@ -412,6 +413,43 @@ export class UnifiedStore {
                 const full = this.remapPlanToAbsolute(input);
                 messages = full.messages;
                 watermark = full.watermark;
+                // #3285: authoritative-set discipline for messages — same as
+                // blocks / refs / dead_refs / ccr_entries below, but ONLY when
+                // completeLog says the plan IS the whole log (the raw tail).
+                // Envelope-only plans are pruned renders (bounded folded view,
+                // #2960 ⑤; folded-resident re-renders, persist ②a caveat), and
+                // sweeping on those would delete raw rows that earlier saves
+                // interned beyond the render window. With a complete plan,
+                // rows whose identity is absent are stale — foreign-writer
+                // leftovers from a restart-handoff overlap (#3285/#2671 shared
+                // directory) or below-boundary rewrites the sampled digest
+                // caught (#3166). INSERT OR IGNORE alone can never remove
+                // them, so without this sweep they ride every unified replay
+                // forever (permanent DIGEST DRIFT even after the #3166
+                // watermark-clear heal). Release their CAS refs and drop them.
+                //
+                // LANE EXCLUSION (#3248): the incremental lane consumes this
+                // table POSITIONALLY — its baseSeq epoch is an absolute row
+                // count recorded at resync, and rejected-branch rows must stay
+                // in the table as an audit floor the served history slices
+                // past. Sweeping them would invalidate the epoch (cold rebuild
+                // serves an empty canonical → 409 loop). Lane-owned sessions
+                // therefore opt out; they keep #3166-class orphans (bounded —
+                // the boot watermark reset still re-establishes delta trust).
+                if (opts?.completeLog === true && !this.hasLaneExt(s.sessionId)) {
+                    const incomingIds = new Set<string>();
+                    for (const m of messages) {
+                        incomingIds.add(`${m.msgId}\u0000${m.contentHash ?? sha256Hex(m.content)}`);
+                    }
+                    const staleRows = this.db
+                        .prepare("SELECT seq, msg_id, content_hash FROM messages WHERE session_id = ?")
+                        .all(s.sessionId) as { seq: number; msg_id: string; content_hash: string }[];
+                    for (const row of staleRows) {
+                        if (incomingIds.has(`${row.msg_id}\u0000${row.content_hash}`)) continue;
+                        this.releaseContent(row.content_hash);
+                        this.db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?").run(s.sessionId, row.seq);
+                    }
+                }
             }
             this.db
                 .prepare(
@@ -707,6 +745,30 @@ export class UnifiedStore {
      *  against a stale watermark and the divergence would be permanent. */
     clearIngestWatermark(sessionId: string): void {
         this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL WHERE session_id = ?").run(sessionId);
+    }
+
+    /** #3285: drop EVERY session's ingest watermark at once. A watermark
+     *  vouches "the writer that set it verified this prefix" but carries no
+     *  writer identity, so the trust must not survive a process handoff:
+     *  under the multi-process shared-directory contract (#2671) a
+     *  restart-handoff overlap (old instance still draining while the new
+     *  one boots, both sharing index.db) leaves a foreign process's rows
+     *  AND its watermark behind, and inheriting that trust lets the new
+     *  process take unverified empty deltas against rows it never wrote.
+     *  Called once at writer init (UnifiedShadow.maybeOpen); pure readers
+     *  (export) must not call it. After the reset each session's first save
+     *  takes the exact full path — an authoritative replace, see
+     *  ingestSession — re-establishing trust from this process's own view.
+     *  Cost: one full ingest per saved session per boot. */
+    resetAllIngestWatermarks(): void {
+        this.db.prepare("UPDATE sessions SET last_ingested_seq = NULL").run();
+    }
+
+    /** #3248 lane-ownership probe for the message sweep (#3285): every ext
+     *  key the incremental lane persists is "inc:"-prefixed, so any such key
+     *  marks a session whose messages table the lane consumes positionally. */
+    private hasLaneExt(sessionId: string): boolean {
+        return this.db.prepare("SELECT 1 FROM session_ext WHERE session_id = ? AND key LIKE 'inc:%' LIMIT 1").get(sessionId) !== undefined;
     }
 
     /** #3133 boundary probe: the identity of the messages row at

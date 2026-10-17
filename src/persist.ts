@@ -108,12 +108,13 @@ const MIGRATION_MARKER = ".bili-migration-286.done";
 
 const STALE_WARN_THROTTLE_MS = 60_000;
 
-/** #3049: slack for the ownership fast path's mtime check — covers this
- *  process's own write latency (builder → atomic write lands a few ms after
- *  builtAtMs). Foreign writes landing INSIDE this window are missed for one
- *  cycle only if their writer also bypasses the shared index (disabled
- *  sidecar); see ownershipFastPath. */
-const OWN_COMMIT_GRACE_MS = 1_500;
+/** #3406: mtime slack for the ownership stamp check — the same physical write
+ *  can surface slightly different mtimeMs across statSync calls on some
+ *  filesystems (FUSE, coarse-grained timestamps); the landed-write stamp is
+ *  taken from the file we just wrote, so a sub-ms drift must not void our own
+ *  ownership. Anything at or below this epsilon is OUR write; anything newer
+ *  with a size change is foreign and forces the full read. */
+const OWN_WRITE_STAMP_EPSILON_MS = 1;
 
 interface PersistedSession {
     version: number;
@@ -322,15 +323,23 @@ export class SessionStore {
     private readonly log: Logger;
     private readonly staleWarnAt = new Map<string, number>();
 
-    /** #3049: ownership token for the stale-guard fast path. Set INSIDE the
-     *  guardedBuild closure after the sidecar ingest of the record we are
+    /** #3049/#3406: ownership token for the stale-guard fast path. Set INSIDE
+     *  the guardedBuild closure after the sidecar ingest of the record we are
      *  about to write (or the disk record we adopted): {counters of that
-     *  commit, wall-clock build time}. The next guard compares this token
-     *  against the unified row + the envelope file's mtime to prove nobody
-     *  else committed since — skipping the full-file read+parse that costs
-     *  ~320ms/turn on >40MiB sessions. Cleared on the direct-write paths
-     *  (restore/rekey) that bypass guardedBuild. */
-    private readonly ownCommit = new Map<string, { requests: number; nextBlockId: number; builtAtMs: number }>();
+     *  commit, build time, and — once the write has LANDED — the envelope's
+     *  post-write stat ("written")}. The next guard compares this token
+     *  against the unified row + the envelope file's size/mtime to prove
+     *  nobody else committed since — skipping the full-file read+parse that
+     *  costs ~320ms/turn on >40MiB sessions. An unstamped token (no "written")
+     *  is unproven and never takes the fast path. Cleared on the direct-write
+     *  paths (restore/rekey) that bypass guardedBuild. */
+    private readonly ownCommit = new Map<string, {
+        requests: number;
+        nextBlockId: number;
+        builtAtMs: number;
+        written?: { size: number; mtimeMs: number };
+        meta?: { protocol?: string; upstreamOrigin?: string };
+    }>();
 
     /** #3049 test seam: how many times the stale guard took the FULL
      *  envelope read (the expensive path). The fast path collapses this to
@@ -376,10 +385,19 @@ export class SessionStore {
      *  index.db open failure) has no index copy, so its files must stamp
      *  legacy (#3093 web panel / #2671 per-file stamp). */
     readonly stampMode: "legacy" | "shadow" | "full";
+    /** #3406: host-owned debounced envelope saves (id → armed timer / latest builder).
+     *  The debounce lives HERE instead of inside the kernel store so each landed
+     *  write goes through the stamped path (store.writeNow + stampOwnWrite): a
+     *  kernel-internal debounce cannot observe its own landing, which left every
+     *  per-turn debounced save unstamped and killed the ownership fast path. */
+    private readonly saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    private readonly saveBuilders = new Map<string, () => PersistedSession>();
+    private readonly debounceMs: number;
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
         this.enabled = (opts?.enabled ?? true) && debounceMs >= 0;
+        this.debounceMs = Math.max(0, debounceMs);
         this.sessionsDir = opts?.dir ?? defaultDir();
         const baseLog = opts?.log ?? defaultLogger;
         this.log = baseLog;
@@ -442,7 +460,7 @@ export class SessionStore {
         this.store = new StateStore<PersistedSession>({
             dir: this.sessionsDir,
             version: PERSIST_VERSION,
-            debounceMs: Math.max(0, debounceMs),
+            debounceMs: this.debounceMs,
             enabled: this.enabled,
             codec: this.codec,
             log: (level, msg) => {
@@ -1586,8 +1604,8 @@ export class SessionStore {
         return null;
     }
 
-    /** #3049 ownership fast path — proves "the disk envelope is still the
-     *  record this process last committed" with three cheap signals, no
+    /** #3049/#3406 ownership fast path — proves "the disk envelope is still
+     *  the record this process last committed" with three cheap signals, no
      *  payload read:
      *
      *  1. Unified row counters equal OUR last commit's counters. Every
@@ -1595,22 +1613,31 @@ export class SessionStore {
      *     multi-process topology), and each commit ingests before it writes
      *     the file — so a sibling's newer commit bumps the row first and this
      *     comparison fails, falling back to the exact full read.
-     *  2. The envelope file's mtime is not newer than our last build (plus
-     *     grace for our own write latency). A writer that does NOT share the
-     *     index (legacy-mode sibling, manual edit) still touches the file, and
-     *     an mtime past our build window forces the full read.
+     *  2. #3406: the token carries the stat of a write that actually LANDED
+     *     ("written", stamped after the awaited write resolves — see
+     *     stampOwnWrite — including host-debounced saves, whose debounce is
+     *     host-owned precisely so their landing goes through the stamped
+     *     writeNow path), and the envelope file still matches it BYTE-FOR-
+     *     BYTE: same size, mtime not newer beyond sub-ms clock skew. Any
+     *     difference means a writer that does NOT share the index (legacy-
+     *     mode sibling, manual edit) touched the file after our last write,
+     *     so the full read decides. An unstamped token (restore-replica seed,
+     *     crash before stamping) is unproven and never takes this path — the
+     *     old #3286 grace window (builtAtMs + 1.5s) mis-classified exactly
+     *     those foreign writes as ours when they landed inside the window
+     *     (#3406 item 2).
      *  3. The incoming counters are not behind our own commit — they cannot
      *     be, in-process (same session object, monotonic counters), but the
      *     check keeps this path self-contained; any surprise defers to the
      *     full read.
      *
-     *  Residual (deliberate, strictly narrower than an unconditional
-     *  size/mtime ownership skip): a sibling whose sidecar is DISABLED (3-
-     *  strike drift) writing a newer envelope within the same grace window
-     *  (~1.5s) as our build is missed for one cycle; its next write wins the
-     *  exact guard again. Crash safety is clean: a process that dies between
-     *  its DB ingest and its file write leaves no token here (fresh map), so
-     *  the next boot always takes the full read. */
+     *  Residual: a foreign write landing in the microsecond gap between our
+     *  awaited write resolving and the stamp's statSync can be adopted as
+     *  "ours" for one cycle — vs the 1.5s window it replaces. A foreign
+     *  write byte-identical to ours changes nothing observable. Crash safety
+     *  is clean: a process that dies between its DB ingest and its file write
+     *  leaves no stamped token here (fresh map), so the next boot always
+     *  takes the full read. */
     private ownershipFastPath(incoming: PersistedSession): boolean {
         const own = this.ownCommit.get(incoming.id);
         if (!own) return false;
@@ -1628,7 +1655,9 @@ export class SessionStore {
         if (!row || row.requests !== own.requests || row.nextBlockId !== own.nextBlockId) return false;
         const stat = this.statEnvelope(incoming.id, incoming.meta);
         if (!stat) return false;
-        if (stat.mtimeMs > own.builtAtMs + OWN_COMMIT_GRACE_MS) return false;
+        if (!own.written) return false; // unproven token (see stampOwnWrite) — full read decides
+        if (stat.size !== own.written.size) return false; // any byte-count change is a foreign write (bigger OR smaller)
+        if (stat.mtimeMs > own.written.mtimeMs + OWN_WRITE_STAMP_EPSILON_MS) return false;
         return true;
     }
 
@@ -1636,7 +1665,7 @@ export class SessionStore {
      *  kernel-discovered source file first, then the canonical live paths.
      * Null when no file exists yet (first save: the full read correctly
      * returns null-fast via loadEnvelope's miss). */
-    private statEnvelope(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): { mtimeMs: number } | null {
+    private statEnvelope(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): { size: number; mtimeMs: number } | null {
         const candidates: string[] = [];
         const known = this.sourceFiles.get(id);
         if (known) candidates.push(known);
@@ -1648,7 +1677,7 @@ export class SessionStore {
         for (const file of candidates) {
             try {
                 const st = statSync(file);
-                return { mtimeMs: st.mtimeMs };
+                return { size: st.size, mtimeMs: st.mtimeMs };
             } catch {
                 // try next
             }
@@ -1713,13 +1742,37 @@ export class SessionStore {
      *  returned — our fresh build, or the disk payload the guard made us
      *  adopt). The unified row was ingested from the same payload in the same
      *  closure, so token counters === row counters until any other writer
-     *  commits. Called from inside the guardedBuild closure only. */
+     *  commits. Called from inside the guardedBuild closure only.
+     *  #3406: the LANDED-write stamp ("written") and the record's identity
+     *  meta are carried across rebuilds — envelope-writing lanes re-stamp
+     *  after their write lands (stampOwnWrite), and writerOff/index-only
+     *  saves never touch the file, so the previous stamp stays valid. */
     private noteOwnCommit(id: string, committed: PersistedSession): void {
+        const prev = this.ownCommit.get(id);
         this.ownCommit.set(id, {
             requests: committed.stats?.requests ?? committed.requests ?? 0,
             nextBlockId: committed.state?.nextBlockId ?? 0,
             builtAtMs: Date.now(),
+            written: prev?.written,
+            meta: committed.meta
+                ? { protocol: committed.meta.protocol, upstreamOrigin: committed.meta.upstreamOrigin }
+                : prev?.meta,
         });
+    }
+
+    /** #3406: stamp the envelope's post-write stat into the ownership token —
+     *  the proof that OUR bytes are the ones on disk right now, replacing the
+     *  #3286 build-time grace window. Called ONLY after a write has LANDED —
+     *  the explicit writeNow resolved, the host-debounced save fired through
+     *  writeNow, or flushSync reported ok. A missing file (null stat) or a
+     *  write failure leaves the token unstamped, which ownershipFastPath
+     *  treats as unproven → full read. */
+    private stampOwnWrite(id: string): void {
+        const token = this.ownCommit.get(id);
+        if (!token) return;
+        const stat = this.statEnvelope(id, token.meta);
+        if (!stat) return;
+        token.written = stat;
     }
 
     /** #2401: read-side convergence. Replace the live session's persisted
@@ -1765,7 +1818,13 @@ export class SessionStore {
     /** Schedule a debounced write for a session. Multiple calls within the
      *  window coalesce; the record is built at WRITE time, so the freshest
      *  session state is persisted. Safe to call on the hot path. No-op if
-     *  disabled. */
+     *  disabled.
+     *  #3406: the debounce is host-owned (saveTimers/saveBuilders) — timer
+     *  semantics mirror the kernel store's (first call arms, later calls swap
+     *  the builder only, unref'd) — but the firing write lands through
+     *  store.writeNow AND gets stamped (stampOwnWrite), which the kernel's
+     *  internal debounce could not do: every per-turn save then proved its
+     *  bytes on disk and the ownership fast path stayed live. */
     scheduleSave(session: Session): void {
         if (!this.saveContentStore(session)) return;
         if (this.writerOffActive()) {
@@ -1797,12 +1856,41 @@ export class SessionStore {
             });
             return;
         }
-        this.store.scheduleSave(session.id, this.guardedBuild(session));
+        if (!this.enabled) return;
+        const id = session.id;
+        this.saveBuilders.set(id, this.guardedBuild(session));
+        const existing = this.saveTimers.get(id);
+        if (existing) return;
+        const timer = setTimeout(() => {
+            this.saveTimers.delete(id);
+            const build = this.saveBuilders.get(id);
+            this.saveBuilders.delete(id);
+            if (!build) return;
+            // Errors are logged inside the kernel write chain; swallowing here
+            // keeps a failed timer write from becoming an unhandledRejection.
+            void this.store.writeNow(id, build).then(() => {
+                this.stampOwnWrite(id); // #3406: the write LANDED — prove our bytes are on disk
+            }).catch(() => {});
+        }, this.debounceMs);
+        timer.unref?.();
+        this.saveTimers.set(id, timer);
     }
 
     /** Asynchronously persist a session right now (skips the debounce). Throws
-     *  on write failure so callers can react (e.g. avoid evicting). Serialized
-     *  per-session by the kernel store's write chains. */
+     *  on write failure so callers can react (e.g. avoid evicting).
+     *
+     *  #3406 item 5 — concurrent writeNow on ONE session cannot lose updates,
+     *  by construction (verified by tests/issue3406-writenow-concurrent.test.ts):
+     *  the kernel store serializes per-id writeNow through its writeChains
+     *  (kernel/src/persist/store.ts), and the guardedBuild closure defers
+     *  buildRecord(session) to CHAIN-RUN time against the LIVE session — so
+     *  each queued write persists the state as of its own turn, never a
+     *  snapshot captured at enqueue time. The later writer therefore always
+     *  commits a snapshot at least as fresh as anything before it; a mutation
+     *  landing between two concurrent calls shows up in BOTH commits. The
+     *  writerOff branch below is fully synchronous (no await between the
+     *  check and the build), so concurrent callers there cannot interleave
+     *  either. Do NOT regress this by eager-snapshotting the record here. */
     async writeNow(session: Session): Promise<void> {
         if (!this.saveContentStore(session)) throw new Error(`Originals were not saved for ${session.id}`);
         if (this.writerOffActive()) {
@@ -1818,6 +1906,7 @@ export class SessionStore {
             return;
         }
         await this.store.writeNow(session.id, this.guardedBuild(session));
+        this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
         this.maybeCutForkBase(session);
         this.foldResidentTail(session);
         this.dropResidentBlockContents(session);
@@ -1933,8 +2022,18 @@ export class SessionStore {
             this.dropResidentMetadata(session);
             return true;
         }
+        // Mirror the kernel flushSync contract: a sync commit supersedes any
+        // armed debounce for this id (its builder would just re-write the
+        // fresher state moments later — redundant IO racing this fence).
+        const armed = this.saveTimers.get(session.id);
+        if (armed) {
+            clearTimeout(armed);
+            this.saveTimers.delete(session.id);
+            this.saveBuilders.delete(session.id);
+        }
         const ok = this.store.flushSync(session.id, this.guardedBuild(session));
         if (ok) {
+            this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
             this.maybeCutForkBase(session);
             this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
@@ -1953,8 +2052,32 @@ export class SessionStore {
         // 3-strike disable for no reason.
         this.drainWriterOffPending();
         for (const session of sessions) this.saveContentStore(session);
+        await this.flushScheduledSaves();
         await this.store.flushAll();
         this.shadow?.close();
+    }
+
+    /** #3406: drain the host-owned debounced saves before the kernel store's
+     *  own flushAll — its timers no longer know about them. Mirrors the
+     *  kernel's drain: clear timers, write each pending builder now (stamped),
+     *  log failures; store.flushAll then also drains any still-in-flight chain. */
+    private async flushScheduledSaves(): Promise<void> {
+        const ids = [...this.saveTimers.keys()];
+        for (const timer of this.saveTimers.values()) clearTimeout(timer);
+        this.saveTimers.clear();
+        const builders = new Map<string, () => PersistedSession>();
+        for (const id of ids) {
+            const build = this.saveBuilders.get(id);
+            if (build) builders.set(id, build);
+            this.saveBuilders.delete(id);
+        }
+        await Promise.all([...builders.entries()].map(([id, build]) =>
+            this.store.writeNow(id, build).then(() => {
+                this.stampOwnWrite(id);
+            }).catch((e) => {
+                this.log("error", `[persist] shutdown flush failed for ${id}: ${String(e)}`);
+            }),
+        ));
     }
 
     /** Close the unified sidecar without flushing pending writes. Intended for
@@ -1969,7 +2092,7 @@ export class SessionStore {
 
     /** Whether a write is currently pending (debounce timer armed) for a id. */
     hasPending(id: string): boolean {
-        return this.store.hasPending(id) || this.writerOffPending.has(id);
+        return this.saveTimers.has(id) || this.writerOffPending.has(id);
     }
 
     /** Phase 3 (#2960): the JSON envelope is skipped only while the sidecar
@@ -1997,6 +2120,9 @@ export class SessionStore {
 
     /** Cancel all pending writes without flushing (e.g. for tests). */
     cancelAll(): void {
+        for (const timer of this.saveTimers.values()) clearTimeout(timer);
+        this.saveTimers.clear();
+        this.saveBuilders.clear();
         this.store.cancelAll();
         this.writerOffPending.clear();
     }

@@ -53,6 +53,14 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // `rollout.features.pluginIncrementalTurns: true` (or a percent), or
     // `BILI_ROLLOUT_PLUGIN_INCREMENTAL_TURNS=1`.
     pluginIncrementalTurns: { percent: 0 },
+    // #2926 anthropic Threads reforge: when the mirrored thread history
+    // crosses the window on a `continue`, swap it for a fresh `create`
+    // carrying [summary, tail ring, delta]. Default 0% — threads traffic
+    // stays byte-faithful passthrough. Mirror capture itself is always on
+    // wherever the unified sidecar is available. Force on with
+    // `rollout.features.anthropicThreadsReforge: true` or
+    // `BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE=1`.
+    anthropicThreadsReforge: { percent: 0 },
 };
 
 export const BP_MAX = 10_000;

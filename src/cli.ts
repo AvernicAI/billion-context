@@ -125,7 +125,7 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili gemini                           # launch Gemini CLI through the proxy (GOOGLE_GEMINI_BASE_URL /bili/ rewrite; API-key & gateway auth)
     bili iflow                            # launch iFlow CLI through the proxy (IFLOW_BASE_URL /bili/ rewrite of apis.iflow.cn/v1)
     bili qwen                             # launch Qwen Code through the proxy (cert-MITM; DashScope/Qwen gateways whitelisted by default, custom relays via --mitm-domain)
-    bili antigravity                      # launch Antigravity CLI (agy) through the proxy (CLOUD_CODE_URL /bili/ rewrite of cloudcode-pa.googleapis.com)
+    bili antigravity                      # launch Antigravity CLI (agy) through the proxy (CLOUD_CODE_URL /bili/ rewrite of daily-cloudcode-pa.googleapis.com — real default upstream, #3129)
     bili mcode                            # launch MiniMax Code through the proxy (cert-MITM; provider hosts from ~/.minimax*/config.yaml or the official agent.minimax.* endpoints)
     bili aider                            # launch aider through the proxy (cert-MITM; endpoint from OPENAI_API_BASE/--openai-api-base/.aider.conf.yml or api.openai.com+api.anthropic.com by default)
     bili copilot                          # launch Copilot CLI through the proxy (cert-MITM; api.githubcopilot.com + plan subdomains whitelisted by default)

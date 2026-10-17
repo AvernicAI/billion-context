@@ -314,6 +314,15 @@ export function maybeAdoptForkBlocks(args: {
     }
 }
 
+/** Outcome of an inheritance attempt (#3351): lets the caller tell "blocks
+ *  were adopted" apart from "refs-only / nothing," so the derived-blocks gate
+ *  closes only on real block adoption — the same discipline the boot sweep
+ *  (reconcileDerivedLineage) applies, not on ref-only seeding. */
+interface AdoptionOutcome {
+    adoptedActive: number;
+    seededRefs: number;
+}
+
 /** #1486: copy-on-resume for an identified client whose resume forked a new
  *  session id (Claude Code --resume). The parent is resolved by the caller
  *  (memory first, then disk) via prefix-affinity's byte-exact full-history
@@ -330,19 +339,19 @@ export function maybeAdoptResume(args: {
     upstreamOrigin: string;
     blocksEnabled: boolean;
     log: (level: string, msg: string) => void;
-}): void {
+}): AdoptionOutcome {
     const { session, parent, sharedDepth, protocol, parsed, upstreamOrigin, blocksEnabled, log } = args;
     const incomingMsgs = incomingCoreMessages(protocol, parsed);
     if (!incomingMsgs) {
         log("info", `[resume-inheritance] ${session.id}: resumed ${parent.id} (${sharedDepth} shared msgs) but ${protocol} has no adoption support in v1; lineage recorded, refs/blocks not inherited (#1486)`);
-        return;
+        return { adoptedActive: 0, seededRefs: 0 };
     }
     const ids = new Set(incomingMsgs.map((m) => m.id));
     const plan = planForkAdoption(parent, ids, { seedAllRefs: true, includeBlocks: blocksEnabled });
     const seededRefs = Object.keys(plan.refs.byRaw).length;
     if (seededRefs === 0 && plan.adoptedActive === 0) {
         log("info", `[resume-inheritance] ${session.id}: resume of ${parent.id} had nothing to inherit (no overlapping refs${blocksEnabled ? " or fully-present blocks" : ""}); starting fresh (#1486)`);
-        return;
+        return { adoptedActive: 0, seededRefs: 0 };
     }
     applyForkAdoption(session, plan, parent);
     log(
@@ -356,6 +365,7 @@ export function maybeAdoptResume(args: {
         const n = Object.keys(storeSlice.byRef).length;
         log("info", `[resume-inheritance] ${session.id} adopted ${n} CCR content-store entr${n === 1 ? "y" : "ies"} for the inherited/cited refs from parent ${parent.id} (#1341/#1486)`);
     }
+    return { adoptedActive: plan.adoptedActive, seededRefs };
 }
 
 /** #2807: the derived (plugin-register) fork link previously recorded
@@ -365,8 +375,12 @@ export function maybeAdoptResume(args: {
  *  history while the parent's fold ledger sat on disk. Adopt the parent's
  *  fully-present blocks by message-id intersection at link time — the same
  *  copy-on-fork seeding maybeAdoptResume runs for the strong path, minus the
- *  byte-prefix requirement. Runs once per session (derivedBlocksAdopted).
- *  Gated on resumeInheritance, NOT forkAdoption: this is an identified fork
+ *  byte-prefix requirement. The call lands once per session (handle.ts gates
+ *  it on derivedFromSessionId === undefined); the derivedBlocksAdopted marker
+ *  it sets gates the BOOT reconcile, and since #3351 it is set only when blocks
+ *  were actually adopted (mirroring reconcileDerivedLineage), so a young parent
+ *  with no folds yet keeps the door open for a later retry. Gated on
+ *  resumeInheritance, NOT forkAdoption: this is an identified fork
  *  (the parent came from the plugin register), same class as the strong
  *  path; #1834/#629 reserve forkAdoption for anonymous forks, and answering
  *  to two different switches left the weak path dark while the boot-time
@@ -383,8 +397,12 @@ export function maybeAdoptDerivedFork(args: {
     const { session, parent, protocol, parsed, upstreamOrigin, enabled, log } = args;
     if (!enabled || session.metadata.derivedBlocksAdopted === true) return;
     try {
-        maybeAdoptResume({ session, parent, sharedDepth: 0, protocol, parsed, upstreamOrigin, blocksEnabled: true, log });
-        session.metadata.derivedBlocksAdopted = true;
+        const outcome = maybeAdoptResume({ session, parent, sharedDepth: 0, protocol, parsed, upstreamOrigin, blocksEnabled: true, log });
+        if (outcome.adoptedActive > 0) {
+            session.metadata.derivedBlocksAdopted = true;
+        } else {
+            log("info", `[${session.id}] [derived] no blocks adopted from ${parent.id} yet (refs-only or none fully present); leaving the gate open so the boot reconcile can retry once the parent folds (#3351)`);
+        }
     } catch (e) {
         log("warn", `[${session.id}] [derived] block adoption from ${parent.id} failed (${String(e)}); continuing fresh (#2807)`);
     }

@@ -103,7 +103,44 @@ const REQUEST_PARAM_KEYS = [
     "model", "max_tokens", "temperature", "top_p", "top_k", "stop_sequences",
     "stream", "tools", "tool_choice", "metadata", "thinking", "service_tier",
     "parallel_tool_calls",
+    // Anthropic-on-Vertex sends no `model` — `anthropic_version` replaces it in
+    // the body (`vertex-2023-10-16`, live capture 2026-10-15). Without it in
+    // this list the lane rebuilds a Vertex turn without the field the endpoint
+    // requires, so a native-extension host (pi/dsh) pointed at Vertex would
+    // 400. Kept last so the forwarded field order for every other host is
+    // unchanged.
+    "anthropic_version",
 ] as const;
+const REQUEST_PARAM_KEY_SET = new Set<string>(REQUEST_PARAM_KEYS);
+
+/** Keys the lane assembles from the payload's top level — hosts mirror the
+ *  full anthropic body as `request`, so these are by-design, not dropped. */
+const LANE_OWNED_REQUEST_KEYS = new Set(["messages", "system"]);
+
+/** #3406 item 6: warn once per conversation+key when a request param falls
+ *  outside the allowlist and is silently not forwarded. Bounded: past the
+ *  pair budget the map resets and the next epoch warns again (low-frequency
+ *  re-warn instead of unbounded memory). */
+const droppedParamWarned = new Map<string, Set<string>>();
+let droppedParamWarnPairs = 0;
+const DROPPED_PARAM_WARN_BUDGET = 4096;
+
+function warnDroppedRequestParams(conversationId: string, request: Record<string, unknown>, log: (level: string, msg: string) => void): void {
+    const fresh = Object.keys(request).filter((key) => !REQUEST_PARAM_KEY_SET.has(key) && !LANE_OWNED_REQUEST_KEYS.has(key));
+    if (fresh.length === 0) return;
+    const seen = droppedParamWarned.get(conversationId) ?? new Set<string>();
+    const unwarned = fresh.filter((key) => !seen.has(key));
+    if (unwarned.length === 0) return;
+    if (droppedParamWarnPairs + unwarned.length > DROPPED_PARAM_WARN_BUDGET) {
+        droppedParamWarned.clear();
+        droppedParamWarnPairs = 0;
+        seen.clear();
+    }
+    droppedParamWarnPairs += unwarned.length;
+    for (const key of unwarned) seen.add(key);
+    droppedParamWarned.set(conversationId, seen);
+    log("warn", `[incremental] ${conversationId}: request parameter(s) not in the forward allowlist were dropped: ${unwarned.join(", ")} — extend REQUEST_PARAM_KEYS (src/incremental-lane.ts) if they must reach the upstream (#3406)`);
+}
 
 /** Wire headers the client may contribute to the forwarded request. */
 const PASSTHROUGH_HEADERS = ["authorization", "anthropic-version", "anthropic-beta"] as const;
@@ -281,6 +318,8 @@ function applyTurn(
 export function __resetIncrementalLaneForTests(): void {
     canonicalCache.clear();
     inFlight.clear();
+    droppedParamWarned.clear();
+    droppedParamWarnPairs = 0;
 }
 
 /** Marker header native extensions stamp on an ordinary model request to
@@ -358,6 +397,7 @@ export async function handleIncrementalTurn(
     const model = typeof payload.model === "string" && payload.model.length > 0 ? payload.model : pluginReportedModel(req.headers);
     const forwarded: Record<string, unknown> = {};
     for (const key of REQUEST_PARAM_KEYS) if (key in request) forwarded[key] = request[key];
+    warnDroppedRequestParams(conversationId, request, log);
     if (typeof model === "string" && model.length > 0) forwarded.model = model;
     if (typeof forwarded.model !== "string" || forwarded.model.length === 0) return jsonReply(res, 400, { error: "request.model is required" });
     if (!Array.isArray(payload.messages)) return jsonReply(res, 400, { error: "messages must be an array (seed: full history; delta: everything after sinceSeq; empty allowed for a pure sticky-system update)" });
@@ -431,17 +471,32 @@ export async function handleIncrementalTurn(
             method: "POST",
             url: path,
             headers,
-            socket: { localPort: (req.socket as { localPort?: number } | undefined)?.localPort, remoteAddress: "127.0.0.1", destroy: (): void => { synthetic.destroy?.(); } },
+            // #3343: the REAL caller's socket object — never a forged or
+            // field-copied loopback one (a `?? "127.0.0.1"` fallback would
+            // re-forge peers whose address is undefined, e.g. unix sockets).
+            // Every downstream gate (admin plane, tunnel admission,
+            // provenance) must judge the actual peer; loopback topology is
+            // unchanged (real == 127.0.0.1), a non-loopback peer degrades to
+            // ordinary model traffic and can no longer ride onto the
+            // management plane.
+            socket: req.socket,
         });
 
-        // Ack header: inject ahead of whatever status the pipeline writes.
+        // Ack header: stamped ONLY on 2xx — a non-2xx response means the turn
+        // did not land, and a host trusting the ack unconditionally would skip
+        // its resend and lose the user's message (#3344). In-repo clients gate
+        // on 200 already, so this tightens the contract rather than changing
+        // any live behavior.
         const appliedSeq = applied.appliedSeq;
         const originalWriteHead = res.writeHead.bind(res) as (...args: never[]) => ReturnType<typeof res.writeHead>;
         (res as { writeHead?: unknown }).writeHead = (...args: unknown[]) => {
-            try {
-                res.setHeader("x-bili-applied-seq", String(appliedSeq));
-            } catch {
-                // header injection is best-effort; the seq is also in the log line
+            const status = typeof args[0] === "number" ? args[0] : 200;
+            if (status >= 200 && status < 300) {
+                try {
+                    res.setHeader("x-bili-applied-seq", String(appliedSeq));
+                } catch {
+                    // header injection is best-effort; the seq is also in the log line
+                }
             }
             return (originalWriteHead as (...a: unknown[]) => ReturnType<typeof res.writeHead>)(...args);
         };

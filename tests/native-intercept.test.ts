@@ -408,6 +408,44 @@ test("install: TypeError triggers one respawn + retry", async () => {
     }
 });
 
+test("install: onResponse carries THIS dispatch's outgoing headers, per request (#3329)", async () => {
+    const seen: Array<{ url: string; headers?: Record<string, string> }> = [];
+    let n = 0;
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        beforeSend: async (_url, init) => {
+            // Stamp a per-request correlation id, exactly like the
+            // incremental adapters do.
+            n += 1;
+            if (init !== undefined) {
+                const h = new Headers(init.headers);
+                h.set("x-bili-turn-id", `t-${n}`);
+                init.headers = h;
+            }
+        },
+        onResponse: (url, _resp, headers) => { seen.push({ url, headers }); },
+    };
+    await withPatchRecording(state, async (fetch) => {
+        // Two dispatches on the SAME provider URL (string + init shape — the
+        // dsh/omp lanes): each must get back its OWN stamped headers.
+        await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+        await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", headers: { "content-type": "application/json", "x-extra": "second" }, body: "{}" });
+        // Request-object shape (the opencode lane): the host stamps the
+        // correlation id onto the Request itself before fetch.
+        const req = new Request("http://127.0.0.1:8199/v1/messages", { method: "POST", headers: { "x-req": "r", "x-bili-turn-id": "t-pre" }, body: "{}" });
+        await fetch(req);
+    });
+    assert.equal(seen.length, 3, "onResponse fired once per dispatch");
+    for (const s of seen) assert.equal(s.url, "http://127.0.0.1:8199/v1/messages", "host-requested url stays the key context");
+    assert.equal(seen[0].headers?.["x-bili-turn-id"], "t-1");
+    assert.equal(seen[0].headers?.["content-type"], "application/json", "original outgoing headers ride along");
+    assert.equal(seen[1].headers?.["x-bili-turn-id"], "t-2", "the second same-URL response carries the second dispatch's id, not the first's");
+    assert.equal(seen[1].headers?.["x-extra"], "second");
+    assert.equal(seen[2].headers?.["x-bili-turn-id"], "t-pre", "Request-object inputs carry their own pre-stamped id through the rewrite");
+    assert.equal(seen[2].headers?.["x-req"], "r");
+});
+
 test("install: second install is a no-op while active", async () => {
     const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") };
     const saved = globalThis.fetch;

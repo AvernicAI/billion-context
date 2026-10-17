@@ -39,7 +39,7 @@ interface Harness {
     close: () => Promise<void>;
 }
 
-async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?: number } = {}): Promise<Harness> {
+async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?: number; upstreamStatus?: number } = {}): Promise<Harness> {
     const dir = mkdtempSync(join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     process.env.BILI_STORAGE_UNIFIED = storageMode === "full" ? "full" : "legacy";
@@ -57,7 +57,7 @@ async function harness(storageMode: "full" | "legacy", opts: { upstreamDelayMs?:
         req.on("end", () => {
             forwarded.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
             const reply = (): void => {
-                res.writeHead(200, { "content-type": "application/json" });
+                res.writeHead(opts.upstreamStatus ?? 200, { "content-type": "application/json" });
                 res.end(JSON.stringify({ id: "msg_test", role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input_tokens: 10000, output_tokens: 10 } }));
             };
             if (opts.upstreamDelayMs) setTimeout(reply, opts.upstreamDelayMs);
@@ -129,6 +129,19 @@ test("incremental lane: seed → delta → upstream receives the assembled full 
         const upstream2 = h.forwarded.at(-1) as { messages: { role: string }[] };
         assert.equal(upstream2.messages.length, 3, "assembled history = seed + delta");
         assert.deepEqual(upstream2.messages.map((m) => m.role), ["user", "assistant", "user"]);
+    } finally {
+        await h.close();
+    }
+});
+
+test("incremental lane: a failed turn (non-2xx) carries NO x-bili-applied-seq (#3344)", async () => {
+    const h = await harness("full", { upstreamStatus: 500 });
+    try {
+        const failed = await h.turn({ sinceSeq: 0, messages: [userTurn(1)] });
+        assert.ok(failed.status >= 400, `expected a non-2xx failure from the failing upstream, got ${failed.status}`);
+        // The ack must not ride a failure: a host trusting it unconditionally
+        // would skip its resend and lose the user's message (#3344).
+        assert.equal(failed.headers.get("x-bili-applied-seq"), null);
     } finally {
         await h.close();
     }
@@ -266,6 +279,25 @@ test("incremental lane: request params (tools/max_tokens) ride the assembled bod
         await h.turn({ sinceSeq: 1, request: { max_tokens: 512, messages: [{ role: "user", content: "smuggled" }] } as never, messages: [assistantTurn(1), userTurn(2)] });
         const upstream2 = h.forwarded.at(-1) as { messages: { role: string }[] };
         assert.equal(upstream2.messages.length, 3, "request.messages is ignored — the lane owns the message list");
+    } finally {
+        await h.close();
+    }
+});
+
+test("incremental lane: a Vertex turn keeps anthropic_version and still drops an unlisted field", async () => {
+    const h = await harness("full");
+    try {
+        // Anthropic-on-Vertex has no `model` in the body — `anthropic_version`
+        // carries the wire revision instead (live capture 2026-10-15). The
+        // allowlist is the only thing that could drop it on the way out.
+        await h.turn({ sinceSeq: 0, request: { anthropic_version: "vertex-2023-10-16" }, messages: [userTurn(1)] });
+        const upstream = h.forwarded.at(-1) as { anthropic_version?: string; smuggled?: unknown };
+        assert.equal(upstream.anthropic_version, "vertex-2023-10-16");
+        // The allowlist is still a whitelist: an unlisted key must not ride.
+        await h.turn({ sinceSeq: 1, request: { anthropic_version: "vertex-2023-10-16", smuggled: true } as never, messages: [assistantTurn(1), userTurn(2)] });
+        const upstream2 = h.forwarded.at(-1) as { anthropic_version?: string; smuggled?: unknown };
+        assert.equal(upstream2.anthropic_version, "vertex-2023-10-16");
+        assert.equal(upstream2.smuggled, undefined);
     } finally {
         await h.close();
     }
