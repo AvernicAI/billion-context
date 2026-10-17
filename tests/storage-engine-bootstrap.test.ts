@@ -9,8 +9,11 @@
  *                      verify, minimal-tarball extract, cache layout, loader
  *                      registration driving a real open), cache hit (zero
  *                      re-fetch), integrity mismatch (quarantine + cooldown),
- *                      cooldown skip + expiry, offline fail-safe, disabled
- *                      knob, legacy-mode short-circuit, unsupported platform.
+ *                      cooldown skip + expiry, multi-mirror fallthrough
+ *                      (#3489 A: candidate resolution matrix, first-mirror
+ *                      failure, all-fail cooldown, per-source sha gate),
+ *                      offline fail-safe, disabled knob, legacy-mode
+ *                      short-circuit, unsupported platform.
  *   EXTRACTOR        — include filtering, required-file validation, path
  *                      traversal rejection, symlink rejection, non-gzip input.
  *   KNOB             — BILI_SQLITE_AUTO_DOWNLOAD > storage.sqliteAutoDownload
@@ -45,9 +48,11 @@ import {
     ensureSqliteEngine,
     extractTgzToDir,
     platformTargetKey,
+    registryDownloadCandidates,
     resetEngineBootstrapForTests,
     setBootstrapTimeoutMsForTests,
     setEngineBootstrapSpecForTests,
+    setMirrorChainForTests,
     setPlatformKeyForTests,
     type BootstrapOutcome,
 } from "../src/storage/engine-bootstrap.ts";
@@ -203,6 +208,7 @@ function resetAllSeams(): void {
     setEngineBootstrapSpecForTests(null);
     setPlatformKeyForTests(null);
     setBootstrapTimeoutMsForTests(null);
+    setMirrorChainForTests(null);
     resetEngineBootstrapForTests();
 }
 
@@ -496,6 +502,140 @@ test("bootstrap: a slow-but-completing download succeeds once the budget covers 
     } finally {
         await reg?.close();
         resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// MULTI-MIRROR FALLTHROUGH (#3489 A)
+// ---------------------------------------------------------------------------
+
+function saveRegistryEnv(): string | undefined {
+    return process.env.BILI_UPDATE_REGISTRY;
+}
+
+function restoreRegistryEnv(prev: string | undefined): void {
+    if (prev === undefined) delete process.env.BILI_UPDATE_REGISTRY;
+    else process.env.BILI_UPDATE_REGISTRY = prev;
+}
+
+test("bootstrap: registry candidates — explicit non-default exclusive, unset walks the public chain (#3489 A)", () => {
+    const prev = saveRegistryEnv();
+    try {
+        resetAllSeams();
+        delete process.env.BILI_UPDATE_REGISTRY;
+        assert.deepEqual(registryDownloadCandidates(), ["https://registry.npmjs.org", "https://registry.npmmirror.com"], "unset -> full public chain");
+        process.env.BILI_UPDATE_REGISTRY = "https://registry.npmjs.org/";
+        assert.deepEqual(registryDownloadCandidates(), ["https://registry.npmjs.org", "https://registry.npmmirror.com"], "explicit primary (trailing slash normalized) -> same chain");
+        process.env.BILI_UPDATE_REGISTRY = "https://registry.npmmirror.com";
+        assert.deepEqual(registryDownloadCandidates(), ["https://registry.npmmirror.com"], "explicit secondary -> starts there, no earlier hop");
+        process.env.BILI_UPDATE_REGISTRY = "http://verdaccio.corp.example:4873";
+        assert.deepEqual(registryDownloadCandidates(), ["http://verdaccio.corp.example:4873"], "corporate registry stays exclusive");
+    } finally {
+        restoreRegistryEnv(prev);
+        resetAllSeams();
+    }
+});
+
+test("bootstrap: first-mirror failure falls through to the next mirror and succeeds (#3489 A)", async () => {
+    const cachePrev = isolateCache();
+    const regPrev = saveRegistryEnv();
+    let regA: MockRegistry | null = null;
+    let regB: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        delete process.env.BILI_UPDATE_REGISTRY;
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        regA = await startMockRegistry(tgz, 503);
+        regB = await startMockRegistry(tgz);
+        setMirrorChainForTests([regA.base, regB.base]);
+        const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+        assert.equal(out.status, "downloaded", `expected fallback download, got ${JSON.stringify(out)}`);
+        assert.equal(regA.requests(), 1, "primary attempted once");
+        assert.equal(regB.requests(), 1, "fallback served the artifact");
+        assert.ok(fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-13.0.3", "package.json")), "fallback materialized the cache");
+        assert.ok(!fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", ".bootstrap-failed.json")), "success must not arm the cooldown");
+    } finally {
+        await regA?.close();
+        await regB?.close();
+        resetAllSeams();
+        restoreRegistryEnv(regPrev);
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+test("bootstrap: all mirrors failing arms the cooldown and names every source tried (#3489 A)", async () => {
+    const cachePrev = isolateCache();
+    const regPrev = saveRegistryEnv();
+    let regA: MockRegistry | null = null;
+    let regB: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        delete process.env.BILI_UPDATE_REGISTRY;
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        regA = await startMockRegistry(tgz, 503);
+        regB = await startMockRegistry(tgz, 503);
+        setMirrorChainForTests([regA.base, regB.base]);
+        const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+        assert.equal(out.status, "failed", `expected all-mirrors failure, got ${JSON.stringify(out)}`);
+        const detail = out.detail ?? "";
+        assert.ok(detail.includes(regA!.base), `detail names the first source: ${detail}`);
+        assert.ok(detail.includes(regB!.base), `detail names the second source: ${detail}`);
+        assert.match(detail, /HTTP 503/, "detail carries the per-source error");
+        const markerPath = path.join(cachePrev, "billion-context", "sqlite", ".bootstrap-failed.json");
+        assert.ok(fs.existsSync(markerPath), "all-fail arms the cooldown");
+        const marker = JSON.parse(fs.readFileSync(markerPath, "utf8")) as { reason?: string };
+        assert.ok((marker.reason ?? "").includes(regA!.base) && (marker.reason ?? "").includes(regB!.base), "cooldown marker records both sources");
+
+        // Cooldown suppresses further attempts on BOTH sources.
+        resetEngineBootstrapForTests();
+        const out2 = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+        assert.equal(out2.status, "cooldown");
+        assert.equal(regA.requests(), 1, "cooldown must not re-hit the first mirror");
+        assert.equal(regB.requests(), 1, "cooldown must not re-hit the second mirror");
+    } finally {
+        await regA?.close();
+        await regB?.close();
+        resetAllSeams();
+        restoreRegistryEnv(regPrev);
+        restoreCache(cachePrev);
+        rmrf(cachePrev);
+    }
+});
+
+test("bootstrap: sha512 mismatch on the first mirror quarantines it; the next mirror still serves (#3489 A)", async () => {
+    const cachePrev = isolateCache();
+    const regPrev = saveRegistryEnv();
+    let regA: MockRegistry | null = null;
+    let regB: MockRegistry | null = null;
+    try {
+        resetAllSeams();
+        delete process.env.BILI_UPDATE_REGISTRY;
+        const good = fakePackageTgz();
+        const tampered = Buffer.from(good);
+        tampered[tampered.length - 1] ^= 0xff;
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(good) });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        regA = await startMockRegistry(tampered);
+        regB = await startMockRegistry(good);
+        setMirrorChainForTests([regA.base, regB.base]);
+        const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+        assert.equal(out.status, "downloaded", `expected fallback after integrity rejection, got ${JSON.stringify(out)}`);
+        assert.equal(regA.requests(), 1, "tampered primary attempted once");
+        assert.equal(regB.requests(), 1, "healthy fallback served the artifact");
+        assert.ok(fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", "better-sqlite3-13.0.3", "package.json")), "cache holds the verified bytes only");
+        assert.ok(!fs.existsSync(path.join(cachePrev, "billion-context", "sqlite", ".bootstrap-failed.json")), "success must not arm the cooldown");
+    } finally {
+        await regA?.close();
+        await regB?.close();
+        resetAllSeams();
+        restoreRegistryEnv(regPrev);
         restoreCache(cachePrev);
         rmrf(cachePrev);
     }

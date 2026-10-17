@@ -16,8 +16,11 @@
  * platform/arch combinations INSIDE its npm tarball (no install script, no
  * per-ABI split — N-API is ABI-stable across Node versions). We pin version +
  * sha512 in-repo; bumping either is a human-visible PR. Download egress honors
- * the same proxy decision chain as model traffic (#609) and the configured
- * registry mirror (BILI_UPDATE_REGISTRY / update.registry).
+ * the same proxy decision chain as model traffic (#609). Registry choice
+ * (#3489): an explicitly configured mirror (BILI_UPDATE_REGISTRY /
+ * update.registry) is used EXCLUSIVELY — corporate egress must not silently
+ * fall through to public registries; the unset/default case walks the built-in
+ * public chain npmjs -> npmmirror, each source under its own timeout budget.
  *
  * Failure policy: every path is fail-safe — offline, integrity mismatch,
  * unsupported platform, disk errors all degrade to "no self-downloaded
@@ -103,6 +106,29 @@ let bootstrapTimeoutOverrideMs: number | null = null;
 /** Test seam: override the whole-download timeout (null = production value). */
 export function setBootstrapTimeoutMsForTests(ms: number | null): void {
     bootstrapTimeoutOverrideMs = ms;
+}
+
+// Public mirror chain for the unset/default registry case (#3489 A): primary
+// npmjs first, npmmirror as fallback. The second source adds no supply-chain
+// risk — every download is sha512-verified against the in-repo pin regardless
+// of which registry served the bytes.
+const DEFAULT_MIRROR_CHAIN: readonly string[] = ["https://registry.npmjs.org", "https://registry.npmmirror.com"];
+
+let mirrorChainOverride: readonly string[] | null = null;
+
+/** Test seam: replace the full candidate list (null = production resolution). */
+export function setMirrorChainForTests(chain: readonly string[] | null): void {
+    mirrorChainOverride = chain;
+}
+
+/** Ordered download candidates (#3489 A). An explicitly configured non-default
+ *  registry is used EXCLUSIVELY (no silent public fallthrough); a value that
+ *  matches a chain member starts the chain at that member (unset == index 0). */
+export function registryDownloadCandidates(): string[] {
+    if (mirrorChainOverride) return [...mirrorChainOverride];
+    const configured = normalizeRegistryBase(updateRegistryBase());
+    const idx = DEFAULT_MIRROR_CHAIN.indexOf(configured);
+    return idx === -1 ? [configured] : DEFAULT_MIRROR_CHAIN.slice(idx);
 }
 
 function activeSpec(): EngineBootstrapSpec {
@@ -237,9 +263,10 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
         loggerLog("debug", `[storage] sqlite engine self-bootstrap in cooldown (${cd.reason}); skipping`);
         return { status: "cooldown", detail: cd.reason };
     }
-    loggerLog("info", `[storage] sqlite engine self-bootstrap: downloading better-sqlite3@${spec.version} (~11 MB) ${registryBaseFor(spec)} ...`);
+    const candidates = registryDownloadCandidates();
+    loggerLog("info", `[storage] sqlite engine self-bootstrap: downloading better-sqlite3@${spec.version} (~11 MB) from ${candidates.join(" -> ")} ...`);
     try {
-        await downloadAndInstall(spec, target, opts.resolveProxy);
+        await downloadAndInstall(spec, target, candidates, opts.resolveProxy);
         if (!tryRegisterFromCache(finalDir(spec.version))) {
             loggerLog("warn", `[storage] sqlite engine self-bootstrap: cached copy present but unloadable — continuing without it`);
         }
@@ -253,10 +280,6 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
         loggerLog("warn", `[storage] sqlite engine self-bootstrap failed (${reason}) — continuing without a self-downloaded engine; retrying after ${COOLDOWN_MS / 3_600_000}h`);
         return { status: "failed", detail: reason };
     }
-}
-
-function registryBaseFor(spec: EngineBootstrapSpec): string {
-    return normalizeRegistryBase(updateRegistryBase());
 }
 
 function tryRegisterFromCache(dir: string): boolean {
@@ -287,8 +310,25 @@ async function pruneSiblingVersions(keepDir: string): Promise<void> {
 // Download + verify + extract
 // ---------------------------------------------------------------------------
 
-async function downloadAndInstall(spec: EngineBootstrapSpec, target: string, resolveProxy?: (url: string) => string | undefined): Promise<void> {
-    const base = registryBaseFor(spec);
+async function downloadAndInstall(spec: EngineBootstrapSpec, target: string, candidates: string[], resolveProxy?: (url: string) => string | undefined): Promise<void> {
+    const failures: string[] = [];
+    for (const base of candidates) {
+        try {
+            await fetchAndInstallFrom(base, spec, target, resolveProxy);
+            return;
+        } catch (err) {
+            // Per-source failure (timeout/refused/HTTP error/sha512 mismatch):
+            // record it and let the next candidate retry; only an ALL-sources
+            // failure arms the 6h cooldown upstream.
+            const msg = err instanceof Error ? err.message : String(err);
+            failures.push(`${base}: ${msg}`);
+            loggerLog("info", `[storage] sqlite engine self-bootstrap: ${base} failed (${msg})${failures.length < candidates.length ? "; trying next mirror" : ""}`);
+        }
+    }
+    throw new Error(failures.join(" | "));
+}
+
+async function fetchAndInstallFrom(base: string, spec: EngineBootstrapSpec, target: string, resolveProxy?: (url: string) => string | undefined): Promise<void> {
     const url = `${base}/better-sqlite3/-/better-sqlite3-${spec.version}.tgz`;
     const root = cacheRoot();
     await fsp.mkdir(root, { recursive: true });
