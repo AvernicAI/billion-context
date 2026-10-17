@@ -1279,6 +1279,16 @@ export class SessionStore {
         return this.shadow !== undefined && !this.shadow.stats.disabled;
     }
 
+    /** #3463 step 1: GC parity for the file sweep — remove this session's
+     *  unified index rows (releasing its CAS refcounts) when its legacy file
+     *  is deleted. Best-effort by contract, exactly like removeLegacyFile:
+     *  no-op without a live sidecar; on failure the sidecar logs and the file
+     *  sweep proceeds. Order is index-first-then-file so a failed file rm
+     *  self-heals on the next sweep (rows already gone, retry is a no-op). */
+    removeUnifiedSession(id: string): void {
+        this.shadow?.remove(id);
+    }
+
     /** #3248: raw canonical history rows (core-form message JSON, seq
      *  order) from the unified messages table. Shadow AND full both qualify —
      *  the shadow sidecar ingests the raw tail on every save (#3007 rawTail +
@@ -1387,6 +1397,7 @@ export class SessionStore {
     deleteKv(namespace: string, key?: string): number {
         return this.liveShadow().deleteKv(namespace, key);
     }
+
     private liveShadow(): UnifiedShadow {
         if (!this.replicasAvailable()) throw new Error("[storage] replicas require the unified store (storage.unified=shadow|full or BILI_STORAGE_UNIFIED); this instance runs legacy-only");
         return this.shadow as UnifiedShadow;
