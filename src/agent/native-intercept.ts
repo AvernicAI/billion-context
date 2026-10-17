@@ -70,7 +70,7 @@ export interface NativeInterceptState {
      *  the request init (body) and may spend async time; wire-mode requests
      *  (headersFor returns nothing) still pass through it — the hook itself
      *  gates on its own conditions. */
-     beforeSend?: (url: string, init: RequestInit | undefined) => Promise<void>;
+    beforeSend?: (url: string, init: RequestInit | undefined) => Promise<void>;
     /** #3304: consulted at EVERY exit that sends a model request DIRECT —
      *  proxy death (give-up), bootstrap failure, unattributed passthrough.
      *  Lane adapters arm it to restore the ORIGINAL payload when they
