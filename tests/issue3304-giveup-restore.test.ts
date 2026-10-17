@@ -234,6 +234,32 @@ test("#3304 bootstrap-failure exit: pre-swapped (opencode shape) request restore
     assert.equal(upstream[0].headerRecord[MARKER], undefined);
 });
 
+test("#3304 unattributed gate-fail exit: pre-swapped (opencode shape) request restores", async () => {
+    // Same shape as the bootstrap failure, but the origin IS up and the
+    // attribution gate refuses the caller — the third direct-send exit that
+    // can carry a pre-swapped envelope (opencode swaps before fetch).
+    const originals = new WeakMap<object, { body: string; headers: Headers }>();
+    const state: Record<string, unknown> = {
+        origin: DEAD_ORIGIN,
+        ready: Promise.resolve(DEAD_ORIGIN),
+        takeoverGate: async () => false,
+        directGuard: (url: string, _input: string | URL | Request, guardInit?: RequestInit) => {
+            if (guardInit === undefined) return undefined;
+            const orig = originals.get(guardInit);
+            if (orig === undefined) return undefined;
+            originals.delete(guardInit);
+            return { input: url, init: { ...guardInit, method: "POST", body: orig.body, headers: orig.headers } };
+        },
+    };
+    const init: RequestInit = { method: "POST", headers: { authorization: "Bearer sk-unattr", [MARKER]: "1" }, body: ENVELOPE_BODY };
+    originals.set(init, { body: ORIGINAL_BODY, headers: new Headers({ authorization: "Bearer sk-unattr" }) });
+    const { proxy, upstream } = await withIntercept(state, async () => globalThis.fetch(UPSTREAM_URL, init));
+    assert.equal(proxy.length, 0, "the gate refused attribution — nothing rode the proxy");
+    assert.equal(upstream.length, 1);
+    assert.equal(upstream[0].bodyText, ORIGINAL_BODY);
+    assert.equal(upstream[0].headerRecord[MARKER], undefined);
+});
+
 // --- lane level: the real adapters' capture + armed guards -----------------
 
 async function fakeLane(enabled: boolean): Promise<{ base: string; close: () => Promise<void> }> {
