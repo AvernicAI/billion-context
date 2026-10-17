@@ -38,7 +38,7 @@ const HOST_ID_PATTERN = /^[\x21-\x7e]+$/;
 export const HOST_ID_MAX_ENTRY_LEN = 1024;
 export const HOST_ID_MAX_ENTRIES = 10_000;
 
-export interface HostIdExtract {
+interface HostIdExtract {
     /** Validated wire-aligned host ids (null = that wire message carries no
      *  id), or null when the field was absent or malformed. */
     ids: (string | null)[] | null;
