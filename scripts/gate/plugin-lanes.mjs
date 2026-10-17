@@ -490,13 +490,9 @@ const RECIPES = {
       const dshHome = path.join(ctx.laneDir, "dsh-home");
       const profile = path.join(dshHome, "profiles", "headless");
       fs.mkdirSync(path.join(profile, "node_modules"), { recursive: true });
-      // Install the candidate WITH its runtime deps — NOT a bare copy. Since
-      // #3425 (jimp image downscale) dist/index.js imports "zod" at module
-      // load, so a bare cpSync of the package alone leaves the self-spawned
-      // proxy dying with ERR_MODULE_NOT_FOUND and the lane silently goes
-      // direct (uncompressed) — caught as 8 red assertions in the 94e0fe04
-      // run. --no-save keeps the dsh profile manifest pristine.
-      must("npm", ["install", "--prefix", profile, "--no-audit", "--no-fund", "--no-save", TGZ], { timeout: 300_000 });
+      // candidate as a REAL copy in the profile (e2e-native-dsh.test.ts shape;
+      // bundles @deepseek-ai/dsh-base/-headless resolve from the dsh install)
+      fs.cpSync(ctx.cand, path.join(profile, "node_modules", "billion-context"), { recursive: true });
       const pkg = {
         name: "dsh-profile-plugin-gate", private: true,
         dependencies: { "billion-context": ctx.candV },
