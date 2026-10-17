@@ -170,7 +170,7 @@ export function incrementalWireHash(m: IncrementalWireMessage): string {
  *  turns — null when the lane only has a cold/table view (restart, LRU
  *  eviction, foreign rawTail rows): a null or mismatched boundary is NEVER
  *  adoptable; the caller must decline and re-sync. */
-export interface IncrementalReceipt {
+interface IncrementalReceipt {
     appliedSeq: number;
     boundary: string | null;
 }
