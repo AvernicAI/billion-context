@@ -24,11 +24,11 @@ export type GateVerdict = boolean | "refuse-oversized";
 
 /** #3304: a (input, init) pair ready for a direct send — either the host's
  *  original pair or a lane-restored one carrying the ORIGINAL payload. */
-export type DirectSendPair = { input: string | URL | Request; init?: RequestInit };
+type DirectSendPair = { input: string | URL | Request; init?: RequestInit };
 
 /** #3304: directGuard verdicts — replace the outgoing pair, refuse locally,
  *  or leave it untouched (nothing was swapped). */
-export type DirectGuardVerdict = DirectSendPair | "refuse" | undefined;
+type DirectGuardVerdict = DirectSendPair | "refuse" | undefined;
 
 export interface NativeInterceptState {
     /** Proxy origin ("http://127.0.0.1:PORT") once the bootstrap resolved.
