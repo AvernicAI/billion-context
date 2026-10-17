@@ -1398,6 +1398,13 @@ export class SessionStore {
         return this.liveShadow().deleteKv(namespace, key);
     }
 
+    /** #3463 step 1: manual storage-GC pass against the unified store
+     *  (refcount reconcile + zero-ref reclaim + optional VACUUM). Throws like
+     *  liveShadow() when legacy-only so the HTTP layer can 501. */
+    storageGc(opts: { fix?: boolean; vacuum?: boolean }): import("./storage/store.js").StorageGcReport {
+        return this.liveShadow().runGc(opts);
+    }
+
     private liveShadow(): UnifiedShadow {
         if (!this.replicasAvailable()) throw new Error("[storage] replicas require the unified store (storage.unified=shadow|full or BILI_STORAGE_UNIFIED); this instance runs legacy-only");
         return this.shadow as UnifiedShadow;
