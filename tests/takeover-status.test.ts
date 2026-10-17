@@ -114,15 +114,20 @@ describe("takeoverStatusWire (#3582)", () => {
     it("selects the requested agent explicitly, else the freshest overall", () => {
         _recordTakeoverStatusAt("omp", report({ state: "none" }), T0);
         _recordTakeoverStatusAt("dsh", report({ state: "threw" }), T0 + 1000);
-        assert.equal(takeoverStatusWire("omp")?.state, "none");
-        assert.equal(takeoverStatusWire("dsh")?.state, "threw");
-        assert.equal(takeoverStatusWire()?.agent, "dsh");
+        // Explicit `now` inside the staleness window: the default now=Date.now()
+        // would backdate the fixed T0 records into `stale`/`unknown` (time-bomb).
+        const now = T0 + 2000;
+        assert.equal(takeoverStatusWire("omp", now)?.state, "none");
+        assert.equal(takeoverStatusWire("dsh", now)?.state, "threw");
+        assert.equal(takeoverStatusWire(undefined, now)?.agent, "dsh");
     });
 
     it("replaces an agent's prior report rather than stacking it", () => {
         _recordTakeoverStatusAt("dsh", report({ state: "threw", refusals: 1 }), T0);
         _recordTakeoverStatusAt("dsh", report({ state: "ok", refusals: 0 }), T0 + 5000);
-        const w = takeoverStatusWire("dsh");
+        // Explicit `now` = the latest ingest timestamp keeps the entry fresh
+        // (default now=Date.now() would mark the fixed-T0 record stale).
+        const w = takeoverStatusWire("dsh", T0 + 5000);
         assert.equal(w?.state, "ok");
         assert.equal(w?.refusals, 0);
     });
