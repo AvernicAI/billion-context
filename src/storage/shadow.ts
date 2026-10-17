@@ -27,7 +27,7 @@ import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode
 import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
-import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
+import { nodeSqliteUpgradeHint, type SqliteEngineName, type SqliteEngineSource } from "./driver.ts";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 export const MAX_CONSECUTIVE_FAILURES = 3;
@@ -97,7 +97,7 @@ export class UnifiedShadow {
             // blobs (#2671 Phase 2) — destructive recovery is operator policy.
             loggerLog(
                 "warn",
-                `[storage] unified sidecar failed to open ${dir}/index.db (${String(err)}) — staying legacy-only; delete the file to reset the index`,
+                `[storage] unified sidecar failed to open ${dir}/index.db (${String(err)}) — staying legacy-only; delete the file to reset the index${/no SQLite engine available/i.test(String(err)) ? nodeSqliteUpgradeHint() : ""}`,
             );
             recordSidecarOpenFailure(String(err));
             return null;

@@ -27,8 +27,9 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { probeBuiltinSqlite, probeHostBetterSqlite3, setPreferredSqliteEngineForTests, setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
-import { _resetStorageRuntimeStatusForTest, recordEngineBootstrap } from "../src/storage/runtime-status.ts";
+import { nodeSqliteUpgradeHint, probeBuiltinSqlite, probeHostBetterSqlite3, setPreferredSqliteEngineForTests, setSqliteEnginesUnavailableForTests, setSqliteProbeOverridesForTests } from "../src/storage/driver.ts";
+import { _resetStorageRuntimeStatusForTest, recordEngineBootstrap, recordSidecarOpenFailure, storageStatusWire } from "../src/storage/runtime-status.ts";
+import { setLogCapture } from "../src/logger.ts";
 import { renderPage } from "../src/web/page.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
 import { VERSION } from "../src/version.ts";
@@ -209,6 +210,54 @@ test("#3040 forced none-engine: status+overview report degraded; diagnostics blo
             await close(proxy);
         }
     } finally {
+        resetSeams();
+        store?.closeQuietly();
+        rmrf(base);
+        restoreEnv(snap);
+    }
+});
+
+test("#3489 B: no-engine degrade output carries the Node-upgrade hint only while this Node lacks builtin node:sqlite", () => {
+    const snap = saveEnv();
+    const base = mkdtempSync(path.join(tmpdir(), "bili-storage-hint-"));
+    let store: SessionStore | null = null;
+    const warns: string[] = [];
+    try {
+        isolate(base);
+        resetSeams();
+        delete process.env.BILI_STORAGE_UNIFIED;
+        delete process.env.BILI_ENCRYPTION_KEY;
+        setLogCapture((level, msg) => { if (level === "warn") warns.push(msg); });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        setSqliteEnginesUnavailableForTests(true);
+        recordEngineBootstrap({ status: "failed", detail: "ECONNREFUSED registry.npmjs.org" });
+        store = new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true });
+
+        assert.ok(nodeSqliteUpgradeHint() !== "", "hint non-empty while the builtin is absent");
+
+        // wire surface: the shared diagnostics/web degrade reason carries the hint
+        const w = storageStatusWire();
+        assert.equal(w.degraded, true);
+        assert.match(w.reason ?? "", /no SQLite engine available/);
+        assert.ok((w.reason ?? "").includes("upgrade to a newer Node.js"), "degrade reason carries the Node-upgrade hint");
+
+        // log surface: the repeated [storage] warn line carries it too
+        assert.ok(
+            warns.some((l) => l.includes("staying legacy-only") && l.includes("upgrade to a newer Node.js")),
+            "sidecar open-failure warn carries the Node-upgrade hint",
+        );
+
+        // builtin present → the hint disappears (no noise where it does not apply)
+        setSqliteProbeOverridesForTests({ builtin: true, host: false });
+        _resetStorageRuntimeStatusForTest();
+        recordSidecarOpenFailure("no SQLite engine available");
+        const w2 = storageStatusWire();
+        assert.equal(w2.degraded, true);
+        assert.match(w2.reason ?? "", /no SQLite engine available/);
+        assert.ok(!(w2.reason ?? "").includes("upgrade to a newer Node.js"), "no hint once the builtin exists");
+    } finally {
+        setLogCapture(null);
+        setSqliteProbeOverridesForTests(null);
         resetSeams();
         store?.closeQuietly();
         rmrf(base);

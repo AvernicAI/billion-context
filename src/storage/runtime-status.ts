@@ -23,6 +23,7 @@
  * raise the degraded warning.
  */
 
+import { nodeSqliteUpgradeHint } from "./driver.js";
 import type { BootstrapOutcome, CooldownMarker } from "./engine-bootstrap.js";
 import { COOLDOWN_MS, readBootstrapFailureMarker } from "./engine-bootstrap.js";
 import { fileStorageAutoDownload, fileStorageJsonWriter, fileStorageUnified, fileStorageWalJournalSizeLimit, resolveStorageMode } from "../knobs.js";
@@ -74,6 +75,11 @@ function shortenError(err: string): string {
     return oneLine.length > 160 ? `${oneLine.slice(0, 157)}...` : oneLine;
 }
 
+// #3489 B: when the running Node lacks a usable builtin node:sqlite, the
+// no-engine reason gains an upgrade hint (nodeSqliteUpgradeHint() returns ""
+// on Nodes where the builtin exists, keeping their output byte-identical).
+const NO_ENGINE_DEGRADE_REASON = "no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)";
+
 function degradeReason(): string {
     const sidecar = state.sidecar;
     if (sidecar && sidecar.stats.disabled) {
@@ -85,7 +91,7 @@ function degradeReason(): string {
         // The driver's no-engine error surfaces through the same open path —
         // say what it actually is instead of "index database failed to open".
         if (/no SQLite engine available/i.test(e)) {
-            return "no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)";
+            return NO_ENGINE_DEGRADE_REASON + nodeSqliteUpgradeHint();
         }
         return `index database failed to open (${e})`;
     }
@@ -104,7 +110,7 @@ function degradeReason(): string {
                 break;
         }
     }
-    return "no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)";
+    return NO_ENGINE_DEGRADE_REASON + nodeSqliteUpgradeHint();
 }
 
 const COOLDOWN_CACHE_MS = 30_000;

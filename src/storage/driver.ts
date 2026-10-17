@@ -183,11 +183,19 @@ export function setSqliteProbeOverridesForTests(o: { builtin?: boolean; host?: b
 export function probeBuiltinSqlite(): boolean {
     if (probeOverridesForTests?.builtin !== undefined) return probeOverridesForTests.builtin;
     try {
-        require("node:sqlite");
-        return true;
+        const mod = createRequire(import.meta.url)("node:sqlite") as { DatabaseSync?: unknown };
+        return typeof mod.DatabaseSync === "function";
     } catch {
         return false;
     }
+}
+
+/** Degrade-output hint (#3489 B): appended to the no-engine degrade surfaces
+ *  when the running Node lacks a usable built-in node:sqlite — upgrading the
+ *  runtime removes the need for a self-downloaded engine entirely. Empty when
+ *  the builtin is present (the hint would be noise there). */
+export function nodeSqliteUpgradeHint(): string {
+    return probeBuiltinSqlite() ? "" : " — hint: upgrade to a newer Node.js; recent releases ship built-in node:sqlite and skip the engine download";
 }
 
 /** Host-installed better-sqlite3 probe (#2833 step 2): opportunistic by design —
