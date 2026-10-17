@@ -29,7 +29,7 @@ import { once } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SessionStore } from "../src/persist.ts";
+import { SessionStore, getStore, _setStoreForTest } from "../src/persist.ts";
 import { UnifiedStore, type RefcountAuditReport } from "../src/storage/store.ts";
 import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { gcSessionFiles } from "../src/session-gc.ts";
@@ -357,6 +357,7 @@ test("storage gc http: non-object bodies are 400, unflagged run defaults to fix+
             releaseNotesCheck: false,
             mitm: { enabled: false, domains: [] },
         };
+        const store = getStore(); // the singleton startServer serves from (unified sidecar in dir)
         const proxy = await startServer(opts);
         if (!proxy.listening) await once(proxy, "listening");
         const base = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
@@ -377,6 +378,10 @@ test("storage gc http: non-object bodies are 400, unflagged run defaults to fix+
             assert.equal(rep.vacuum.ran, true, "unflagged run defaults to fix+vacuum ON");
         } finally {
             await new Promise<void>((resolve, reject) => proxy.close((err) => (err ? reject(err) : resolve())));
+            // The server's store keeps index.db open; on Windows unlinking an open file
+            // fails with EBUSY, so close the handle before the dir rmrf below.
+            store.closeQuietly();
+            _setStoreForTest(new SessionStore({ enabled: false }));
         }
     } finally {
         if (prevUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = prevUnified;
