@@ -518,25 +518,36 @@ test("#3444 sub-benefit fold: a round trip that saves less than its cost arms th
     const port = (server.address() as AddressInfo).port;
     process.env.E2E_SUM_KEY = "k";
 
-    // Only ~3K tokens are foldable (three small pairs); the rest of the
-    // payload is the live tail — one ~15K-token final user message that no
-    // fold may touch. The trigger sees a large expected benefit and fires;
-    // the actual pass saves ~3K < 4096 AUTO_FOLD_MIN_BENEFIT_TOKENS.
-    const giantTail = bigConversation(3) as unknown[];
-    giantTail.pop();
-    giantTail.push({ role: "user", content: [{ type: "text", text: `giant paste: ${"0123456789abcdef".repeat(3750)}` }] });
-
-    const t1 = await postRaw(port, "autofold-subbenefit", { messages: giantTail });
+    // Irreducible baseline: the ~15K-token system prompt sits above the 8192
+    // target and no fold may touch it; the only foldable content is two small
+    // pairs (~2K tokens). Turn 1 therefore fires on a large EXPECTED benefit
+    // yet saves < 4096 real tokens — the estimation-error shape behind
+    // #3444's marginal folds. A bare conversation cannot express this shape:
+    // with no protected baseline the first pass folds everything it can and
+    // the saving clears the cost bar, so the sub-benefit arm never triggers.
+    const t1 = await postRaw(port, "autofold-subbenefit", { system: BIG_SYSTEM, messages: bigConversation(2) });
     assert.equal(t1.status, 200, "turn 1 must forward");
     assert.ok(sum.bodies.length >= 1, `turn 1 dispatched the fold attempt (proves the sub-benefit path, not zero-progress), got ${sum.bodies.length}`);
     const attemptsAfterTurn1 = sum.bodies.length;
 
-    // Turn 2: identical payload, still far above the configured target. Pre-
-    // #3444 the cheap pass repeated every turn; now the under-cost result
-    // armed the 10-minute backoff, so the chain is skipped entirely.
-    const t2 = await postRaw(port, "autofold-subbenefit", { messages: giantTail });
+    // Turn 2: same baseline plus ONE fresh ~8K-token foldable pair. This pins
+    // the MECHANISM, not just the outcome: pre-#3444 turn 1 counted as
+    // progress (it saved > 0), so nothing suppressed the next trigger — the
+    // fresh content sat far above the configured target and the chain ran
+    // again, burning an external round trip for a marginal saving. With the
+    // sub-benefit backoff armed by turn 1's under-cost result, growth folding
+    // is fully suppressed for the cooldown: no repeat round trip even though
+    // new material crossed the bar. (An identical-payload turn 2 cannot
+    // distinguish the fix: the legacy zero-progress backoff arms there anyway
+    // once the foldable space is exhausted.)
+    const freshMessages = bigConversation(2) as unknown[];
+    freshMessages.pop(); // drop the trailing "final question"
+    freshMessages.push({ role: "user", content: [{ type: "text", text: `fresh doc chunk: ${"0123456789abcdef".repeat(1960)}` }] });
+    freshMessages.push({ role: "assistant", content: [{ type: "text", text: "ack fresh" }] });
+    freshMessages.push({ role: "user", content: [{ type: "text", text: "final question" }] });
+    const t2 = await postRaw(port, "autofold-subbenefit", { system: BIG_SYSTEM, messages: freshMessages });
     assert.equal(t2.status, 200, "turn 2 must forward (backoff = skip, not fail)");
-    assert.equal(sum.bodies.length, attemptsAfterTurn1, "a sub-benefit fold must arm the backoff — no repeat round trip next turn");
+    assert.equal(sum.bodies.length, attemptsAfterTurn1, "a sub-benefit fold must arm the backoff — fresh growth content must NOT re-run the chain during the cooldown");
 });
 
 // ---------------------------------------------------------------------------
