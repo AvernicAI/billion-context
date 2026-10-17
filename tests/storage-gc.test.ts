@@ -27,7 +27,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionStore } from "../src/persist.ts";
-import { UnifiedStore } from "../src/storage/store.ts";
+import { UnifiedStore, type RefcountAuditReport } from "../src/storage/store.ts";
 import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { gcSessionFiles } from "../src/session-gc.ts";
 import type { CoreMessage } from "acp-kernel";
@@ -91,7 +91,7 @@ test("storage gc: reconcile detects over-booked drift and fix restores actual co
             } finally {
                 raw.close();
             }
-            const rep = store.refcountAudit(false);
+            const rep: RefcountAuditReport = store.refcountAudit(false);
             assert.equal(rep.checked, 1);
             assert.equal(rep.overBooked, 1);
             assert.equal(rep.orphaned, 0);
