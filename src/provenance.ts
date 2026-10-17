@@ -16,7 +16,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { DSH_PACKAGE, dshProfileDirs, dshProfileDepSpec, isRegistryDepSpec } from "./dsh-channel.js";
+import { DSH_DESKTOP_PROFILE, DSH_PACKAGE, dshProfileDirs, dshProfileDepSpec, isRegistryDepSpec } from "./dsh-channel.js";
 import type { Logger } from "./logger.js";
 
 type ProvenanceFindingKind = "copy-vs-lock" | "manifest-vs-lock" | "copy-vs-manifest";
@@ -156,6 +156,15 @@ function remediation(profile: string): string {
  */
 export function dshProfileCopyFindings(profileDir: string): ProvenanceFinding[] {
     const profile = path.basename(profileDir);
+    // Desktop profile excluded by design (#3224 option A, decided in-thread): bili is
+    // the in-place writer of this one lane — after every self-update the manifest spec
+    // is synced to the new version while the lockfile stays stale BY DESIGN until dsh's
+    // in-app manager reconciles it (#2894), so post-update disagreement there is
+    // expected and locally indistinguishable from a true wedge; the ahead face rides
+    // #3164's registry advisory, and the CLI refuses --profile desktop (#1575), which
+    // would make our remediation wrong. One guard covers both detection exits
+    // (startup audit + doctor lane).
+    if (profile === DSH_DESKTOP_PROFILE) return [];
     const spec = dshProfileDepSpec(profileDir);
     if (spec === undefined) return [];
     if (!isRegistryDepSpec(spec)) return [];

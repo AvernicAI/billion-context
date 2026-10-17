@@ -232,6 +232,23 @@ test("#3224: skip conditions — dev pins, no dep, missing copy, unjudgeable spe
     }
 });
 
+test("#3224: desktop profile is skipped by design — wedged desktop stays silent, sibling still flagged", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-prov-desktop-"));
+    try {
+        const dshHome = path.join(base, "dsh");
+        // Identical #3160 wedge shape on both profiles; only the non-desktop one
+        // may be reported (bili writes the desktop lane in place — see provenance.ts).
+        makeProfile(path.join(dshHome, "profiles"), "desktop", { manifestSpec: "^1.2.9", copyVersion: "1.2.9", pnpmLock: { specifier: "^0.1.196", version: "0.1.196" } });
+        makeProfile(path.join(dshHome, "profiles"), "web", { manifestSpec: "^1.2.9", copyVersion: "1.2.9", pnpmLock: { specifier: "^0.1.196", version: "0.1.196" } });
+        assert.deepEqual(dshProfileCopyFindings(path.join(dshHome, "profiles", "desktop")), []);
+        const findings = auditDshProfileCopyProvenance({ env: { DSH_HOME: dshHome } });
+        assert.equal(findings.length, 2);
+        assert.ok(findings.every((f) => f.profile === "web"));
+    } finally {
+        rmrf(base);
+    }
+});
+
 test("#3224: startup audit walks every profile, warns per finding, healthy ones stay silent", () => {
     const base = mkdtempSync(path.join(tmpdir(), "bc-prov-audit-"));
     try {
