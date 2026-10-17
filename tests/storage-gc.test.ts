@@ -19,10 +19,13 @@
  *   PARITY      — the #1082 file sweep finally releases the unified side too: an
  *                 aged-out eligible file → index rows gone, exclusive CAS rows
  *                 reclaimed, shared CAS rows survive while any holder lives.
+ *   HTTP        — POST /__bili/storage/gc rejects non-object bodies with 400 and
+ *                 an unflagged run defaults to fix+vacuum ON.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -30,7 +33,9 @@ import { SessionStore } from "../src/persist.ts";
 import { UnifiedStore, type RefcountAuditReport } from "../src/storage/store.ts";
 import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
 import { gcSessionFiles } from "../src/session-gc.ts";
-import type { CoreMessage } from "acp-kernel";
+import { defaultConfig, type CoreMessage } from "acp-kernel";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
@@ -306,6 +311,76 @@ test("storage gc parity: file sweep releases unified rows and exclusive CAS refs
     } finally {
         if (prevUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = prevUnified;
         if (prevGc === undefined) delete process.env.BILI_SESSION_GC; else process.env.BILI_SESSION_GC = prevGc;
+        if (prevXdg === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = prevXdg;
+        rmrf(dir);
+        rmrf(xdg);
+    }
+});
+
+// ---------------------------------------------------------------------------
+// HTTP surface: POST /__bili/storage/gc (loopback-gated ops route).
+// ---------------------------------------------------------------------------
+
+test("storage gc http: non-object bodies are 400, unflagged run defaults to fix+vacuum", async () => {
+    const prevUnified = process.env.BILI_STORAGE_UNIFIED;
+    const prevSessions = process.env.BILI_SESSIONS_DIR;
+    const prevXdg = process.env.XDG_STATE_HOME;
+    const xdg = fs.mkdtempSync(path.join(os.tmpdir(), "bili-storagegc-xdg-http-"));
+    const dir = tmpdir("bili-storagegc-http-");
+    process.env.BILI_STORAGE_UNIFIED = "1";
+    process.env.BILI_SESSIONS_DIR = dir;
+    process.env.XDG_STATE_HOME = xdg;
+    try {
+        const opts: ProxyOptions = {
+            port: 0,
+            host: "127.0.0.1",
+            upstream: "http://127.0.0.1:1",
+            routes: {},
+            proxy: "",
+            proxyMode: "direct",
+            proxySource: "direct",
+            modelContextLimit: 400_000,
+            kernelConfig: defaultConfig(400_000),
+            compress: { injectTool: true, injectNudge: true },
+            promptCache: { routing: "auto" },
+            sessionHeader: "x-acp-session",
+            log: false,
+            debug: false,
+            passthrough: false,
+            autoUpdate: false,
+            compat: { roles: {} },
+            streamErrorShape: "protocol",
+            passthroughSource: null,
+            autoRestartOnUpdate: false,
+            updateTag: "latest",
+            advisoryCheck: false,
+            releaseNotesCheck: false,
+            mitm: { enabled: false, domains: [] },
+        };
+        const proxy = await startServer(opts);
+        if (!proxy.listening) await once(proxy, "listening");
+        const base = `http://127.0.0.1:${(proxy.address() as { port: number }).port}`;
+        try {
+            for (const body of ["null", "[true]", '"gc"', "42"]) {
+                const bad = await fetch(`${base}/__bili/storage/gc`, { method: "POST", body });
+                assert.equal(bad.status, 400, `non-object body ${body} must be rejected with 400`);
+                assert.equal(((await bad.json()) as { ok: boolean }).ok, false);
+            }
+            const flag = await fetch(`${base}/__bili/storage/gc`, { method: "POST", body: JSON.stringify({ fix: "yes" }) });
+            assert.equal(flag.status, 400, "a wrong-typed option must be rejected with 400");
+            const res = await fetch(`${base}/__bili/storage/gc`, { method: "POST" });
+            assert.equal(res.status, 200);
+            const rep = (await res.json()) as { ok: boolean; audit: { checked: number }; reclaimed: { rows: number }; vacuum: { ran: boolean } };
+            assert.equal(rep.ok, true);
+            assert.equal(rep.audit.checked, 0, "fresh store has no content to audit");
+            assert.equal(rep.reclaimed.rows, 0);
+            assert.equal(rep.vacuum.ran, true, "unflagged run defaults to fix+vacuum ON");
+        } finally {
+            await new Promise<void>((resolve, reject) => proxy.close((err) => (err ? reject(err) : resolve())));
+        }
+    } finally {
+        if (prevUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = prevUnified;
+        if (prevSessions === undefined) delete process.env.BILI_SESSIONS_DIR; else process.env.BILI_SESSIONS_DIR = prevSessions;
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = prevXdg;
         rmrf(dir);
         rmrf(xdg);

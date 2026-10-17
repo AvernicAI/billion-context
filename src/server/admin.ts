@@ -567,7 +567,15 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         try {
             const raw = await readBody(req);
             let parsed: { fix?: unknown; vacuum?: unknown } = {};
-            if (raw.byteLength > 0) parsed = JSON.parse(raw.toString("utf8")) as { fix?: unknown; vacuum?: unknown };
+            if (raw.byteLength > 0) {
+                const maybe = JSON.parse(raw.toString("utf8")) as unknown;
+                if (typeof maybe !== "object" || maybe === null || Array.isArray(maybe)) {
+                    res.writeHead(400, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ ok: false, error: "expected {} or { fix?: boolean, vacuum?: boolean }" }));
+                    return;
+                }
+                parsed = maybe as { fix?: unknown; vacuum?: unknown };
+            }
             if ((parsed.fix !== undefined && typeof parsed.fix !== "boolean") || (parsed.vacuum !== undefined && typeof parsed.vacuum !== "boolean")) {
                 res.writeHead(400, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: false, error: "expected {} or { fix?: boolean, vacuum?: boolean }" }));
