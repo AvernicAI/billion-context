@@ -86,6 +86,18 @@ test("/__bili/memory exposes cumulative CPU time and core count (#3437)", async 
         assert.ok(second.process.cpuUserNs >= p.cpuUserNs, "cpuUserNs monotone across polls");
         assert.ok(second.process.cpuSystemNs >= p.cpuSystemNs, "cpuSystemNs monotone across polls");
         assert.ok(p.rssBytes > 0 && p.heapUsedBytes > 0 && p.externalBytes >= 0, "pre-existing memory fields intact (additive change only)");
+
+        // #3133 fast-path observability: the sidecar's delta/full ingest split
+        // is exposed under storage.ingestStats so a retest can confirm steady-
+        // state saves ride the O(new-tail) path instead of full re-ingests.
+        const status = (await (await fetch(`http://127.0.0.1:${port}/__bili/status`)).json()) as { storage: { sidecarDisabled: boolean; ingestStats: { ingests: number; deltaIngests: number; verifyDrift: number } | null } };
+        assert.equal(typeof status.storage.sidecarDisabled, "boolean", "pre-existing storage fields intact");
+        const s = status.storage.ingestStats;
+        if (s === null) {
+            assert.ok(true, "no live sidecar in this rig — null is the documented shape");
+        } else {
+            assert.ok(Number.isInteger(s.ingests) && s.ingests >= 0 && Number.isInteger(s.deltaIngests) && s.deltaIngests <= s.ingests && Number.isInteger(s.verifyDrift) && s.verifyDrift >= 0, `ingestStats counters sane (${JSON.stringify(s)})`);
+        }
     } finally {
         if (proxy) await new Promise<void>((resolve) => proxy!.close(() => resolve()));
         process.env.XDG_STATE_HOME = prevXdg;
