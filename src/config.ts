@@ -1478,6 +1478,27 @@ export function resolveMitmDomains(env: NodeJS.ProcessEnv): string[] {
     ]);
 }
 
+/** The exact mitm whitelist a spawned proxy child RECORDS in its instance
+ *  file (server.ts writes opts.mitm.domains when mitm is enabled): the same
+ *  file-first/env-second tier as loadOptions, evaluated against the env the
+ *  CHILD will see — the launcher's explicit list when it overrides
+ *  BILI_MITM_DOMAINS at spawn time, otherwise the inherited value. Empty
+ *  when mitm is disabled (the child records [] then too). Attachers must
+ *  want exactly this value or they never converge on the child's own
+ *  instance (#3436: native bootstraps pass no domains at all, so any
+ *  configured mitm.domains / BILI_MITM_DOMAINS made every host process
+ *  spawn its own proxy instead of attaching). */
+export function resolveRecordedMitmDomains(passed: readonly string[] | undefined, env: NodeJS.ProcessEnv = process.env): string[] {
+    const fileConfig = loadConfigFile();
+    const enabled = (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0";
+    if (!enabled) return [];
+    const effective = passed && passed.length > 0 ? passed.join(",") : env.BILI_MITM_DOMAINS;
+    return dedupeDomains([
+        ...(fileConfig.mitm?.domains ?? []),
+        ...splitCsv(effective),
+    ]);
+}
+
 /** #1392: opted-in non-http(s) baseUrl providers — providers-table entries
  *  (key = provider id) with `compactionOptIn: true` ∪
  *  BILI_NON_HTTP_PROVIDERS, deduped. Exported so launchers can mirror the list
