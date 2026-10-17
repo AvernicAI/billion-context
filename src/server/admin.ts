@@ -234,7 +234,20 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // framed document's prefers-color-scheme.
         const rawTheme = u.searchParams.get("theme");
         const theme = rawTheme === "light" || rawTheme === "dark" ? rawTheme : undefined;
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        const headers: Record<string, string> = { "content-type": "text/html; charset=utf-8" };
+        // #3xxx: the dsh settings pane's #3100 pre-flight fetches this route
+        // CROSS-ORIGIN (dsh web serves the page on its own port, the proxy on
+        // another — both loopback names, so isTrustedAdminOrigin above accepts
+        // the request), but a cors-mode fetch is only readable when the
+        // response carries access-control-allow-origin. Without it the probe
+        // rejects in the browser, the verdict never lands, and the pane stays
+        // on "connecting to the bili proxy…" forever (model proxying and the
+        // iframe itself keep working — only the probe is blocked). Echo the
+        // requesting origin: this route serves a static HTML shell, no state,
+        // and only origins the trusted-origin gate already admitted reach it.
+        const reqOrigin = req.headers.origin;
+        if (typeof reqOrigin === "string" && reqOrigin.length > 0) headers["access-control-allow-origin"] = reqOrigin;
+        res.writeHead(200, headers);
         res.end(renderUI(origin, { embed: u.searchParams.get("embed") === "1", theme }));
         return;
     }
