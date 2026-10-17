@@ -646,9 +646,12 @@ const RECIPES = {
     // see runLane: absorbs the v1 CLI's one-time storage migration
     async warmup(ctx) {
       const model = MODEL1.model.split(",")[0];
-      sh((process.env.GATE_OC1_BIN || "opencode").trim(),
+      const r = sh((process.env.GATE_OC1_BIN || "opencode").trim(),
         ["run", "-m", `gate/${model}`, "--dangerously-skip-permissions", "Reply with the single word READY."],
         { cwd: ctx.workDir, env: ctx.env, timeout: 600_000 });
+      // sh() swallows exit codes — throw so runLane logs "warmup failed"
+      // instead of a misleading "warmup ok" when the turn actually died.
+      if (r.status !== 0) throw new Error(`opencode warmup exited ${r.status ?? "timeout"}\n${(r.stderr || "").slice(-300)}`);
     },
     setWindow(ctx, w) {
       const file = path.join(ctx.laneDir, "xdg/config/opencode/opencode.json");
