@@ -2308,7 +2308,7 @@ async function handleRequest(
                     const mode = codexCompactMode();
                     const gatePre = codexCompactGatePre(session, reqConfig.modelContextLimit);
                     if (mode === "intercept" && gatePre) prepared = await runPrepare();
-                    if (prepared) memProbe(opts.debug, log, session.id, "prepared", typeof prepared.body === "string" ? prepared.body.length : prepared.body.byteLength);
+                    if (prepared) memProbe(opts.debug, log, session.id, "prepared", typeof prepared.body === "string" ? Buffer.byteLength(prepared.body) : prepared.body.byteLength);
                     if (prepared?.codexForge) {
                         logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared.body);
                         return { body: prepared.body, prepared };
@@ -2326,7 +2326,7 @@ async function handleRequest(
                     return { body: forwardBody, prepared: null };
                 }
                 prepared = await runPrepare();
-                memProbe(opts.debug, log, session.id, "prepared", typeof prepared.body === "string" ? prepared.body.length : prepared.body.byteLength);
+                memProbe(opts.debug, log, session.id, "prepared", typeof prepared.body === "string" ? Buffer.byteLength(prepared.body) : prepared.body.byteLength);
                 // [#2926] anthropic Threads lane: prepare mirrored the turn and
                 // may have armed a reforge (mirror estimate crossed the window
                 // on a continue, rollout flag on). Execute it now — one summary
