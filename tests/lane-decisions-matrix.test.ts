@@ -14,6 +14,7 @@ import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
+import { closeServers } from "./server-close-guard.ts";
 
 // #3417 lane-decisions truth table (characterization pass): pin the CURRENT
 // compress-surface behavior (standing prompt + nudge) per lane across all four
@@ -81,20 +82,6 @@ function historyTexts(): string[] {
 // teachTokens: what the fake upstream REPORTS as input_tokens on every reply.
 // The loop adopts it as the next turn's tokenCount (usage-grade baseline), so
 // this is how each row dials context usage against the 64k declared window.
-const CLOSE_TIMEOUT_MS = 5_000;
-// #3731: bound the teardown 'close' await. Under Windows runner-pool load a delayed
-// or lost 'close' makes `await once(server,"close")` a handle-less dangling await that
-// drains the event loop, so node --test aborts the WHOLE file and records every sibling
-// subtest as cancelledByParent with ZERO assertion failures. The live timer keeps the
-// loop alive so the promise always settles; per-test/--test-timeout do NOT rescue this
-// (node:test's timer is unref'd). closeAllConnections already freed every socket.
-const settledClose = (srv: http.Server): Promise<void> => {
-    let timer: ReturnType<typeof setTimeout> | undefined = undefined;
-    const timeout = new Promise<void>((resolve) => { timer = setTimeout(resolve, CLOSE_TIMEOUT_MS); });
-    return Promise.race([once(srv, "close"), timeout]).then(() => {
-        if (timer !== undefined) clearTimeout(timer);
-    });
-};
 
 async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool = true, teachTokens = 50_000) {
     // Windows CI flake class (seen on runners, not on dev VMs): listen(0)
@@ -194,12 +181,7 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
     };
     const close = async () => {
         store.cancelAll();
-        // closeAllConnections destroys keep-alive sockets that close() alone
-        // would wait on forever (server.close only completes once every
-        // connection ends) — belt-and-suspenders against teardown hangs.
-        proxy.close(); proxy.closeIdleConnections?.(); proxy.closeAllConnections?.();
-        upstream.close(); upstream.closeIdleConnections?.(); upstream.closeAllConnections?.();
-        await Promise.all([settledClose(proxy), settledClose(upstream)]);
+        await closeServers([proxy, upstream], "lane-decisions harness");
     };
     return { send, forwarded, close };
 }
