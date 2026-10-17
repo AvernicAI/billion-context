@@ -101,6 +101,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `rollout.features.salt` | string | the feature name | — | Hash salt for bucketing. Changing it re-randomizes the whole cohort (the only way to reshuffle; raising percent alone never reshuffles). |
 | `rollout.features.base` | string | unset (roll out over everyone) | — | Nested rollout: evaluate this feature only inside the named feature's enabled cohort, so the percent is relative to that population (roll B out to A's users; chains allowed, cycles fail closed). |
 | `maskHosts` | boolean | true | BILI_LOG_MASK_HOSTS | Mask non-public target hosts in logs as <private-host>; credential headers are always masked regardless. |
+| `strictSessionRouting` | boolean | false | BILI_STRICT_SESSION_ROUTING | Multi-instance routing guard (#3633): when enabled, a request whose session id this instance has never seen locally (memory or disk) and whose resent history already carries prior turns is rejected with 409 instead of silently starting a cold session on the wrong instance. Genuinely fresh conversations always pass; single-instance deployments never trip it. |
 | `security.adminRelay` | boolean | false | — | Let an embedding host (dsh web today) relay the ENTIRE /__bili/ admin surface through its own entry origin so a remote browser can open the panel (#3373). Fail-closed, file-only. The relayed hop reaches the proxy as a local non-browser client (loopback source + loopback Host, no Origin), so the admin gate stays unchanged; enabling it exposes config editing and credential writes to whoever can reach the host web entry — protect that entry (auth / reverse proxy) first. |
 | `subagentSplit` | boolean | true | BILI_SUBAGENT_SPLIT | Claude Code subagents get their own session namespace (<session>\|sub:<agent-id>) instead of queueing behind the main session. |
 | `forkAdoption` | boolean | false | BILI_FORK_ADOPTION | Anonymous forks inherit the parent's compression blocks whose source content is fully present in the forked request. |
@@ -1742,6 +1743,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_STORAGE_WAL_JOURNAL_SIZE_LIMIT_BYTES` | `storage.walJournalSizeLimitBytes` | 8388608 |
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
+| `BILI_STRICT_SESSION_ROUTING` | `strictSessionRouting` | false |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | 180000 |
 | `BILI_UPDATE_REGISTRY` | `update.registry` | "npmjs" (registry.npmjs.org) |
