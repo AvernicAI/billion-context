@@ -10,10 +10,10 @@ import { getStore, storageStatusLabel } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSession, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
-import { BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
+import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
 import { externalSummaryEnabled, externalSummaryMaxToolDurationMs, withExternalSummaryTools } from "./external-summary-surface.js";
 import { salvageCompressArgs } from "./plugin-compress-salvage.js";
-import { isProxyToolFor } from "./proxy-tool.js";
+import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { effectiveRulesEnabled, rulesEnabled } from "./rules-feature.js";
 import { executeProxyToolAsync } from "./loop/core.js";
 import type { ProxyToolResult } from "./proxy-tool-result.js";
@@ -812,6 +812,9 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // enablement stays enforced at execution (isProxyToolFor / executeProxyTool).
     // #1359: the advertised name is the base-config toolName, matching the
     // plugin-lane gate (which adjudicates the same base block).
+    const absorbOn = absorbEnabled(config);
+    const absorbName = config.absorb?.toolName ?? ABSORB_TOOL_NAME;
+    const absorbTools = absorbOn ? absorbToolsFor(absorbName) : undefined;
     const rulesOn = rulesEnabled(config);
     // [#1271] acp_retrieve is advertised only while the base config enables CCR (same
     // #1192 conservative rule as absorb/acp_rule). The proxy wires it on the anthropic/
@@ -852,11 +855,11 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
         proxy: "billion-context",
         version: VERSION,
         commit: BUILD_COMMIT,
-        toolNames: [...PROXY_TOOL_NAMES, ...(rulesOn ? [RULE_TOOL_NAME] : []), ...(ccrOn ? [ccrName] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_NAME] : [])],
+        toolNames: [...PROXY_TOOL_NAMES, ...(absorbTools ? [absorbName] : []), ...(rulesOn ? [RULE_TOOL_NAME] : []), ...(ccrOn ? [ccrName] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_NAME] : [])],
         tools: {
-            anthropic: [...acpAnthropic, ...(rulesOn ? [RULE_TOOL] : []), ...(ccrTools ? [ccrTools.anthropic] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL] : [])],
-            openai: [...acpOpenai, ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : [])],
-            responses: [...acpResponses, ...(rulesOn ? [RULE_TOOL_RESPONSES] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_RESPONSES] : [])],
+            anthropic: [...acpAnthropic, ...(absorbTools ? [absorbTools.anthropic] : []), ...(rulesOn ? [RULE_TOOL] : []), ...(ccrTools ? [ccrTools.anthropic] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL] : [])],
+            openai: [...acpOpenai, ...(absorbTools ? [absorbTools.openai] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : [])],
+            responses: [...acpResponses, ...(absorbTools ? [absorbTools.responses] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : []), ...(rescaleOn ? [READ_ORIGINAL_IMAGE_TOOL_RESPONSES] : [])],
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER, instructionsMutable: PLUGIN_INSTRUCTIONS_MUTABLE_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
@@ -1328,6 +1331,8 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
  *  name is not one of the known opt-in tools (a truly unknown tool keeps the
  *  generic 400 with its allowed list). */
 function disabledOptionalToolNote(tool: string, session: Session, config: Config): string | undefined {
+    const absorbName = effectiveAbsorbConfig(session, config)?.toolName ?? ABSORB_TOOL_NAME;
+    if (tool === absorbName) return `${tool} is not enabled on this bili proxy (compress.absorb.enabled is not true) — nothing was absorbed.`;
     if (tool === RULE_TOOL_NAME) return `${tool} is not enabled on this bili proxy (compress.rules.enabled is not true) — nothing was recorded.`;
     if (!ccrEnabled(session) && tool === retrieveToolName(session)) return `${tool} is not enabled on this bili proxy (compress.ccr.enabled is not true) — nothing was retrieved.`;
     return undefined;
@@ -1732,7 +1737,7 @@ export async function handlePluginTool(
     if (!isProxyToolFor(tool, session, deps.config)) {
         // #1192: a known opt-in tool disabled by this session's effective config
         // (registered from a manifest served while it was enabled) answers with
-        // model-facing text on the same channel executeRule use
+        // model-facing text on the same channel executeRule/executeAbsorb use
         // for failures — a hard 400 would surface as an unfixable red error card.
         const note = disabledOptionalToolNote(tool, session, deps.config);
         if (note !== undefined) {
@@ -1742,6 +1747,8 @@ export async function handlePluginTool(
             return;
         }
         const allowed = [...PROXY_TOOL_NAMES];
+        const absorb = effectiveAbsorbConfig(session, deps.config);
+        if (absorb?.enabled === true) allowed.push(absorb.toolName ?? ABSORB_TOOL_NAME);
         if (effectiveRulesEnabled(session, deps.config)) allowed.push(RULE_TOOL_NAME);
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: `unknown tool "${tool}" (expected one of: ${allowed.join(", ")})` }));

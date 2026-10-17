@@ -73,7 +73,8 @@ import {
     type GoogleSystemInstruction,
     type GoogleTool,
 } from "acp-kernel/wire";
-import { COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, COMPRESS_TOOL_NAME, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, retrieveToolsFor, buildAcpTagsOnlyPrompt } from "./compress-tool.js";
+import { ABSORB_TOOL_NAME, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_GOOGLE_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, COMPRESS_TOOL_NAME, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, absorbToolsFor, retrieveToolsFor, buildAcpTagsOnlyPrompt } from "./compress-tool.js";
+import { absorbEnabled, storeEffectiveAbsorb } from "./absorb.js";
 import { ccrEnabled, ccrLoopConfig, ccrPluginWireOk, contentStoreOf, executeRetrieve, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes, storeEffectiveCcr, type CcrSettings } from "./store.js";
 import { buildIncomingImageIndex, pruneRetrieveImgExports } from "./image-restore.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
@@ -1472,13 +1473,16 @@ export type Prepared = {
      * ACTUALLY reached the payload, not the pre-gate intent. The model-decided
      * gate runs asynchronously between diagNudge's label and the rebuild, so
      * consumers that need truth (self-heal streaks, log labels) read this.
-     * "injected": an advisory/directive/fallback message landed; "vetoed":
-     * the decision gate ran and nothing was injected (model declined or the
-     * answer was unusable); "skipped": armed but nothing renderable (empty
-     * nudge text / yes-with-no-live-range). Undefined = no arm this round, or
-     * the arm was gated off before delivery was attempted (suppression /
-     * breaker / gate off) — consumers only ever test for "injected". */
-    nudgeOutcome?: "injected" | "vetoed" | "skipped";
+      * "injected": an advisory/directive/fallback message landed; "vetoed":
+      * the decision gate ran and nothing was injected (model declined or the
+      * answer was unusable); "skipped": armed but nothing renderable (empty
+      * nudge text / yes-with-no-live-range); "gated" (#3461): over-limit
+      * pressure admitted by every standing gate but held by the emergency
+      * backoff this round — a pressure fact for self-heal credit, not a
+      * delivery. Undefined = no arm this round, or the arm was gated off
+      * before delivery was attempted (suppression / breaker / gate off) —
+      * consumers test for "injected" (+ "gated" where pressure counts). */
+     nudgeOutcome?: "injected" | "vetoed" | "skipped" | "gated";
     /** Render strategy the prepare used for processTurn ("none" for codex
      *  compaction triggers / ACP_RENDER_NONE). The #422 fold-refresh hook in
      *  forward() re-runs processTurn with the same strategy so the re-request
@@ -3448,7 +3452,23 @@ export async function preflightCompressIfNeeded(
     }
     // The payload still overflows the window: fail fast with a diagnostic
     // error instead of forwarding a guaranteed-400 payload (#301).
-    const status = f?.kind === "upstream" && f.status === 429 ? 503 : 502;
+    // #3461 problem 2: DETERMINISTIC exhaustion (futile-round math proved no
+    // combination of folds can close the gap regardless of upstream health)
+    // can never succeed for this identical payload — answer it 413 like every
+    // other "can never fit as-is" verdict (#2847 lesson applied to the
+    // exhaustion path; #2921/#3146 doomed-bytes precedent) instead of 502,
+    // which status-code-driven headless hosts read as transient and spin on
+    // forever (field measurement: 5+ doomed rounds). Relay-dependent
+    // exhaustion (empty/truncated/incomplete summaries, budget draws, pool
+    // saturation) stays 502: those walks succeed once the relay recovers.
+    // AND only when bili's own calibrated meter agrees the payload is over the
+    // window (!payloadFitsWindow): when the calibrated estimate FITS but the
+    // walk still ran (char-count trigger arm, overflow-armed baseline), the
+    // doom is a relay-billing artifact bili cannot compute (#496/#767/#857
+    // byte-relay lanes) — bili must not declare structural doom for it; those
+    // lanes keep their 502 fail-fast contract where NOT re-forwarding IS the
+    // protection, not a client spin.
+    const status = f?.kind === "upstream" && f.status === 429 ? 503 : f?.kind === "exhausted" && f.deterministic && !payloadFitsWindow ? 413 : 502;
     // #2189: an explicit retryable=false from preflight (credential-shape
     // rejection — deterministic for the identical payload) overrides the
     // status-based heuristic below; every other path keeps today's mapping.

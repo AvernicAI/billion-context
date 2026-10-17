@@ -24,6 +24,7 @@ import { getUpdateVisibility } from "./update-notes.js";
 import { VERSION, BUILD_COMMIT } from "./version.js";
 import { isExternalSummaryBlock } from "./external-summary-marker.js";
 import { storageStatusLabel } from "./persist.js";
+import { storageStatusWire } from "./storage/runtime-status.js";
 import { toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 interface AcpStatusCtx {
@@ -362,6 +363,15 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     // am I on" never requires shell access to the lane log.
     extra.push("");
     extra.push(`STORAGE — ${storageStatusLabel()}`);
+    // #3385 (owner directive 3, acp_status surface): when the unified store is
+    // degraded (engine missing, self-download cooldown, ...), surface the SAME
+    // reason string the web banner and diagnostics carry — on Node < 22.5 it
+    // contains the explicit Node upgrade lever, so the MODEL can tell the
+    // user instead of the fact living only in lane logs the user never opens.
+    const storageWire = storageStatusWire();
+    if (storageWire.degraded && storageWire.reason) {
+        extra.push(`  ⚠ degraded — ${storageWire.reason} (relay this to the user)`);
+    }
     const archive = preCompactionArchiveOf(ctx.session);
     if (Object.keys(archive).length > 0) {
         extra.push("");

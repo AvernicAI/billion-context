@@ -2357,13 +2357,18 @@ async function handleRequest(
                 // model never received. Actual injection subsumes every factor
                 // the old expression listed: gated-off rounds (suppression /
                 // breaker / gate off / no arm) leave it undefined or yield
-                // "vetoed"/"skipped" — never "injected".
+                // "vetoed"/"skipped" — never "injected". #3461: "gated" joins
+                // "injected" as active — a pressure round held only by the
+                // emergency backoff still counts, otherwise the rate limit
+                // starves the streaks (#2155 zombie degrade, D1 suppression)
+                // that exist precisely for sessions pinned under continuous
+                // pressure.
                 if (!selfHealRoundDone && prepared.nudge !== undefined) {
                     selfHealRoundDone = true;
                     evaluateSelfHealRound(session, {
                         pluginHeaderPresent: pluginAgentHeader(req.headers) !== undefined,
                         biliToolsDeclared: biliToolsDeclaredOnWire(parsed, protocol),
-                        nudgeActive: prepared.nudgeOutcome === "injected",
+                        nudgeActive: prepared.nudgeOutcome === "injected" || prepared.nudgeOutcome === "gated",
                         biliToolUses: countBiliToolUses(prepared.processedMessages),
                         degradeAvailable: opts.compress.injectTool && !knobNoInjectTool(),
                     }, log);

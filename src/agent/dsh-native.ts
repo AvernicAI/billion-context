@@ -48,7 +48,7 @@ import path from "node:path";
 import { logHostEvent } from "./host-log.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { APIG_RESIGN_SCHEME, unresolvedRefusals } from "../apig-resign.js";
-import { resolveResignSettings } from "../config.js";
+import { adminRelayEnabled, resolveResignSettings } from "../config.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
@@ -169,7 +169,7 @@ export type PluginContext = {
         register: (route: {
             kind: "exact" | "prefix";
             path: string;
-            handler: (req: unknown, res: { writeHead: (status: number, headers?: Record<string, string>) => void; end: (body?: string) => void }) => void | Promise<void>;
+            handler: (req: unknown, res: { writeHead: (status: number, headers?: Record<string, string>) => void; write?: (chunk: string | Uint8Array) => boolean; end: (body?: string | Uint8Array) => void }) => void | Promise<void>;
         }) => (() => void) | undefined;
     };
 };
@@ -249,6 +249,129 @@ let regAdoptLogged = false;
 function currentOrigin(): string | undefined {
     const envOrigin = process.env.BILLION_CONTEXT_PROXY?.trim();
     return register.base ?? (envOrigin !== undefined && envOrigin.length > 0 ? envOrigin : undefined);
+}
+
+/** #3373: the /__bili admin relay — dsh web's remote-panel path. With
+ *  `security.adminRelay` on and the proxy bound, forward browser admin calls
+ *  received on dsh's web entry to the loopback proxy, so a remote browser
+ *  talks same-origin through the entry it already reached dsh by. The
+ *  forwarded hop is a local non-browser client (loopback source, loopback
+ *  Host via fetch, no Origin header), so the admin gate (#1538) holds
+ *  unchanged; when the gate is off this stays a plain 404 (fail-closed). */
+const RELAY_REQUEST_DROP = new Set([
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
+    "trailer", "transfer-encoding", "upgrade",
+    // fetch re-derives these from the target; the browser's values describe
+    // the entry origin and would leak host-session state into the proxy.
+    "host", "origin", "cookie", "referer", "content-length", "accept-encoding",
+]);
+const RELAY_RESPONSE_DROP = new Set(["connection", "keep-alive", "transfer-encoding", "content-length", "content-encoding"]);
+const RELAY_MAX_BODY_BYTES = 8 * 1024 * 1024;
+
+type RelayRes = { writeHead: (status: number, headers?: Record<string, string>) => void; write?: (chunk: string | Uint8Array) => boolean; end: (body?: string | Uint8Array) => void };
+
+async function relayAdminRequest(req: unknown, res: RelayRes): Promise<void> {
+    const fail = (status: number, code: string): void => {
+        try {
+            res.writeHead(status, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: code }));
+        } catch {
+            // socket already gone — nothing left to report
+        }
+    };
+    // Fail-closed presentation first: while the gate is off the route answers
+    // 404 regardless of proxy state (no state disclosure).
+    if (!adminRelayEnabled()) {
+        fail(404, "admin relay disabled");
+        return;
+    }
+    const base = register.base;
+    if (base === undefined) {
+        fail(503, "bili proxy not running");
+        return;
+    }
+    const rawMethod = (req as { method?: unknown }).method;
+    const method = typeof rawMethod === "string" ? rawMethod : "GET";
+    const rawUrl = (req as { url?: unknown }).url;
+    const url = typeof rawUrl === "string" ? rawUrl : "/";
+    // Contain the relay to the declared /__bili surface: fetch() normalizes
+    // dot segments (literal and %2e-encoded alike), so an unchecked
+    // "/__bili/.." would land on sibling paths of the loopback proxy.
+    const cut = url.search(/[?#]/);
+    const pathPart = cut === -1 ? url : url.slice(0, cut);
+    let decodedPath: string;
+    try {
+        decodedPath = decodeURIComponent(pathPart).replaceAll("\\", "/");
+    } catch {
+        fail(400, "bad request path");
+        return;
+    }
+    if (decodedPath.split("/").includes("..")) {
+        fail(400, "bad request path");
+        return;
+    }
+    const headersIn = (req as { headers?: unknown }).headers;
+    const headers: Record<string, string> = {};
+    if (headersIn !== null && typeof headersIn === "object") {
+        for (const [key, value] of Object.entries(headersIn as Record<string, unknown>)) {
+            if (RELAY_REQUEST_DROP.has(key)) continue;
+            if (typeof value === "string") headers[key] = value;
+            else if (Array.isArray(value)) headers[key] = value.filter((entry): entry is string => typeof entry === "string").join(", ");
+        }
+    }
+    let body: Uint8Array | undefined;
+    if (method !== "GET" && method !== "HEAD") {
+        const chunks: Buffer[] = [];
+        let size = 0;
+        try {
+            for await (const chunk of req as AsyncIterable<unknown>) {
+                const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk instanceof Uint8Array ? Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength) : undefined;
+                if (buf === undefined) break;
+                size += buf.length;
+                if (size > RELAY_MAX_BODY_BYTES) {
+                    fail(413, "request body too large");
+                    return;
+                }
+                chunks.push(buf);
+            }
+            body = chunks.length > 0 ? Buffer.concat(chunks) : undefined;
+        } catch {
+            fail(400, "request body read failed");
+            return;
+        }
+    }
+    let upstream: Response;
+    try {
+        upstream = await fetch(`${base}${url}`, {
+            method,
+            headers,
+            body,
+            redirect: "manual",
+            signal: AbortSignal.timeout(120_000),
+        });
+    } catch {
+        fail(502, "bili proxy unreachable");
+        return;
+    }
+    const headersOut: Record<string, string> = {};
+    upstream.headers.forEach((value, key) => {
+        if (!RELAY_RESPONSE_DROP.has(key)) headersOut[key] = value;
+    });
+    try {
+        res.writeHead(upstream.status, headersOut);
+        if (upstream.body !== null) {
+            if (typeof res.write === "function") {
+                for await (const chunk of upstream.body) res.write(chunk);
+                res.end();
+            } else {
+                res.end(Buffer.from(await upstream.arrayBuffer()));
+            }
+        } else {
+            res.end();
+        }
+    } catch {
+        // client hung up mid-stream — the upstream read dies with it
+    }
 }
 
 // #2604: host-title channel (mirror of pi.ts #2322/#2354): dsh owns its
@@ -1073,7 +1196,11 @@ export function apply(ctx: PluginContext): void {
     // a stale link.
     ctx.on?.("webserver/index-inject", (table: Array<{ kind: string; name?: string; value?: unknown }>) => {
         const origin = currentOrigin();
-        if (origin !== undefined) table.push({ kind: "global", name: "__BILI__", value: { origin } });
+        if (origin === undefined) return;
+        // #3373: with the admin relay armed the settings entry must talk
+        // same-origin (the entry's origin, relayed by the host) — publish the
+        // relay marker instead of the loopback origin.
+        table.push({ kind: "global", name: "__BILI__", value: adminRelayEnabled() ? { origin: null, relay: true } : { origin } });
     });
 
     // #2604: follow the host session name (dsh-session-title service). Every
@@ -1105,10 +1232,19 @@ export function apply(ctx: PluginContext): void {
         kind: "exact" as const,
         path: "/bili/origin",
         handler: (_req: unknown, res: { writeHead: (status: number, headers?: Record<string, string>) => void; end: (body?: string) => void }): void => {
-            const body = JSON.stringify({ origin: currentOrigin() ?? null });
+            const origin = currentOrigin();
+            // #3373: relay mode ⇒ the client derives its base from the probe
+            // response URL itself; the loopback origin is useless (and leaky)
+            // to a remote browser.
+            const body = JSON.stringify(origin !== undefined && adminRelayEnabled() ? { origin: null, relay: true } : { origin: origin ?? null });
             res.writeHead(200, { "content-type": "application/json" });
             res.end(body);
         },
+    };
+    const adminRelayRoute = {
+        kind: "prefix" as const,
+        path: "/__bili",
+        handler: (req: unknown, res: RelayRes): void | Promise<void> => relayAdminRequest(req, res),
     };
     if (typeof ctx.inject === "function") {
         // Cordis inject: fires once the service is available, re-runs on
@@ -1118,11 +1254,25 @@ export function apply(ctx: PluginContext): void {
         ctx.inject(["webServer"], (sub) => {
             const ws = sub.webServer;
             if (ws === undefined) return;
-            if (typeof sub.effect === "function") sub.effect(() => ws.register(originRoute), "bili: /bili/origin route");
-            else ws.register(originRoute);
+            if (typeof sub.effect === "function") sub.effect(() => {
+                const offOrigin = ws.register(originRoute);
+                const offRelay = ws.register(adminRelayRoute);
+                // The effect's return value is how dsh disposes this
+                // registration on re-run — combine both route disposers or
+                // stale duplicates accumulate in the router table.
+                return () => {
+                    offOrigin?.();
+                    offRelay?.();
+                };
+            }, "bili: panel routes (origin + admin relay)");
+            else {
+                ws.register(originRoute);
+                ws.register(adminRelayRoute);
+            }
         });
     } else if (ctx.webServer !== undefined) {
         ctx.webServer.register(originRoute);
+        ctx.webServer.register(adminRelayRoute);
     }
 
     if (plan.mode === "attach") {

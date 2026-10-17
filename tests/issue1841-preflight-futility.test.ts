@@ -167,7 +167,7 @@ test("#1841 A: a payload whose foldable pool cannot close the gap skips the roun
         ];
         const resp = await post(p, "issue1841-futility-skip", messages);
         const body = await resp.text();
-        assert.equal(resp.status, 502, `a futile round must fail fast: HTTP ${resp.status} ${body.slice(0, 240)}`);
+        assert.equal(resp.status, 413, `a futile round must fail fast non-retryably (#3461): HTTP ${resp.status} ${body.slice(0, 240)}`);
         const json = JSON.parse(body) as { error?: { code?: string; message?: string } };
         assert.equal(json.error?.code, "preflight_compress_failed");
         assert.match(json.error?.message ?? "", /futile round/, `names the futility verdict (got: ${json.error?.message})`);
@@ -246,6 +246,9 @@ test("#1841 B: mid-walk bail stops before summarizing ranges that cannot change 
         ];
         const resp = await post(p, "issue1841-futility-midbail", messages);
         const body = await resp.text();
+        // Relay-dependent by fixture design (every summary comes back empty):
+        // a healthy relay could still fold the drawn range, so this verdict
+        // stays the retryable 502 — unlike case A's zero-call structural 413.
         assert.equal(resp.status, 502, `a bailed walk must fail fast: HTTP ${resp.status} ${body.slice(0, 240)}`);
         const json = JSON.parse(body) as { error?: { code?: string; message?: string } };
         assert.equal(json.error?.code, "preflight_compress_failed");

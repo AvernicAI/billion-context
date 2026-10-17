@@ -1,6 +1,8 @@
 import { defaultCountTokens, type CoreMessage, type NudgeDecision } from "acp-kernel";
 import { googleSystemText, type BiliMessage, type GoogleRequestBody } from "acp-kernel/wire";
 import { estimateCoreMessages } from "../preflight.js";
+import { SELF_HEAL_SUPPRESS_CAP_MS, reductionKeyOf } from "../session-self-heal.js";
+import type { Session } from "../session.js";
 import { applyEstimateCalibration } from "../util.js";
 import { readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./side-request.js";
 
@@ -346,6 +348,62 @@ export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalati
     const b = nudge.breakdown;
     const minBenefit = b?.minPressureBenefit;
     return !(typeof minBenefit === "number" && Number.isFinite(minBenefit) && minBenefit > 0 && (b.maxPending ?? 0) < minBenefit);
+}
+
+/** #3461 problem 2: backoff for the EMERGENCY override. The pure check above
+ * has no cadence of its own — once usage sits over the escalation line it
+ * re-arms on EVERY request, so a headless client retrying a doomed request
+ * injected the tier-1 nudge ~7×/second (field measurement, dsh/pi lanes). A
+ * repeat injection carries no new information unless something changed that
+ * could make compression newly viable or newly needed, so this wrapper adds a
+ * per-session gate stamped on every ALLOWED injection. Re-arm grounds:
+ *   - first injection under the current state (no gate yet / corrupt shape);
+ *   - a reduction landed since (reductionKeyOf moved — same evidence self-heal
+ *     D1 watches: committed fold → nextBlockId advanced, or plugin-lane
+ *     compress tool stamped lastCompress): the payload shrank and still needs
+ *     the prompt;
+ *   - input grew by ≥ the flat growth step since (KDD #8 discipline; the step
+ *     is loopConfig.nudge.growthFloor, flat 50K by default — NOT rescaled with
+ *     the window): new content worth advising about;
+ *   - wall-clock safety valve (SELF_HEAL_SUPPRESS_CAP_MS precedent, 10 min):
+ *     one more injection so a permanently stuck session gets periodic reminders
+ *     instead of silence forever.
+ * Kernel-driven injections (nudge.shouldInject=true) never pass through here —
+ * call sites OR them in BEFORE the emergency arm, so normal cadence is
+ * untouched. State lives in session.metadata.emergencyNudgeGate (survives
+ * restarts with the snapshot, visible on /__bili/sessions like selfHeal). */
+export function emergencyNudgeArmed(
+    session: Session,
+    nudge: NudgeDecision | null | undefined,
+    minCompressRange: number,
+    tokenCount: number,
+    growthStep?: number,
+): boolean {
+    if (!emergencyNudge(nudge, undefined, minCompressRange)) return false;
+    const now = Date.now();
+    const key = reductionKeyOf(session);
+    const raw = session.metadata["emergencyNudgeGate"];
+    if (raw === null || typeof raw !== "object") {
+        session.metadata["emergencyNudgeGate"] = { at: now, tokens: tokenCount, reductionKey: key };
+        return true;
+    }
+    const g = raw as Record<string, unknown>;
+    const prevAt = typeof g["at"] === "number" ? g["at"] : NaN;
+    const prevTokens = typeof g["tokens"] === "number" ? g["tokens"] : NaN;
+    const prevKey = typeof g["reductionKey"] === "string" ? g["reductionKey"] : undefined;
+    const step = typeof growthStep === "number" && Number.isFinite(growthStep) && growthStep > 0 ? growthStep : 50_000;
+    let arm = false;
+    if (!Number.isFinite(prevAt) || !Number.isFinite(prevTokens) || prevKey === undefined) {
+        arm = true; // corrupt/legacy shape → re-stamp
+    } else if (prevKey !== key) {
+        arm = true; // a reduction landed since the last injection
+    } else if (tokenCount - prevTokens >= step) {
+        arm = true; // a full flat-growth step of new content
+    } else if (now - prevAt >= SELF_HEAL_SUPPRESS_CAP_MS) {
+        arm = true; // wall-clock safety valve
+    }
+    if (arm) session.metadata["emergencyNudgeGate"] = { at: now, tokens: tokenCount, reductionKey: key };
+    return arm;
 }
 
 export function clampOutgoingOutput(

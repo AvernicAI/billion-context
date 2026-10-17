@@ -219,10 +219,10 @@ entries:
     group: compress
     id: ct.rules
     render: compress-row
-    desc_en: "Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command."
-    desc_zh: "通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。"
-    site_en: "Off by default: persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds. pi/omp expose an /acp-rule command."
-    site_zh: "默认关：通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护。pi/omp 提供 /acp-rule 命令。"
+    desc_en: "Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode, where the host owns the tool surface."
+    desc_zh: "通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。仅代理模式生效——插件模式下宿主自管工具面，此项无效。"
+    site_en: "Off by default: persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds. pi/omp expose an /acp-rule command. Proxy-mode only — inert in plugin mode."
+    site_zh: "默认关：通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护。pi/omp 提供 /acp-rule 命令。仅代理模式生效——插件模式下无效。"
   - key: compress.injectTool
     type: boolean
     default: "true"
@@ -255,6 +255,16 @@ entries:
     desc_zh: "丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
     site_en: "{ drop?, threshold? } — drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false."
     site_zh: "{ drop?, threshold? }——丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。"
+  - key: compress.absorb
+    type: object
+    default: "opt-in (disabled)"
+    group: compress
+    id: co.absorb
+    render: obj-item
+    desc_en: "Opt-in instant distillation of tool results into short abstracts; originals go to the content store. By default only image-bearing results qualify."
+    desc_zh: "可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库。默认仅图片类结果参与。"
+    site_en: "<code>absorb</code> — opt-in instant distillation of tool results into short abstracts; originals go to the content store; by default only image-bearing results qualify (<span class='mech'>enabled, minToolTokens (default 1000), contextThresholdPct, excludeTools, mediaOnly (default true), toolName \"absorb\"</span>)."
+    site_zh: "<code>absorb</code> —— 可选即时蒸馏：把工具结果蒸馏成短摘要，原文进内容库；默认仅图片类结果参与（<span class='mech'>enabled, minToolTokens(默认 1000), contextThresholdPct, excludeTools, mediaOnly(默认 true), toolName \"absorb\"</span>）。"
   - key: compress.ccr
     type: object
     default: "enabled in proxy mode since v2"
@@ -335,6 +345,42 @@ entries:
     desc_zh: "必须先置 true，自定义 prompts 才会生效。"
     site_en: "<code>acknowledgePromptsRisk</code> — must be true before custom prompts take effect."
     site_zh: "<code>acknowledgePromptsRisk</code> —— 必须先置 true，自定义 prompts 才会生效。"
+  - key: compress.absorb.enabled
+    type: boolean
+    default: "false"
+    group: compress
+    desc_en: "Enable the absorb distillation block."
+    desc_zh: "启用 absorb 蒸馏块。"
+  - key: compress.absorb.minToolTokens
+    type: number
+    default: "1000"
+    group: compress
+    desc_en: "Minimum estimated token size of a tool result eligible for absorption."
+    desc_zh: "可被吸收的工具结果的最小估算 token 大小。"
+  - key: compress.absorb.contextThresholdPct
+    type: "number | %"
+    default: "unset"
+    group: compress
+    desc_en: "Only absorb when context usage passes this share of the window."
+    desc_zh: "仅当上下文使用率超过窗口该占比时才吸收。"
+  - key: compress.absorb.excludeTools
+    type: "string[]"
+    default: "[]"
+    group: compress
+    desc_en: "Tool names excluded from absorption."
+    desc_zh: "排除出吸收范围的工具名。"
+  - key: compress.absorb.toolName
+    type: string
+    default: "\"absorb\""
+    group: compress
+    desc_en: "Registered name of the absorb tool."
+    desc_zh: "absorb 工具的注册名。"
+  - key: compress.absorb.mediaOnly
+    type: boolean
+    default: "true"
+    group: compress
+    desc_en: "Restrict absorption to tool results that carry media (images). Image bytes are exempt from minToolTokens since they are not counted in text. Set false to restore legacy full-text absorption of any large result."
+    desc_zh: "仅吸收携带媒体（图片）的工具结果；图片字节不计入文本 token，故豁免 minToolTokens 门槛。置 false 恢复对任意大结果的全文吸收（旧行为）。"
   - key: compress.ccr.enabled
     type: boolean
     default: "true (proxy mode)"

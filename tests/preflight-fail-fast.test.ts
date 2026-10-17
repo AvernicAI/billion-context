@@ -225,7 +225,7 @@ test("e2e #301: payload fits the window + preflight 429 → request still forwar
     }
 });
 
-test("e2e #301: over-window payload with nothing compressible → structured 502, no summary call, no forward", async () => {
+test("e2e #301: over-window payload with nothing compressible → structured 413 (#3461), no summary call, no forward", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream429(calls);
     upstream.listen(0, "127.0.0.1");
@@ -256,7 +256,7 @@ test("e2e #301: over-window payload with nothing compressible → structured 502
                 ],
             }),
         });
-        assert.equal(r.status, 502, "fail-fast 502 when nothing is compressible");
+        assert.equal(r.status, 413, "fail-fast 413 when nothing is compressible (#3461: deterministic exhaustion is non-retryable)");
         const json = JSON.parse(await r.text()) as { error?: { code?: string; message?: string; retryable?: boolean } };
         assert.equal(json.error?.code, "preflight_compress_failed");
         assert.equal(json.error?.retryable, false);
@@ -404,7 +404,7 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
                 ],
             }),
         });
-        assert.equal(r.status, 502, "fail-fast 502 when nothing is compressible under the shrunken window");
+        assert.equal(r.status, 413, "fail-fast 413 when nothing is compressible under the shrunken window (#3461)");
         const json = JSON.parse(await r.text()) as { error?: { code?: string; message?: string } };
         assert.equal(json.error?.code, "preflight_compress_failed");
         const msg = json.error?.message ?? "";
@@ -433,7 +433,7 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
                 ],
             }),
         });
-        assert.equal(r2.status, 502);
+        assert.equal(r2.status, 413);
         const msg2 = (JSON.parse(await r2.text()) as { error?: { message?: string } }).error?.message ?? "";
         assert.ok(!msg2.includes("full window"), `no shrink note when the window was not operator-shrunk (got: ${msg2})`);
         proxyPlain.close();
@@ -487,7 +487,7 @@ test("e2e #737: output-headroom-shrunk window (non-Anthropic, no operator overri
                 ],
             }),
         });
-        assert.equal(r.status, 502, "fail-fast 502 when nothing is compressible under the headroom-shrunk window");
+        assert.equal(r.status, 413, "fail-fast 413 when nothing is compressible under the headroom-shrunk window (#3461)");
         const json = JSON.parse(await r.text()) as { error?: { code?: string; message?: string } };
         assert.equal(json.error?.code, "preflight_compress_failed");
         const msg = json.error?.message ?? "";

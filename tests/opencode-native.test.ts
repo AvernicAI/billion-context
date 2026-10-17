@@ -29,14 +29,14 @@ after(() => {
 
 import type { NativeInterceptState } from "../src/agent/native-intercept.ts";
 import type { V2HttpRequestEvent, V2PluginContext, V2State } from "../src/agent/opencode-v2.ts";
-import { ACP_TOOLS_OPENAI } from "../src/compress-tool.ts";
+import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../src/compress-tool.ts";
 
 const { shouldBootstrapNativeOpencode, createNativeRoute, planNativeOpencode, armNativeOpencode, verifyAttachAndRecover, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest, _noteRoutedForTest } = await import("../src/agent/opencode-native.ts");
 const { createOpencodeV2Setup } = await import("../src/agent/opencode-v2.ts");
 const { markNativeHost, nativeAttachOrigin } = await import("../src/agent/native-bootstrap.ts");
 const nativeDefault = (await import("../src/agent/opencode-native.ts")).default;
 
-const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name)];
+const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name), ABSORB_TOOL_OPENAI.function.name];
 const MODEL_URL = "https://api.anthropic.com/v1/messages";
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 

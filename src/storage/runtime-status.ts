@@ -24,7 +24,7 @@
  */
 
 import type { BootstrapOutcome, CooldownMarker } from "./engine-bootstrap.js";
-import { COOLDOWN_MS, readBootstrapFailureMarker } from "./engine-bootstrap.js";
+import { COOLDOWN_MS, nodeSqliteUpgradeHint, readBootstrapFailureMarker } from "./engine-bootstrap.js";
 import { fileStorageAutoDownload, fileStorageJsonWriter, fileStorageUnified, fileStorageWalJournalSizeLimit, resolveStorageMode } from "../knobs.js";
 import { MAX_CONSECUTIVE_FAILURES, type UnifiedShadow } from "./shadow.js";
 import type { StorageMode } from "./shadow.js";
@@ -85,7 +85,7 @@ function degradeReason(): string {
         // The driver's no-engine error surfaces through the same open path —
         // say what it actually is instead of "index database failed to open".
         if (/no SQLite engine available/i.test(e)) {
-            return "no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)";
+            return `no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)${nodeSqliteUpgradeHint()}`;
         }
         return `index database failed to open (${e})`;
     }
@@ -104,7 +104,7 @@ function degradeReason(): string {
                 break;
         }
     }
-    return "no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)";
+    return `no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)${nodeSqliteUpgradeHint()}`;
 }
 
 const COOLDOWN_CACHE_MS = 30_000;

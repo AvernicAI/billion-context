@@ -114,6 +114,7 @@ export function formatRanges(
     toolPct: number;
     textPct: number;
     dangerous: boolean;
+    noMergeBefore: boolean;
   }
   const refNum = (ref: string): number => {
     const m = ref.match(/\d+/);
@@ -139,6 +140,7 @@ export function formatRanges(
       protectedCount: 0,
       protectedTools: [],
       dangerous: r.dangerous ?? false,
+      noMergeBefore: r.noMergeBefore ?? false,
     });
   }
   for (const r of protectedRanges) {
@@ -160,6 +162,7 @@ export function formatRanges(
       protectedCount: r.count,
       protectedTools: [...r.tools],
       dangerous: false,
+      noMergeBefore: r.noMergeBefore ?? false,
     });
   }
   // Order/merge by POSITION, never ref number: refs can be non-monotonic vs array
@@ -170,7 +173,9 @@ export function formatRanges(
   const merged: Merged[] = [];
   for (const e of entries) {
     const last = merged[merged.length - 1];
-    if (last && e.startPos <= last.endPos + 1) {
+    // #3192/#3205: a dead-hole boundary has no index gap, so position adjacency
+    // alone would bridge across it — honor the flag set by buildCompressibleRanges.
+    if (last && !e.noMergeBefore && e.startPos <= last.endPos + 1) {
       last.endRef = e.endRef;
       last.endNum = Math.max(last.endNum, e.endNum);
       last.endPos = Math.max(last.endPos, e.endPos);

@@ -234,14 +234,51 @@ const en: Dict = {
 };
 
 function readOrigin(): string | undefined {
-    const g = globalThis as { __BILI__?: { origin?: unknown } };
-    const origin = g.__BILI__?.origin;
+    const g = globalThis as { __BILI__?: { origin?: unknown; relay?: unknown } };
+    const snap = g.__BILI__;
+    // #3373: relay snapshot — the entry serves the admin surface itself, so
+    // the base is same-origin ("" = entry-relative paths). Prefix gateways
+    // correct this to an absolute base on the first live probe.
+    if (snap !== undefined && snap.relay === true) return "";
+    const origin = snap?.origin;
     return typeof origin === "string" && origin.length > 0 ? origin : undefined;
 }
 
 function openExternal(url: string): void {
     const w = globalThis as { open?: (url: string, target?: string, features?: string) => unknown };
     if (typeof w.open === "function") w.open(url, "_blank", "noopener,noreferrer");
+}
+
+/** #3373: relay mode — the probe response carries `relay: true` instead of
+ *  a loopback origin. Derive the UI base from the probe's own response URL:
+ *  whatever origin+prefix carried the probe also serves /__bili/. An empty
+ *  base means same-origin paths (root deployments, test harnesses). */
+function relayBaseOf(res: { url?: unknown }): string {
+    const url = typeof res.url === "string" ? res.url : "";
+    if (url.endsWith(ORIGIN_PATH)) {
+        const base = url.slice(0, -ORIGIN_PATH.length).replace(/\/+$/, "");
+        return base.length > 0 ? base : "";
+    }
+    return "";
+}
+
+// #3373: gateways that mount dsh web under a path prefix re-map every URL
+// the index references, so the absolute probe path misses. Probe relative to
+// the page's own base as a second form; the last form that answered wins the
+// next tick (direct hosts never leave the primary form).
+let winningProbeForm: string | undefined;
+
+function probeForms(): string[] {
+    if (winningProbeForm !== undefined) return [winningProbeForm];
+    const doc = (globalThis as { document?: { baseURI?: unknown } }).document;
+    const baseURI = typeof doc?.baseURI === "string" && doc.baseURI.length > 0 ? doc.baseURI : undefined;
+    if (baseURI === undefined) return [ORIGIN_PATH];
+    try {
+        const fallback = new URL("bili/origin", baseURI).toString();
+        return fallback === ORIGIN_PATH ? [ORIGIN_PATH] : [ORIGIN_PATH, fallback];
+    } catch {
+        return [ORIGIN_PATH];
+    }
 }
 
 /** #1809/#2187/#2288: follow the host's live origin route for the lifetime
@@ -260,25 +297,35 @@ function probeOrigin(onOrigin: (origin: string) => void, onTheme?: (theme: "ligh
     let timer: ReturnType<typeof setTimeout> | undefined;
     let attempts = 0;
     const poll = async (): Promise<void> => {
-        try {
-            const res = await fetch(ORIGIN_PATH);
-            if (res.ok) {
-                const data = (await res.json()) as { origin?: unknown };
-                if (typeof data.origin === "string" && data.origin.length > 0 && !cancelled) {
-                    onOrigin(data.origin);
+        // #3373: try the known-good form first — under a path-prefix gateway
+        // that becomes the relative form after its first hit.
+        let sawOk = false;
+        for (const form of probeForms()) {
+            try {
+                const res = await fetch(form);
+                if (!res.ok) continue;
+                sawOk = true;
+                const data = (await res.json()) as { origin?: unknown; relay?: unknown };
+                let bind: string | undefined;
+                if (data.relay === true) bind = relayBaseOf(res);
+                else if (typeof data.origin === "string" && data.origin.length > 0) bind = data.origin;
+                if (bind !== undefined && !cancelled) {
+                    winningProbeForm = form;
+                    onOrigin(bind);
                     settled = true;
                     // #3100: every resolution is also an embed-probe retry slot —
                     // a snapshot-only origin (older hosts without the route)
                     // never flows through onOrigin again after mount.
-                    if (onTick !== undefined) onTick(data.origin);
+                    if (onTick !== undefined) onTick(bind);
+                    break;
                 }
-                if (onTheme && !cancelled) {
-                    const theme = detectHostTheme();
-                    if (theme !== undefined) onTheme(theme);
-                }
+            } catch {
+                // host without the route (older builds) or transient error: try the next form
             }
-        } catch {
-            // host without the route (older builds) or transient error: retry below
+        }
+        if (sawOk && onTheme && !cancelled) {
+            const theme = detectHostTheme();
+            if (theme !== undefined) onTheme(theme);
         }
         if (cancelled) return;
         attempts += 1;

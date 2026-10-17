@@ -3,8 +3,8 @@ import { activeBlockSpans, collectBlockContent, countMessageTokens, defaultCount
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
-import { COMPRESS_TOOL_NAME, parseCompressInput, type ParsedRange } from "./compress-tool.js";
-import { isProxyToolFor } from "./proxy-tool.js";
+import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
+import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
 import { ONE_CALL_HINT } from "acp-kernel";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
@@ -64,6 +64,10 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
     }
     if (toolName === "acp_cache") {
         return handleAcpCache(ctx.session);
+    }
+    const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
+    if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
+        return executeAbsorb(args, undefined, absorb, ctx);
     }
     if (ccrEnabled(ctx.session) && toolName === retrieveToolName(ctx.session)) {
         // Non-stream rewrite has no re-request to ride, so the full text rides
@@ -1150,7 +1154,7 @@ function* rewriteJsonSteps(body: unknown, ctx: RewriteCtx): Generator<JsonToolCa
     // Absorb signature in whole text (m00885): drop only when the request
     // actually instructed the model about absorb — the shape check alone
     // cannot tell an emission from a user-quoted fragment.
-    const absorbArmed = false;
+    const absorbArmed = effectiveAbsorbConfig(ctx.session, ctx.config)?.enabled === true;
     const requestText = JSON.stringify(ctx.messages);
     for (const blk of newContent) {
         const t = (blk as { type?: string; text?: string }).text;

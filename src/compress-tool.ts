@@ -12,6 +12,9 @@
  */
 import {
     parseCompressArgs,
+    ABSORB_TOOL,
+    ABSORB_TOOL_GOOGLE,
+    ABSORB_TOOL_OPENAI,
     DECOMPRESS_TOOL,
     DECOMPRESS_TOOL_GOOGLE,
     DECOMPRESS_TOOL_NAME,
@@ -85,9 +88,14 @@ export {
     buildCompressSystemPrompt,
     buildCompressTextSystemPrompt,
     buildCompressHybridSystemPrompt,
+    ABSORB_TOOL_NAME,
+    ABSORB_TOOL,
+    ABSORB_TOOL_OPENAI,
+    ABSORB_TOOL_GOOGLE,
+    buildAbsorbSystemPrompt,
     RULE_TOOL_NAME,
 } from "acp-kernel";
-export type { ParsedRange } from "acp-kernel";
+export type { ParsedRange, AbsorbConfig } from "acp-kernel";
 export { ACP_TOOL_NAMES as PROXY_TOOL_NAMES, ACP_MUTATING_TOOLS as MUTATING_PROXY_TOOLS, ACP_READONLY_TOOLS as READONLY_PROXY_TOOLS } from "acp-kernel";
 
 // #1881: the ACP-TAGS NEVER-echo prohibition must not disappear with injectTool.
@@ -326,6 +334,29 @@ export function withProjectAttribution(prompt: string): string {
 export function ptcNoteMode(names: Iterable<string | undefined>): AcpNoteMode {
     for (const n of names) if (n === RUN_CODE_TOOL_NAME) return "exempt";
     return "none";
+}
+
+// The kernel ships no Responses-format absorb const (the four ACP tools have
+// *_RESPONSES variants; absorb is host-registered opt-in). Synthesize it in
+// the same flat shape as SEARCH_CONTEXT_TOOL_RESPONSES.
+export const ABSORB_TOOL_RESPONSES = {
+    type: "function",
+    name: ABSORB_TOOL_OPENAI.function.name,
+    description: ABSORB_TOOL_OPENAI.function.description,
+    parameters: ABSORB_TOOL_OPENAI.function.parameters,
+};
+
+// #1359: absorb wire shapes parameterized by name so registration (manifest +
+// per-request injection) follows the resolved `absorb.toolName` in BOTH lanes —
+// a renamed tool must be advertised, injected, and adjudicated under one name.
+// At the default name this is byte-identical to the static consts above.
+export function absorbToolsFor(name: string) {
+    return {
+        anthropic: { name, description: ABSORB_TOOL.description, input_schema: ABSORB_TOOL.input_schema },
+        openai: { type: "function" as const, function: { name, description: ABSORB_TOOL_OPENAI.function.description, parameters: ABSORB_TOOL_OPENAI.function.parameters } },
+        responses: { type: "function" as const, name, description: ABSORB_TOOL_OPENAI.function.description, parameters: ABSORB_TOOL_OPENAI.function.parameters },
+        google: { name, description: ABSORB_TOOL_GOOGLE.description, parameters: ABSORB_TOOL_GOOGLE.parameters },
+    };
 }
 
 // The reconciled kernel (acp-kernel#332) ships RULE_TOOL_NAME + the rule state

@@ -21,6 +21,18 @@ export const WEB_CLIENT = `(function () {
             else if (/^en([-_]|$)/i.test(navigator.language || "")) locale = "en";
         }
     } catch (e) {}
+    // #3373: when the panel is served through a host relay under a path
+    // prefix (e.g. /app/dsh/__bili/…), the wire root is that prefixed path,
+    // not the site root. Derive it from the document's own pathname — the
+    // only prefix source that survives gateway <base> injection. Direct
+    // serving (/__bili/) keeps the byte-identical root "/__bili".
+    let API_ROOT = "/__bili";
+    try {
+        if (typeof location !== "undefined" && location.pathname) {
+            const m = /^(.*\\/)__bili(\\/|$)/.exec(location.pathname);
+            if (m && m[1] !== undefined) API_ROOT = m[1] + "__bili";
+        }
+    } catch (e) {}
     function t(key, vars) {
         let text = MESSAGES[locale][key];
         if (text === undefined) text = MESSAGES["zh-CN"][key];
@@ -273,7 +285,7 @@ export const WEB_CLIENT = `(function () {
     async function putCfg(btn, payload) {
         busy(btn, true);
         try {
-            await json("/__bili/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+            await json(API_ROOT + "/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
             toast(t("cfg.saved"), "ok");
             loadConfig();
         } catch (e) {
@@ -480,7 +492,7 @@ export const WEB_CLIENT = `(function () {
 
     async function loadOverview(silent) {
         try {
-            const d = await json("/__bili/overview");
+            const d = await json(API_ROOT + "/overview");
             const o = d.overview || {};
             // #1426: total splits live vs historical (disk-restored pool entries are history);
             // counters without usage samples render "—" instead of a misleading 0; the saved
@@ -632,7 +644,7 @@ export const WEB_CLIENT = `(function () {
                     btn.addEventListener("click", async () => {
                         busy(btn, true);
                         try {
-                            await json("/__bili/conflicts/clear", { method: "POST" });
+                            await json(API_ROOT + "/conflicts/clear", { method: "POST" });
                             toast(t("conflict.cleared"), "ok");
                             await loadOverview(true);
                         } catch (e) {
@@ -704,7 +716,7 @@ export const WEB_CLIENT = `(function () {
                     btn.addEventListener("click", async () => {
                         busy(btn, true);
                         try {
-                            await json("/__bili/host-plugins/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: btn.getAttribute("data-hpid") || "" }) });
+                            await json(API_ROOT + "/host-plugins/dismiss", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: btn.getAttribute("data-hpid") || "" }) });
                             toast(t("hostplug.dismissed"), "ok");
                             await loadOverview(true);
                         } catch (e) {
@@ -832,7 +844,7 @@ export const WEB_CLIENT = `(function () {
     function sessionListUrl(page) {
         const input = $("ses-search");
         const q = ((input && input.value) || "").trim();
-        return "/__bili/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE + (q ? "&q=" + encodeURIComponent(q) : "");
+        return API_ROOT + "/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE + (q ? "&q=" + encodeURIComponent(q) : "");
     }
     async function loadMoreSessions() {
         const btn = $("ses-loadmore");
@@ -1703,7 +1715,7 @@ export const WEB_CLIENT = `(function () {
         host.innerHTML = '<div class="empty"><span class="spin"></span> ' + t("common.loading") + "</div>";
         let d = null;
         try {
-            d = await json("/__bili/sessions/" + encodeURIComponent(id) + "/detail");
+            d = await json(API_ROOT + "/sessions/" + encodeURIComponent(id) + "/detail");
         } catch (e) {}
         if (!d) {
             host.innerHTML = '<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>"
@@ -1722,7 +1734,7 @@ export const WEB_CLIENT = `(function () {
                 cc.addEventListener("click", async () => {
                     busy(cc, true);
                     try {
-                        await json("/__bili/conflicts/clear?session=" + encodeURIComponent(id), { method: "POST" });
+                        await json(API_ROOT + "/conflicts/clear?session=" + encodeURIComponent(id), { method: "POST" });
                         toast(t("det.conflicts_cleared"), "ok");
                         await loadDetail(id);
                     } catch (e) {
@@ -1793,7 +1805,7 @@ export const WEB_CLIENT = `(function () {
         if (hit && Date.now() - hit.at < DIAG_CACHE_MS) return bindReport(hit.d, copyBtn, issueLink);
         busy(copyBtn, true);
         try {
-            const d = await json("/__bili/diagnostics?topic=" + encodeURIComponent(topic));
+            const d = await json(API_ROOT + "/diagnostics?topic=" + encodeURIComponent(topic));
             diagCache[topic] = { at: Date.now(), d };
             bindReport(d, copyBtn, issueLink);
         } catch (e) {
@@ -1863,7 +1875,7 @@ export const WEB_CLIENT = `(function () {
         if (mdBtn) mdBtn.addEventListener("click", async function () {
             busy(mdBtn, true);
             try {
-                var r = await json("/__bili/session-report?format=md&" + q);
+                var r = await json(API_ROOT + "/session-report?format=md&" + q);
                 if (!r || typeof r.md !== "string") throw new Error("no report");
                 downloadUrl(URL.createObjectURL(new Blob([r.md], { type: "text/markdown;charset=utf-8" })), base + ".md");
             } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); } finally { busy(mdBtn, false); }
@@ -1871,7 +1883,7 @@ export const WEB_CLIENT = `(function () {
         if (pngBtn) pngBtn.addEventListener("click", async function () {
             busy(pngBtn, true);
             try {
-                var r = await json("/__bili/session-report?format=svg&" + q);
+                var r = await json(API_ROOT + "/session-report?format=svg&" + q);
                 if (!r || !r.svg) throw new Error("no report");
                 var blob = await svgToPngBlob(r.svg, r.w || 920, r.h || 800);
                 downloadUrl(URL.createObjectURL(blob), base + ".png");
@@ -1906,7 +1918,7 @@ export const WEB_CLIENT = `(function () {
         const dlB = $("cacherpt-dl");
         if (!copyB || !dlB) return;
         const grab = async () => {
-            const r = await json("/__bili/cache-report?session=" + encodeURIComponent(d.id));
+            const r = await json(API_ROOT + "/cache-report?session=" + encodeURIComponent(d.id));
             const rep = r && Array.isArray(r.reports) && r.reports[0] ? r.reports[0].report : null;
             if (!rep) throw new Error("no cache report for this session yet");
             return rep;
@@ -2009,7 +2021,7 @@ export const WEB_CLIENT = `(function () {
 
     async function loadConfig() {
         try {
-            const cfg = await json("/__bili/config");
+            const cfg = await json(API_ROOT + "/config");
             const cfgPathEl = $("cfg-path");
             if (cfgPathEl) cfgPathEl.textContent = cfg.path || t("common.empty");
             const fileBtn = $("copy-cfg-file");
@@ -2075,7 +2087,7 @@ export const WEB_CLIENT = `(function () {
         if (!box) return;
         let data;
         try {
-            data = await json("/__bili/resign");
+            data = await json(API_ROOT + "/resign");
         } catch (e) {
             const el = document.createElement("div");
             el.className = "dim small";
@@ -2573,7 +2585,7 @@ export const WEB_CLIENT = `(function () {
                         async function saveKey(btn, value) {
                             busy(btn, true);
                             try {
-                                const result = await json("/__bili/external-summary/credential", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: recipe.credentialRef, key: value }) });
+                                const result = await json(API_ROOT + "/external-summary/credential", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: recipe.credentialRef, key: value }) });
                                 key.value = ""; status[ref] = result.configured;
                                 render();
                                 toast(t("summary.key_saved"), "ok");
@@ -2602,7 +2614,7 @@ export const WEB_CLIENT = `(function () {
     }
     async function loadUpstream(cfg) {
         let up = null;
-        try { up = await json("/__bili/upstream"); } catch (e) {}
+        try { up = await json(API_ROOT + "/upstream"); } catch (e) {}
         // #1426: mode/proxy are editable form fields again, not read-only labels
         const mode = (up && up.mode) || cfg.upstreamProxyMode || "auto";
         document.querySelectorAll('input[name="proxy-mode"]').forEach((el) => { el.checked = el.value === mode; });
@@ -2634,7 +2646,7 @@ export const WEB_CLIENT = `(function () {
         const q = (qEl.value || "").trim();
         try {
             const linesSel = $("log-lines");
-            const d = await json("/__bili/logs?q=" + encodeURIComponent(q) + "&lines=" + (linesSel ? linesSel.value : "500") + logViewExtras());
+            const d = await json(API_ROOT + "/logs?q=" + encodeURIComponent(q) + "&lines=" + (linesSel ? linesSel.value : "500") + logViewExtras());
             $("log-path").textContent = d.path || t("logs.empty");
             $("copy-log-path").dataset.copy = d.path || "";
             $("log-count").textContent = d.total > 0
@@ -2728,7 +2740,7 @@ export const WEB_CLIENT = `(function () {
             busy(ldl, true);
             try {
                 const q = ($("log-search").value || "").trim();
-                const r = await fetch("/__bili/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras());
+                const r = await fetch(API_ROOT + "/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras());
                 const blob = await r.blob();
                 const a = document.createElement("a");
                 a.href = URL.createObjectURL(blob);
@@ -2749,7 +2761,7 @@ export const WEB_CLIENT = `(function () {
             try {
                 // Full unfiltered log (rotated .old + current) regardless of the
                 // search box — the honest "download everything" path.
-                const r = await fetch("/__bili/logs?raw=1&all=1");
+                const r = await fetch(API_ROOT + "/logs?raw=1&all=1");
                 const blob = await r.blob();
                 const a = document.createElement("a");
                 a.href = URL.createObjectURL(blob);
@@ -2768,7 +2780,7 @@ export const WEB_CLIENT = `(function () {
         if (testBtn) testBtn.addEventListener("click", async () => {
             busy(testBtn, true);
             try {
-                const r = await json("/__bili/upstream/test", { method: "POST" });
+                const r = await json(API_ROOT + "/upstream/test", { method: "POST" });
                 // #1426: an HTTP >= 400 answer still proves the network path works — auth is the
                 // client's job, so report reachability instead of a flat failure
                 const st = $("up-state");
@@ -2820,7 +2832,7 @@ export const WEB_CLIENT = `(function () {
         if (cp) cp.addEventListener("click", async () => {
             busy(cp, true);
             try {
-                await json("/__bili/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ passthrough: null }) });
+                await json(API_ROOT + "/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ passthrough: null }) });
                 toast(t("toast.passthrough_cleared"), "ok");
                 loadConfig();
             } catch (e) {
