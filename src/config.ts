@@ -943,6 +943,26 @@ function warnInertRoutingFields(key: string, obj: Record<string, unknown> | null
     );
 }
 
+/** #3675: compress-block keys written on the ROUTE ROOT (URL lane or named
+ *  entry) are silently dropped by parseRouteEntry — the same silent-inert
+ *  class as the #1469 routing fields, one level down. Recognition is
+ *  COMPRESS_SETTING_FIELDS (defined below; kept in sync with
+ *  parseCompressSettings): every member is inert at a route root, and none of
+ *  them may be added to parseRouteEntry's whitelist while this warning exists.
+ *  Dialing recipes are skipped — their own parser rejects unknown root fields
+ *  loudly (parseNamedProviderRecipe throws → chain disabled with a warning),
+ *  so a second signal here would only add noise. */
+function warnCompressOnlyFieldsAtRouteRoot(key: string, obj: Record<string, unknown> | null): void {
+    if (!obj) return;
+    if (obj.baseUrl !== undefined || obj.api !== undefined) return;
+    const misplaced = Object.keys(obj).filter((f) => obj[f] !== undefined && COMPRESS_SETTING_FIELDS.has(f));
+    if (misplaced.length === 0) return;
+    warnNamedProviderOnce(
+        `route-root-compress:${key}:${misplaced.join(",")}`,
+        `providers."${key}" carries compress-block keys [${misplaced.join(", ")}] at the route root — they are inert there (move them under providers."${key}".compress to apply)`,
+    );
+}
+
 /** True when the providers-map key is itself a URL lane (http/https/mitm
  *  scheme — mitm:// is the README-documented lookup key for MITM traffic).
  *  Anything else is a NAMED key (provider id): routing-inert on its own,
@@ -1127,6 +1147,10 @@ export function loadRoutes(env: NodeJS.ProcessEnv = process.env): ProviderRoutes
         if (!route) return;
         const obj = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
         const urlLike = isUrlLikeKey(key);
+        // Before the bind branch on purpose: these keys are inert even on a
+        // validly bound alias — parseRouteEntry never parses them, so the
+        // fold onto the target lane cannot carry them.
+        warnCompressOnlyFieldsAtRouteRoot(key, obj);
         if (obj && "bind" in obj) {
             const bind = obj.bind;
             if (typeof bind !== "string") {
