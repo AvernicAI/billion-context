@@ -14,7 +14,7 @@ import { configFile } from "./paths.js";
 import type { WireProtocol } from "./util.js";
 
 export const MODEL_ENDPOINT_WIRES = ["anthropic", "openai", "responses", "google", "commandcode"] as const;
-export type ModelEndpointWire = (typeof MODEL_ENDPOINT_WIRES)[number];
+type ModelEndpointWire = (typeof MODEL_ENDPOINT_WIRES)[number];
 
 export interface ModelEndpointPattern {
     /** Normalized absolute URL prefix: scheme://host[:port]/path (no trailing slash). */
