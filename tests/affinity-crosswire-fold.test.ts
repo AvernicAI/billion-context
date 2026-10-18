@@ -38,6 +38,13 @@ import { once } from "node:events";
 const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bc-2791-crosswire-"));
 for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = testRoot;
 
+// #3003: this suite pins the CROSS-WIRE fold-attachment property on the
+// FIRST post-fold request (eager materialization). The default burst-hold now
+// defers that first post-fold view (raw prefix, one seam per burst — pinned
+// in tests/fold-hold-seam.test.ts), so restore the eager behavior here to
+// keep this suite's original intent unchanged.
+process.env.BILI_DEFER_MATERIALIZATION = "0";
+
 const { startServer } = await import("../src/server.ts");
 const { SessionStore, _setStoreForTest } = await import("../src/persist.ts");
 const { _setForTest: setRegistryForTest } = await import("../src/registry.ts");

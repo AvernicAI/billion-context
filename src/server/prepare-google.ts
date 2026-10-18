@@ -28,6 +28,7 @@ import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions } from "./lane-decisions.js";
+import { processTurnWithHold } from "../fold-hold.js";
 
 function appendGoogleNudge(contents: GoogleContent[], text: string): GoogleContent[] {
     const last = contents[contents.length - 1];
@@ -165,7 +166,7 @@ export async function prepareGoogle(
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
             ? coveredRealHistoryIds(session.state.blocks)
             : null;
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
+        const turn = processTurnWithHold(session, core, { messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) }, { limit: loopConfig.modelContextLimit, log: (m) => log("info", `[${sessionId}] ${m}`) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —

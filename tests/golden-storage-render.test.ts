@@ -58,7 +58,14 @@ for (const wire of WIRES) {
         }
         // Structural sanity on top of the byte pin (cheap, keeps a regen honest).
         assert.ok(record.foldAt >= 0 && record.editedAt > record.foldAt, `${wire}: script shape (fold then edit)`);
-        assert.ok(record.summaryFrom >= 0 && record.summaryFrom <= record.foldAt + 1, `${wire}: summary carrier must appear by the fold round-2 body`);
+        // #3003 deferred materialization: under the default hold the fold
+        // turn's settle-round body (foldAt) and the next client request
+        // (foldAt+1) stay raw (prefix byte-identical, no seam); the summary
+        // carrier first appears on the materialization body (foldAt+2). With
+        // the BILI_DEFER_MATERIALIZATION=0 escape hatch the legacy contract
+        // holds: carrier by the settle-round re-request (foldAt+1).
+        const carrierBy = process.env.BILI_DEFER_MATERIALIZATION === "0" ? record.foldAt + 1 : record.foldAt + 2;
+        assert.ok(record.summaryFrom >= 0 && record.summaryFrom <= carrierBy, `${wire}: summary carrier must appear by ${carrierBy === record.foldAt + 1 ? "the fold round-2 body" : "the materialization body (#3003)"}`);
         assert.equal(record.stateShape.activeBlocks, 1, `${wire}: exactly one active block expected`);
         assert.ok(record.stateShape.blockContents >= 1, `${wire}: block contents must be persisted`);
     });

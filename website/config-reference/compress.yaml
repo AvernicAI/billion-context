@@ -525,6 +525,17 @@ entries:
     group: compress
     desc_en: "Character threshold above which finished reasoning runs are dropped."
     desc_zh: "已结束推理块被丢弃的字符阈值。"
+  - key: compress.deferMaterialization
+    type: boolean
+    default: "true"
+    env: BILI_DEFER_MATERIALIZATION
+    group: compress
+    id: cw.dm
+    render: compress-row
+    desc_en: "#3003 fold-hold: while a compress burst continues, committed folds render raw (prefix byte-identical, no cache seam) and materialize on the first request without a new fold — one seam for the whole burst. Window pressure (>= 90% of the effective window) materializes immediately; emergency/preflight folds always render folded right away."
+    desc_zh: "#3003 折叠暂缓：连续压缩期间已提交的折叠以原文渲染（前缀字节不变、无缓存断点），在下一次没有新折叠的请求上一次性生效——整段突发只付一个断点。窗口压力（>= 有效窗口的 90%）立即生效；紧急/preflight 折叠始终立即折叠渲染。"
+    site_en: "<code>deferMaterialization</code> — fold-hold switch (#3003): during a compress burst committed folds render raw (prefix byte-identical, no cache seam) and materialize once the burst ends; one seam for the whole burst. Window pressure materializes immediately."
+    site_zh: "<code>deferMaterialization</code> —— 折叠暂缓开关（#3003）：连续压缩期间已提交的折叠以原文渲染（前缀字节不变、无缓存断点），突发结束后一次性生效；整段突发只付一个断点。窗口压力时立即生效。"
   - key: compress.minCompressRange
     type: number
     default: "same as minCompressRangeChars"

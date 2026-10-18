@@ -17,6 +17,7 @@ import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSu
 import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
+import { noteFoldCommit } from "./fold-hold.js";
 
 export type RewriteCtx = {
     core: CompressionCore;
@@ -694,7 +695,7 @@ export function findVisibleStubResubmissions(ctx: RewriteCtx, ranges: ParsedRang
     return hits;
 }
 
-export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx, opts?: { loopTracking?: boolean }): ProxyToolResult {
+export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx, opts?: { loopTracking?: boolean; holdFold?: boolean }): ProxyToolResult {
     // #2146: preflight overflow-compress is bili's OWN internal lane — its
     // failures have separate reporting (noteSkip) and must not arm the
     // model-facing circuit breaker on attempts the model never made.
@@ -853,6 +854,14 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             return compressResult(receipt, "refused", 0, "gate:no-net-shrink");
         }
         ctx.session.state = res.state;
+        // #3003 burst-hold: the fold is COMMITTED — refs, ledger, consumed
+        // classification all see it now — but its materialization into the
+        // next outbound view waits out a consecutive-compress burst (raw view
+        // → byte-identical prefix → full cache hit on the burst legs; the
+        // first fold-free request materializes everything, one seam total).
+        // Emergency folds (preflight overflow rescue) pass holdFold:false —
+        // their entire purpose is shrinking the CURRENT request.
+        noteFoldCommit(ctx.session, res.state.blocks.filter((b) => !beforeIds.has(b.blockId)).map((b) => b.blockId), { hold: opts?.holdFold });
         // #2627 backstop: no committed state may carry outbound-only turn-
         // separator ids in coverage (a polluted child would otherwise re-
         // poison higher folds via effectiveMessageIds inheritance). Runs

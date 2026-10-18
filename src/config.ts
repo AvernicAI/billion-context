@@ -260,6 +260,12 @@ export type CompressSettings = {
     minCompressRange?: number;
     /** Enable multi-tier (T2/T3) distillation (kernel `tiers.enabled`). */
     tiers?: boolean;
+    /** #3003 burst-hold: fold results commit to state immediately but their
+     *  materialization into the outbound view waits out a consecutive-compress
+     *  burst — K folds pay ONE prefix-cache seam instead of K. Window pressure
+     *  materializes immediately. On by default; `false` restores eager
+     *  per-fold materialization. Env override BILI_DEFER_MATERIALIZATION. */
+    deferMaterialization?: boolean;
     /** Tool-name patterns whose LATEST tool-call + paired result are never
      *  compressed (kernel `protectedLatestTools`, acp-kernel >= 0.0.80).
      *  Built for cumulative-snapshot tools (e.g. a client's todo/task list):
@@ -2032,7 +2038,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "visibilityMarkers", "rules", "injectTool", "injectNudge",
     "acknowledgePromptsRisk", "absorb", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
-    "reconcile", "streamSummary",
+    "reconcile", "streamSummary", "deferMaterialization",
 ]);
 
 // Deduped per unique key set per process (same pattern as
@@ -2654,6 +2660,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("tiers" in obj) {
         if (typeof obj.tiers !== "boolean") ok = false;
         else out.tiers = obj.tiers;
+    }
+    if ("deferMaterialization" in obj) {
+        if (typeof obj.deferMaterialization !== "boolean") ok = false;
+        else out.deferMaterialization = obj.deferMaterialization;
     }
     if ("tierNudgeTokens" in obj && obj.tierNudgeTokens !== undefined) {
         const v = obj.tierNudgeTokens;

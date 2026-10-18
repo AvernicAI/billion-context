@@ -75,6 +75,11 @@
 // shared with proxy mode, but exercised here through the plugin endpoint).
 // Test-only workstream per #1553: no product changes.
 
+// This suite pins the EAGER fold-render contract (the fold must be visible on
+// the first post-fold request). The #3003 deferred-materialization hold changes
+// that timing by design; its semantics are pinned in fold-hold*.test.ts.
+process.env.BILI_DEFER_MATERIALIZATION = "0";
+
 import { test } from "node:test";
 import assert from "node:assert";
 import http from "node:http";

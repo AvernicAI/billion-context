@@ -296,6 +296,7 @@
 | `compress.priceProfile.q` | number | unset (registry) | — | 输出价相对输入价的比率。 |
 | `compress.reasoning.drop` | boolean | true | — | 丢弃超过阈值的已结束轮次推理块。 |
 | `compress.reasoning.threshold` | number | 2048 | — | 已结束推理块被丢弃的字符阈值。 |
+| `compress.deferMaterialization` | boolean | true | BILI_DEFER_MATERIALIZATION | #3003 折叠暂缓：连续压缩期间已提交的折叠以原文渲染（前缀字节不变、无缓存断点），在下一次没有新折叠的请求上一次性生效——整段突发只付一个断点。窗口压力（>= 有效窗口的 90%）立即生效；紧急/preflight 折叠始终立即折叠渲染。 |
 | `compress.minCompressRange` | number | same as minCompressRangeChars | — | minCompressRangeChars 的弃用别名（接受，映射到后者）。 _(已弃用)_ |
 
 **路由表字段**
@@ -1710,6 +1711,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_CODEX_COMPACT` | `codexCompact` | "intercept" |
 | `BILI_DECODED_BODY_BYTES` | `network.decodedBodyBytes` | 10737418240 |
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
+| `BILI_DEFER_MATERIALIZATION` | `compress.deferMaterialization` | true |
 | `BILI_DUMP_4XX` | `diagnostics.dump4xx` | false |
 | `BILI_DUMP_4XX_MAX_BYTES` | `diagnostics.dump4xxMaxBytes` | 2097152 (floor 1024) |
 | `BILI_DUMP_MAX_AGE_DAYS` | `diagnostics.maxAgeDays` | unset (off) |

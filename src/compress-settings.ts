@@ -79,6 +79,7 @@ export function mergeCompress(
         preserveRecentTokens: pick("preserveRecentTokens"),
         minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
         tiers: pick("tiers"),
+        deferMaterialization: pick("deferMaterialization"),
         protectedLatestTools: pick("protectedLatestTools"),
         protectedTools: pick("protectedTools"),
         neverPreserveRecentTools: pick("neverPreserveRecentTools"),

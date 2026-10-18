@@ -1763,7 +1763,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             }
             const ctx: RewriteCtx = { core: deps.core, config: activeConfig, messages, session: deps.session, log: (m) => deps.log("info", m) };
             const fold = parseCompressInput({ content: [{ startId: first.blockId, endId: last.blockId, summary: outcome.summary, topic: `preflight tier-${sourceTier + 1} distill (#2952)` }] });
-            const applied = applyRanges(fold, ctx, { loopTracking: false });
+            const applied = applyRanges(fold, ctx, { loopTracking: false, holdFold: false });
             if (applied.outcome === "refused") {
                 deps.log("warn", `[preflight] tier distillation apply refused: ${safePrefix(applied.text, 200)}; stopping recovery (#2952)`);
                 stopReason = "unavailable";
@@ -2059,7 +2059,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // #2146: internal lane — must not arm the model-facing loop breaker.
             const fold = parseCompressInput({ content: [{ startId: startRef, endId: endRef, summary, topic: deps.compressReason === "growth" ? "preflight auto-fold (growth)" : "preflight overflow compress" }] });
             if (externalFold) for (const range of fold.ranges) range.compressCallId = newExternalCallId();
-            const applied = applyRanges(fold, ctx, { loopTracking: false });
+            const applied = applyRanges(fold, ctx, { loopTracking: false, holdFold: false });
             if (applied.outcome === "refused") {
                 deps.log("warn", `[preflight] ${applied.text}`);
                 noteSkip(`${skipKey}: apply failed — ${safePrefix(applied.text.replace(/^\[Compression FAILED[:\s]*/, ""), 200)}`);

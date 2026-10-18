@@ -6,6 +6,7 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
+import { clearFoldHold, heldFoldBlockIds } from "../src/fold-hold.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { REPLAY_MAX_ATTEMPTS } from "../src/fetch-util.ts";
 
@@ -541,6 +542,11 @@ test("loop #10 (S3): upstream 500 mid-loop terminates cleanly (timer cleared, no
 // The stale view is what made the model stop: it was told "~N tokens saved"
 // while staring at the identical context it had just compressed.
 test("loop #422a: successful compress → re-request carries the refreshed fold + round records", async () => {
+    // #3003: the eager-refresh contract this test pins now lives behind the
+    // burst-hold knob — by default a successful compress HOLDS the re-request
+    // raw (one seam per burst, pinned in the #3003 tests below). Set the knob
+    // off to pin the legacy behavior of this #422 regression guard.
+    process.env.BILI_DEFER_MATERIALIZATION = "0";
     // 7 messages: kernel protects the last 5, so m00001/m00002 are compressible.
     const ctx = withRefs(
         makeCtx([
@@ -590,6 +596,102 @@ test("loop #422a: successful compress → re-request carries the refreshed fold 
         assert.equal(refreshCalls, 1, "refreshFolded called exactly once for one successful compress");
         assert.equal(ctx.session.stats.compressCreditTokens, 0, "credit cleared once the fold reached a model-visible request");
     } finally {
+        delete process.env.BILI_DEFER_MATERIALIZATION;
+        probe.restore();
+    }
+});
+
+// #3003 burst-hold (loop side): the fold COMMITS to state immediately, but
+// the re-request view stays RAW while the burst continues — refresh deferred
+// to the first fold-free request (or window pressure). The receipt riding the
+// raw tail is what tells the model its compress landed.
+test("loop #3003a: successful compress → re-request stays RAW (fold held), refresh deferred", async () => {
+    const ctx = withRefs(
+        makeCtx([
+            textMsg("raw_1", "user", "task: audit files. " + bigText(5000)),
+            textMsg("raw_2", "user", "consumed content " + bigText(5000)),
+            textMsg("raw_3", "user", bigText(5000)),
+            textMsg("raw_4", "assistant", bigText(5000)),
+            textMsg("raw_5", "user", bigText(5000)),
+            textMsg("raw_6", "assistant", bigText(5000)),
+            textMsg("raw_7", "user", bigText(5000)),
+        ]),
+    );
+    const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "SUMMARY-3003: task kickoff plus consumed file read distilled into one dense block." }] });
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c", "compress", compressArgs),
+        COMPLETED,
+    ].join("");
+    const probe = reFetchProbe();
+    let refreshCalls = 0;
+    try {
+        ctx.refreshFolded = () => {
+            refreshCalls++;
+            return [textMsg("m00001", "user", "FRESH-FOLDED-VIEW-3003")];
+        };
+        await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(probe.calls() >= 1, "re-request fired");
+        const body = probe.bodies()[0]!;
+        assert.ok(body.includes("consumed content"), "re-request stays RAW through the burst leg (fold held)");
+        assert.ok(body.includes("[Compressed m00001"), "the compress receipt rides the raw tail — the model sees its fold landed");
+        assert.ok(!body.includes("FRESH-FOLDED-VIEW-3003"), "no refresh during the hold");
+        assert.equal(refreshCalls, 0, "refreshFolded must NOT be called while holding");
+        assert.ok(ctx.session.state.blocks.length >= 1, "the fold is COMMITTED to state despite the held view");
+        assert.equal(heldFoldBlockIds(ctx.session).size, 1, "the block sits in the hold set");
+        // Materialization marker: once spent, the next view build renders folded.
+        clearFoldHold(ctx.session);
+        assert.equal(heldFoldBlockIds(ctx.session).size, 0);
+    } finally {
+        probe.restore();
+    }
+});
+
+// #3003 pressure override: near the window the hold must not gamble on the
+// raw view — the refresh (materialization) fires on the SAME round.
+test("loop #3003b: window pressure materializes the fold immediately (refresh fires)", async () => {
+    const ctx = withRefs(
+        makeCtx([
+            textMsg("raw_1", "user", "task: audit files. " + bigText(5000)),
+            textMsg("raw_2", "user", "consumed content " + bigText(5000)),
+            textMsg("raw_3", "user", bigText(5000)),
+            textMsg("raw_4", "assistant", bigText(5000)),
+            textMsg("raw_5", "user", bigText(5000)),
+            textMsg("raw_6", "assistant", bigText(5000)),
+            textMsg("raw_7", "user", bigText(5000)),
+        ]),
+    );
+    ctx.session.stats.contextTokens = 190_000; // ≥ 0.9 × the 200k window
+    const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "SUMMARY-3003P: task kickoff plus consumed file read distilled into one dense block." }] });
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c", "compress", compressArgs),
+        COMPLETED,
+    ].join("");
+    const probe = reFetchProbe();
+    let refreshCalls = 0;
+    try {
+        ctx.refreshFolded = (current) => {
+            refreshCalls++;
+            const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
+            return [textMsg("m00001", "user", "FRESH-FOLDED-VIEW-3003P"), ...records];
+        };
+        await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(probe.calls() >= 1, "re-request fired");
+        assert.ok(probe.bodies()[0]!.includes("FRESH-FOLDED-VIEW-3003P"), "pressure materializes the fold on the same round");
+        assert.equal(refreshCalls, 1, "refreshFolded called once (materialization)");
+        assert.equal(heldFoldBlockIds(ctx.session).size, 0, "the hold is spent by the refresh");
+    } finally {
         probe.restore();
     }
 });
@@ -631,6 +733,9 @@ test("loop #422b: failed compress → no fold refresh (stale view kept)", async 
 // Degradation guard: a throwing refreshFolded falls back to the pre-compress
 // view (previous behavior) instead of killing the loop.
 test("loop #422c: refreshFolded throws → re-request keeps the pre-compress view", async () => {
+    // #3003: same knob scoping as #422a — this degradation guard pins the
+    // refresh path, which the default burst-hold defers (see #3003a).
+    process.env.BILI_DEFER_MATERIALIZATION = "0";
     // 7 messages: kernel protects the last 5, so m00001/m00002 are compressible
     // and refreshFolded IS invoked (then throws) — not a protected-zone failure.
     const ctx = withRefs(
@@ -668,6 +773,7 @@ test("loop #422c: refreshFolded throws → re-request keeps the pre-compress vie
         assert.ok(probe.bodies()[0]!.includes("consumed content"), "pre-compress view kept as fallback");
         assert.ok(/response\.completed/.test(out), "loop completed gracefully");
     } finally {
+        delete process.env.BILI_DEFER_MATERIALIZATION;
         probe.restore();
     }
 });

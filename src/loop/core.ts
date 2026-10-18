@@ -33,6 +33,7 @@ import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { classifyUpstreamFailure, type SkippedProxyInfo, type UpstreamFailureKind } from "../upstream-fail.js";
 import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
 import { warnCacheCollapse } from "../cache-warn.js";
+import { clearFoldHold, foldHoldPressure, heldFoldBlockIds } from "../fold-hold.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { bodyDumpEnabled as knobBodyDumpEnabled, imageRescaleMaxDim } from "../knobs.js";
 import { dumpsDir } from "../paths.js";
@@ -1342,15 +1343,30 @@ export async function* runCompressLoop(
                 // to the pre-compress view (previous behavior) if the host hook
                 // is absent or throws.
                 const absorbName = activeAbsorbToolName(ctx.session, ctx.config);
+                // #3003 burst-hold: a successful compress commits its fold to
+                // state immediately, but the re-request view stays RAW while the
+                // burst continues — the refresh (the seam) is deferred to the
+                // first fold-free request unless window pressure forces it now.
+                // Absorb refreshes unchanged (it is not part of the burst-hold
+                // contract; its pair hiding is bounded and immediate).
+                const absorbOk = proxyResults.some((pr) => pr.name === absorbName && !pr.result.includes("FAILED"));
+                const compressOk = proxyResults.some((pr) => pr.name === "compress" && !pr.result.includes("FAILED"));
+                const heldNow = heldFoldBlockIds(ctx.session).size > 0;
+                const pressureNow = foldHoldPressure(ctx.session.stats.contextTokens, ctx.config.modelContextLimit);
+                const foldHeld = compressOk && heldNow && !pressureNow;
                 if (
                     ctx.refreshFolded &&
-                    proxyResults.some((pr) => (pr.name === "compress" || pr.name === absorbName) && !pr.result.includes("FAILED"))
+                    (absorbOk || (compressOk && !foldHeld))
                 ) {
                     try {
                         const refreshed = await ctx.refreshFolded(coreMessages);
                         if (refreshed.length > 0) {
                             coreMessages.length = 0;
                             coreMessages.push(...refreshed);
+                            // #3003: this refresh IS the materialization — the
+                            // re-request view renders the fold(s), so the hold
+                            // set is spent (one seam for the whole burst).
+                            clearFoldHold(ctx.session);
                             // The fold has now materialized in a request the
                             // model actually sees — the next usage report is
                             // post-fold reality; keeping the credit would net
@@ -1362,6 +1378,8 @@ export async function* runCompressLoop(
                         ctx.log(`[acp-loop] round ${round}: fold refresh failed (${String(err)}); keeping pre-compress view`);
                         loggerLog("warn", `[acp-loop] fold refresh failed: ${String(err)}`);
                     }
+                } else if (foldHeld) {
+                    ctx.log(`[acp-loop] round ${round}: fold held through the compress burst (${heldFoldBlockIds(ctx.session).size} block(s) committed, raw re-request view — prefix byte-identical, one seam on materialization; #3003)`);
                 }
             }
 

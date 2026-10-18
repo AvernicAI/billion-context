@@ -296,6 +296,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.priceProfile.q` | number | unset (registry) | — | Output price ratio relative to the input price. |
 | `compress.reasoning.drop` | boolean | true | — | Drop finished-round reasoning runs longer than the threshold. |
 | `compress.reasoning.threshold` | number | 2048 | — | Character threshold above which finished reasoning runs are dropped. |
+| `compress.deferMaterialization` | boolean | true | BILI_DEFER_MATERIALIZATION | #3003 fold-hold: while a compress burst continues, committed folds render raw (prefix byte-identical, no cache seam) and materialize on the first request without a new fold — one seam for the whole burst. Window pressure (>= 90% of the effective window) materializes immediately; emergency/preflight folds always render folded right away. |
 | `compress.minCompressRange` | number | same as minCompressRangeChars | — | Deprecated alias of minCompressRangeChars (accepted, mapped onto it). _(deprecated)_ |
 
 **Provider route fields**
@@ -1711,6 +1712,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_CODEX_COMPACT` | `codexCompact` | "intercept" |
 | `BILI_DECODED_BODY_BYTES` | `network.decodedBodyBytes` | 10737418240 |
 | `BILI_DECOMPRESS_TMP_CAP` | `decompressTmpCap` | 50 |
+| `BILI_DEFER_MATERIALIZATION` | `compress.deferMaterialization` | true |
 | `BILI_DUMP_4XX` | `diagnostics.dump4xx` | false |
 | `BILI_DUMP_4XX_MAX_BYTES` | `diagnostics.dump4xxMaxBytes` | 2097152 (floor 1024) |
 | `BILI_DUMP_MAX_AGE_DAYS` | `diagnostics.maxAgeDays` | unset (off) |

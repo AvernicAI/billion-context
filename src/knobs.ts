@@ -496,6 +496,17 @@ export function imageRescaleEnabled(): boolean {
     return loadConfigFile().imageRescale !== false;
 }
 
+/** BILI_DEFER_MATERIALIZATION > compress.deferMaterialization > true.
+ *  #3003 burst-hold: fold results commit to state but their materialization
+ *  into the outbound view waits out the compress burst, so K consecutive
+ *  folds pay ONE prefix-cache seam instead of K. Read live per view build —
+ *  flipping it mid-burst clears the hold on the next request. */
+export function deferMaterializationEnabled(): boolean {
+    const envRaw = process.env.BILI_DEFER_MATERIALIZATION;
+    if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
+    return loadConfigFile().compress?.deferMaterialization !== false;
+}
+
 /** BILI_IMAGE_RESCALE_MAX_DIM > IMAGE_RESCALE_DEFAULT_MAX_DIM. Longest-edge
  *  target of the rescale pass (fit-inside, never upscale). Env-only by design
  *  (#3400 spec): the config file carries just the on/off key. Floor 128 keeps

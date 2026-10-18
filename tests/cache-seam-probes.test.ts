@@ -16,6 +16,11 @@
 //                     rides the wire as a placeholder; the placeholder element
 //                     must stay byte-identical across folds (round-2 and the
 //                     next client turn).
+// This suite pins the EAGER fold-render contract (the fold must be visible on
+// the first post-fold request). The #3003 deferred-materialization hold changes
+// that timing by design; its semantics are pinned in fold-hold*.test.ts.
+process.env.BILI_DEFER_MATERIALIZATION = "0";
+
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";

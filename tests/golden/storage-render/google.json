@@ -48,13 +48,13 @@
   },
   {
    "i": 9,
-   "sha": "e38ba572fc6a78edd320383f084bba8ed93b8c687a0fda490eff3083af87e8ca",
-   "bytes": 50867
+   "sha": "367a67465326efc382fd13cd07cafd3b7a05f207e474ae70719ce65f9f2d70bf",
+   "bytes": 79435
   },
   {
    "i": 10,
-   "sha": "8a05cf4b7f1faba876e0aca26af58d4d2d826d3edfcd3fc3b61ba6ce29cb53ff",
-   "bytes": 58270
+   "sha": "3f8c0a013ccf2ff7ca64f53a7cbf010350ac74867bab7d30f10b68b2025a1342",
+   "bytes": 86838
   },
   {
    "i": 11,
@@ -79,18 +79,18 @@
  ],
  "foldAt": 9,
  "editedAt": 12,
- "summaryFrom": 9,
- "stateDigest": "77aee26da8f7dae7e31edcceb48624ea7a22fdf8f3683d8baa1013d46663d974",
+ "summaryFrom": 11,
+ "stateDigest": "4847e1a86edd9f6026ac03c817d04c64645914d358e5385cebfaae5fe6c89eeb",
  "sectionDigests": {
-  "state": "a9b9531d952b48d8",
+  "state": "b3b8616293271d9c",
   "blockContents": "473264d9df8ba338",
-  "stats": "e358dc992395fc7e",
-  "metadata": "928ce8bcd75794ae"
+  "stats": "10db2276e3bdf1a3",
+  "metadata": "6d6c031e242b2f99"
  },
  "stateKeyDigests": {
-  "blocks": "0cfd0b9c0fc53073",
+  "blocks": "b433d9497f91e760",
   "messageRefs": "61ee2b1599995c19",
-  "nudge": "1aafe7b2e5e10a1f",
+  "nudge": "4d5ea317e17d8386",
   "stats": "e4ee14ae39539ff8",
   "nextBlockId": "d4735e3a265e16ee",
   "nextRunId": "d4735e3a265e16ee",
