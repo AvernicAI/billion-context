@@ -288,8 +288,12 @@ export function renderLaneNudgeText(
     config: unknown,
 ): RenderedNudge {
     const tier = decision.tier;
+    // `config` is the full request Config; the latch records fingerprints of
+    // its externalSummary rail chain (same source as the plan/catch paths),
+    // so compare against THAT, not the whole config (#3638 review).
+    const chain = (config as { externalSummary?: unknown } | undefined)?.externalSummary;
     if (tier !== null && tier >= 2 && externalSummaryEnabled(config)
-        && externalFailureLatchActive(metadata, externalSummaryFingerprint(config))) {
+        && externalFailureLatchActive(metadata, externalSummaryFingerprint(chain))) {
         return { voice: "gentle", text: renderExternalFailureNotice(tier, externalFailureClasses(metadata), externalFailureStreak(metadata)) };
     }
     return renderNudgeText(decision, prompts, sections);
