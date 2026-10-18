@@ -128,6 +128,11 @@ function checkpointMessage() {
 
 const FOLD_SUMMARY = "MAIN-SUMMARY-SETUP-CONTEXT-FOLDED-BY-COMPRESSION-LONG-ENOUGH-FOR-KERNEL-MIN-LENGTH-CHECK";
 
+// #3712 review: the re-measure must price the FULL outbound view — tool schemas
+// included, matching the usage-grade caliber (upstream prompt_tokens) it replaces.
+// A messages-only count drops this block entirely; the floor below discriminates.
+const TOOLS_DESC = "T".repeat(20_000);
+
 async function seedAndFold(rig: Rig, conv: string): Promise<void> {
     const r1 = await fetch(chatUrl(rig), {
         method: "POST",
@@ -165,7 +170,11 @@ test("#3712: a dsh native-compaction rebase re-measures the turn's sizing input 
         const r = await fetch(chatUrl(rig), {
             method: "POST",
             headers: dshHeaders(conv),
-            body: JSON.stringify({ model: MODEL, messages: [checkpointMessage(), seedInput()[12], seedInput()[13]] }),
+            body: JSON.stringify({
+                model: MODEL,
+                messages: [checkpointMessage(), seedInput()[12], seedInput()[13]],
+                tools: [{ type: "function", function: { name: "probe", description: TOOLS_DESC, parameters: { type: "object", properties: {} } } }],
+            }),
         });
         assert.equal(r.status, 200, "compacted replay request succeeds");
         await r.text();
@@ -184,6 +193,10 @@ test("#3712: a dsh native-compaction rebase re-measures the turn's sizing input 
         assert.ok(boundary?.priced, "the rebased turn's pricing was recorded on the boundary");
         assert.equal(boundary?.priced?.source, "estimate", "post-rebase sizing input is a fresh measure, not the stale usage-grade baseline");
         assert.ok((boundary?.priced?.tokens ?? 0) > 0, `post-rebase sizing input measured a real current-view size (${boundary?.priced?.tokens})`);
+        // Caliber pin: the tool schema (TOOLS_DESC, ~5K tok at 4 chars/token) must be
+        // in the measure — a messages-only count would land near the core mass only
+        // (~1.8K tok here) and fail this floor.
+        assert.ok((boundary?.priced?.tokens ?? 0) >= TOOLS_DESC.length / 4 + 500, `post-rebase pricing covers the full outbound view incl. tools (${boundary?.priced?.tokens} >= ${TOOLS_DESC.length / 4 + 500})`);
     } finally {
         await rig.close();
     }

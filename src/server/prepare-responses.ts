@@ -225,8 +225,11 @@ export async function prepareResponses(
         // request's forged-compact handoff) already wiped the sizing anchors this
         // request's tokenCount would otherwise derive from — re-measure the current
         // view instead of feeding a stale/zero value into decideNudge.
-        let { tokens: tokenCount, source: tokenCountSource } = earlyRebased ? postRebaseTokenCount(msgs, imageReserve) : effectiveTokenCount(session, renderMsgs, imageReserve);
-        if (earlyRebased) noteRebasePricing(session, { tokens: tokenCount, source: tokenCountSource });
+        let { tokens: tokenCount, source: tokenCountSource } = earlyRebased ? postRebaseTokenCount(parsed, imageReserve) : effectiveTokenCount(session, renderMsgs, imageReserve);
+        if (earlyRebased) {
+            noteRebasePricing(session, { tokens: tokenCount, source: tokenCountSource });
+            log("info", `[${sessionId}] post-rebase pricing: ${tokenCount} tok (${tokenCountSource}) — nudge meter re-based off the current compacted view (#3712)`);
+        }
         // Absorb markers ride in the kernel's processTurn output (gated by
         // config.absorb). The marker/text protocol has no native tool channel,
         // so strip absorb from the loop config there (both modes).
@@ -280,8 +283,9 @@ export async function prepareResponses(
                     markNativeCompactionBoundary(session);
                     if (reconcileNativeCompactionBoundary(session)) {
                         // #3712: same post-rebase re-measure as the early site above.
-                        ({ tokens: tokenCount, source: tokenCountSource } = postRebaseTokenCount(msgs, imageReserve));
+                        ({ tokens: tokenCount, source: tokenCountSource } = postRebaseTokenCount(parsed, imageReserve));
                         noteRebasePricing(session, { tokens: tokenCount, source: tokenCountSource });
+                        log("info", `[${sessionId}] post-rebase pricing: ${tokenCount} tok (${tokenCountSource}) — nudge meter re-based off the current compacted view (#3712)`);
                     }
                 }
             }

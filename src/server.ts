@@ -2362,8 +2362,17 @@ export function usageGradeInputBaseline(session: Session): number {
 // count) — truthful, so a genuinely over-window payload still hits its band while
 // code/JSON payloads do NOT fire a phantom EMERGENCY the way the char-count upper
 // bound would (#1839 ghost class).
-export function postRebaseTokenCount(msgs: CoreMessage[], inboundImageTokens = 0): { tokens: number; source: "estimate" } {
-    return { tokens: estimateCoreMessages(msgs) + inboundImageTokens, source: "estimate" };
+// The measure is taken over the RAW outbound body, not just the message array:
+// the usage-grade baseline this replaces (upstream prompt_tokens) prices the FULL
+// request — tool schemas and system frame included. A messages-only count drops
+// exactly that delta (measured on the #3712 incident payload: 97 tool schemas ≈
+// 23.6K tok + largest system frame ≈ 8.9K tok), re-introducing an underprice that
+// can sit a near-gate payload below minContextLimitPct. estimateRawBodyTokens walks
+// every string leaf of the parsed body through defaultCountTokens (binary image
+// fields excluded — inboundImageTokens charges those separately); its residual
+// overcount is structural strings only (ids/roles), a conservative bias of ~1%.
+export function postRebaseTokenCount(parsed: unknown, inboundImageTokens = 0): { tokens: number; source: "estimate" } {
+    return { tokens: estimateRawBodyTokens(parsed) + inboundImageTokens, source: "estimate" };
 }
 
 // #3712: stamp how the rebased turn priced its context onto the native-compaction

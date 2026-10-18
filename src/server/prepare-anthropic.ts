@@ -289,8 +289,9 @@ export async function prepareAnthropic(
             // from (and tokenCount itself described the pre-compaction payload).
             // Re-measure the current compacted view so this turn's nudge decision
             // prices reality instead of a stale-low value that strands firstSightMassReady.
-            ({ tokens: tokenCount, source: tokenCountSource } = postRebaseTokenCount(msgs, inboundImageTokens));
+            ({ tokens: tokenCount, source: tokenCountSource } = postRebaseTokenCount(parsed, inboundImageTokens));
             noteRebasePricing(session, { tokens: tokenCount, source: tokenCountSource });
+            log("info", `[${sessionId}] post-rebase pricing: ${tokenCount} tok (${tokenCountSource}) — nudge meter re-based off the current compacted view (#3712)`);
         }
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
