@@ -7,6 +7,7 @@ import type { Session } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
+import { resolveDecompress } from "../src/decompress-shared.ts";
 
 _setStoreForTest(new SessionStore({ enabled: false }));
 
@@ -172,6 +173,35 @@ test("#3726: a model-carried footer in the submitted summary normalizes to exact
     const promoted = active[0]!;
     assert.equal(countFooterSpans(promoted.summary), 1, `duplicate footers: ${promoted.summary}`);
     assert.ok(promoted.summary.includes("[image: png 1024x768 · m00002]"), promoted.summary);
+});
+
+test("#3726: in-place refold (#398) of a folded image block recarries the footer from its own previous summary", () => {
+    const msgs: CoreMessage[] = [
+        textMsg("raw_1", "user", "a".repeat(3000)),
+        imgMsg("raw_2"),
+        textMsg("raw_3", "assistant", "b".repeat(3000)),
+    ];
+    const ctx = makeCtx(msgs);
+    t1Fold(ctx, "m00001", "m00003", "Baseline fold of the first screenshot pass: tail reads flat like a paddle, neck runs long past the shoulder, legs proportionally short against the motorcycle frame.");
+    assert.ok(ctx.session.state.blocks[0]!.summary.includes("[image: png 1024x768 · m00002]"), "precondition: T1 footer landed");
+
+    // Inline restore flags restoredInline; the originals stay OFF the wire —
+    // the model holds the material via the kept tool result, so the next
+    // request's view cannot re-derive the image notes.
+    resolveDecompress({ blockId: "b1" }, ctx);
+    ctx.messages = [];
+    // #2748: the net-shrink gate requires the new summary to be strictly
+    // smaller than the stored one, so the refold condenses further.
+    const out = applyRanges(compress({ content: [{ startId: "m00001", endId: "m00003", summary: "Condensed visual pass: tail tapers now; neck still long." }] }), ctx).text;
+    assert.match(out, /Compressed m00001–m00003 → 1 block\(s\)/, `refold must land: ${out.slice(0, 200)}`);
+    const blocks = ctx.session.state.blocks;
+    assert.equal(blocks.length, 1, "in-place refold keeps a single block");
+    const b1 = blocks[0]!;
+    assert.equal(b1.blockId, "b1", "refold updates the same block id");
+    assert.equal(b1.tier, 1, "refold keeps the tier");
+    assert.ok(b1.summary.startsWith("Condensed visual pass:"), b1.summary);
+    assert.equal(countFooterSpans(b1.summary), 1, `footer lost or duplicated on refold: ${b1.summary}`);
+    assert.ok(b1.summary.includes("[image: png 1024x768 · m00002]"), `recarried footer missing: ${b1.summary}`);
 });
 
 test("#3726 negative: a text-only fold gains no footer", () => {
