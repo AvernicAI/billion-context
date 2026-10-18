@@ -1,6 +1,11 @@
 import { splitDemotedThinking } from "./demoted-thinking.js";
+import {
+  CANONICAL_IMAGE_TEXT,
+  canonicalToolArgs,
+  deriveCanonicalMessageId,
+} from "./identity.js";
 import { hashId } from "./util.js";
-import { ClusterCounter, deriveMessageId } from "./message-id.js";
+import { ClusterCounter } from "./message-id.js";
 import { parseDataUrl, type BiliMessage } from "./bili-message.js";
 
 export type OpenAIContentPart =
@@ -54,7 +59,8 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
   // Backfill toolName onto role:"tool" results from their paired tool_call —
   // kernel guards are name-based. Not part of the identity seed (id stability).
   const toolNames = new Map<string, string>();
-  for (const m of body.messages) {
+  for (const [wireIndex, m] of body.messages.entries()) {
+    const before = msgs.length;
     switch (m.role) {
       case "system":
       case "developer": {
@@ -62,7 +68,11 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
           systemParts.push(stringContent(m.content));
           break;
         }
-        const base = deriveMessageId(m.role, "text", stringContent(m.content));
+        const base = deriveCanonicalMessageId(
+          m.role,
+          "text",
+          stringContent(m.content),
+        );
         msgs.push({
           id: clusters.next(base),
           role: "system",
@@ -73,43 +83,123 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
         break;
       }
       case "user": {
-        // Image-only messages keep text "" (NO "[image]" placeholder as
-        // in the responses/anthropic codecs): ids derive from text alone
-        // and switching the seed would move every pre-existing shape.
-        const text = stringContent(m.content);
-        const nonText = allNonTextParts(m.content);
-        const imgs = allImageParts(m.content);
-        const firstImg = imgs[0];
-        const firstUrl = firstImg ? firstImg.image_url.url : undefined;
-        const firstParsed = firstUrl ? parseDataUrl(firstUrl) : undefined;
-        const base = deriveMessageId("user", "text", text);
-        msgs.push({
-          id: clusters.next(base),
-          role: "user",
-          contentType: "text",
-          text,
-          // A lone string-URL image keeps the legacy singular sidecar
-          // (byte-stable for pre-existing shapes). Any other mix —
-          // multiple images, or any unknown part type such as a
-          // DeepSeek Files API `{type:"file"}` ref — rides the plural
-          // sidecar verbatim so coreToOpenai can re-emit it
-          // (billion-context#1205: unknown parts were silently dropped).
-          ...(imgs.length === 1 && nonText.length === 1
-            ? {
-                rawOpenaiContent: imgs[0],
-                // data: URLs only — remote URLs ride rawOpenaiContent
-                // verbatim (#187/#291)
-                ...(firstParsed
-                  ? {
-                      imageMediaType: firstParsed.mediaType,
-                      imageBase64: firstParsed.base64,
-                    }
-                  : {}),
-              }
-            : nonText.length > 0
-              ? { rawOpenaiContentParts: nonText }
-              : {}),
-        });
+        // #3642 canonical granularity: every content part is its own core
+        // (the anthropic codec's model), so the same logical conversation
+        // yields the same core ARRAY — ids AND counts — in every protocol.
+        // Text parts become text cores; each image part becomes its own
+        // image core (text = the canonical "[image]" marker, byte-fidelity
+        // via the sidecars); unknown opaque parts (DeepSeek file refs,
+        // #1205) attach to the preceding text core's plural sidecar so they
+        // still round-trip verbatim. A message with only opaque parts keeps
+        // the legacy single-core shape (text "" + plural sidecar).
+        if (typeof m.content === "string" || m.content == null) {
+          const base = deriveCanonicalMessageId(
+            "user",
+            "text",
+            m.content ?? "",
+          );
+          msgs.push({
+            id: clusters.next(base),
+            role: "user",
+            contentType: "text",
+            text: m.content ?? "",
+          });
+          break;
+        }
+        let lastTextCore: BiliMessage | null = null;
+        let leadingOpaque: OpenAIContentPart[] | [] = [];
+        let sawText = false;
+        for (const part of m.content) {
+          if (typeof part === "string") {
+            const base = deriveCanonicalMessageId("user", "text", part);
+            lastTextCore = {
+              id: clusters.next(base),
+              role: "user",
+              contentType: "text",
+              text: part,
+            };
+            msgs.push(lastTextCore);
+            sawText = true;
+            continue;
+          }
+          if (part?.type === "text" && typeof part.text === "string") {
+            const base = deriveCanonicalMessageId("user", "text", part.text);
+            lastTextCore = {
+              id: clusters.next(base),
+              role: "user",
+              contentType: "text",
+              text: part.text,
+            };
+            msgs.push(lastTextCore);
+            sawText = true;
+            continue;
+          }
+          if (part?.type === "image_url") {
+            const url =
+              (part as { image_url?: { url?: unknown } }).image_url?.url;
+            const parsed =
+              typeof url === "string" ? parseDataUrl(url) : undefined;
+            const base = deriveCanonicalMessageId(
+              "user",
+              "text",
+              CANONICAL_IMAGE_TEXT,
+            );
+            msgs.push({
+              id: clusters.next(base),
+              role: "user",
+              contentType: "text",
+              text: CANONICAL_IMAGE_TEXT,
+              imagePart: true,
+              rawOpenaiContent: part,
+              ...(parsed
+                ? {
+                    imageMediaType: parsed.mediaType,
+                    imageBase64: parsed.base64,
+                  }
+                : {}),
+            });
+            continue;
+          }
+          // Unknown opaque part: never dropped (#1205). Attach to the
+          // preceding text core; parts seen before any text core wait for
+          // the first one so the rebuild's part order matches the wire.
+          if (lastTextCore) {
+            lastTextCore.rawOpenaiContentParts = [
+              ...(lastTextCore.rawOpenaiContentParts ?? []),
+              part,
+            ];
+          } else {
+            leadingOpaque = [...leadingOpaque, part];
+          }
+        }
+        if (leadingOpaque.length > 0) {
+          if (sawText && msgs.length > 0) {
+            const firstTextCore = msgs.find(
+              (c, i) =>
+                i >= before &&
+                c.role === "user" &&
+                c.contentType === "text" &&
+                !c.rawOpenaiContent,
+            );
+            const host = firstTextCore ?? msgs[msgs.length - 1]!;
+            // PREPEND: the host may already carry opaque parts accumulated
+            // after it during the loop ([opaque, text, opaque]) — assigning
+            // would silently drop them (#1205: unknown parts never dropped).
+            host.rawOpenaiContentParts = [
+              ...leadingOpaque,
+              ...(host.rawOpenaiContentParts ?? []),
+            ];
+          } else {
+            const base = deriveCanonicalMessageId("user", "text", "");
+            msgs.push({
+              id: clusters.next(base),
+              role: "user",
+              contentType: "text",
+              text: "",
+              rawOpenaiContentParts: leadingOpaque,
+            });
+          }
+        }
         break;
       }
       case "assistant": {
@@ -138,7 +228,11 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
         // thinking models reject the key's absence, not its emptiness.
         const blankEcho = fieldPresent && reasoning.length === 0;
         if (reasoning) {
-          const base = deriveMessageId("assistant", "reasoning", reasoning);
+          const base = deriveCanonicalMessageId(
+            "assistant",
+            "reasoning",
+            reasoning,
+          );
           msgs.push({
             id: clusters.next(base),
             role: "assistant",
@@ -148,7 +242,7 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
           });
         }
         if (text) {
-          const base = deriveMessageId("assistant", "text", text);
+          const base = deriveCanonicalMessageId("assistant", "text", text);
           msgs.push({
             id: clusters.next(base),
             role: "assistant",
@@ -159,14 +253,15 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
         }
         if (Array.isArray(m.tool_calls)) {
           for (const tc of m.tool_calls) {
-            const base = deriveMessageId(
+            // #3642: canonical args in the seed, wire toolCallId out of it
+            // (transport plumbing, not content). `text` keeps the host's
+            // verbatim arguments string so coreToOpenai rebuilds it
+            // byte-stable.
+            const base = deriveCanonicalMessageId(
               "assistant",
               "tool-call",
-              tc.function.arguments ?? "",
-              {
-                toolCallId: tc.id,
-                toolName: tc.function.name,
-              },
+              canonicalToolArgs(tc.function.arguments ?? ""),
+              { toolName: tc.function.name },
             );
             msgs.push({
               id: clusters.next(base),
@@ -183,13 +278,13 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
         break;
       }
       case "tool": {
-        const base = deriveMessageId(
+        // #3642: canonical result identity = toolName + text; the wire
+        // tool_call_id is out of the seed (transport plumbing).
+        const base = deriveCanonicalMessageId(
           "tool",
           "tool-result",
           stringContent(m.content),
-          {
-            toolCallId: m.tool_call_id ?? "",
-          },
+          { toolName: m.name || toolNames.get(m.tool_call_id ?? "") },
         );
         const name = m.name || toolNames.get(m.tool_call_id ?? "");
         msgs.push({
@@ -203,12 +298,54 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
         break;
       }
     }
+    for (let k = before; k < msgs.length; k++) {
+      msgs[k]!.wireIndex = wireIndex;
+    }
   }
   return { msgs, systemText: systemParts.join("\n\n") };
 }
 
 export function coreToOpenai(messages: BiliMessage[]): OpenAIMessage[] {
   const out: OpenAIMessage[] = [];
+  let userRun: BiliMessage[] = [];
+  // #3642: rebuild a run of consecutive user cores as ONE wire message —
+  // parts array when any core carries media/opaque sidecars, plain string
+  // when the run is a lone text core (the dominant shape stays
+  // byte-identical to the legacy codec's output).
+  const flushUserRun = () => {
+    if (userRun.length === 0) return;
+    const parts: OpenAIContentPart[] = [];
+    let plain = true;
+    for (const m of userRun) {
+      if (m.rawOpenaiContentParts && m.rawOpenaiContentParts.length > 0) {
+        if (m.text) parts.push({ type: "text", text: m.text });
+        for (const part of m.rawOpenaiContentParts)
+          parts.push(part as OpenAIContentPart);
+        plain = false;
+      } else if (m.rawOpenaiContent) {
+        if (m.text && !m.imagePart)
+          parts.push({ type: "text", text: m.text });
+        parts.push(m.rawOpenaiContent as OpenAIContentPart);
+        plain = false;
+      } else if (m.imageBase64 && m.imageMediaType) {
+        parts.push({
+          type: "image_url",
+          image_url: {
+            url: `data:${m.imageMediaType};base64,${m.imageBase64}`,
+          },
+        });
+        plain = false;
+      } else {
+        parts.push({ type: "text", text: m.text ?? "" });
+      }
+    }
+    if (plain && userRun.length === 1) {
+      out.push({ role: "user", content: userRun[0]!.text ?? "" });
+    } else {
+      out.push({ role: "user", content: parts });
+    }
+    userRun = [];
+  };
   let pending: {
     text: string | null;
     toolCalls: OpenAIToolCall[];
@@ -249,6 +386,10 @@ export function coreToOpenai(messages: BiliMessage[]): OpenAIMessage[] {
   };
   for (const m of messages) {
     if (m.role === "assistant") {
+      // An assistant core NEVER joins a user run — flush the run first so
+      // emission order always matches core order (a run left open across an
+      // assistant turn would emit after it and scramble the conversation).
+      flushUserRun();
       if (!pending)
         pending = {
           text: null,
@@ -270,33 +411,33 @@ export function coreToOpenai(messages: BiliMessage[]): OpenAIMessage[] {
         });
       }
     } else {
-      flush();
+      if (m.role !== "user") {
+        // A user message never terminates the user run — consecutive user
+        // cores accumulate into ONE wire message (#3642). Everything else
+        // (system/tool) closes the run first.
+        flush();
+        flushUserRun();
+      }
       if (m.role === "system") {
         out.push({
           role: m.originalRole === "developer" ? "developer" : "system",
           content: m.text ?? "",
         });
       } else if (m.role === "user") {
-        if (m.rawOpenaiContent || m.imageBase64 || m.rawOpenaiContentParts) {
-          const parts: OpenAIContentPart[] = [];
-          if (m.text) parts.push({ type: "text", text: m.text });
-          if (m.rawOpenaiContentParts && m.rawOpenaiContentParts.length > 0) {
-            for (const part of m.rawOpenaiContentParts)
-              parts.push(part as OpenAIContentPart);
-          } else if (m.rawOpenaiContent) {
-            parts.push(m.rawOpenaiContent as OpenAIContentPart);
-          } else if (m.imageBase64 && m.imageMediaType) {
-            parts.push({
-              type: "image_url",
-              image_url: {
-                url: `data:${m.imageMediaType};base64,${m.imageBase64}`,
-              },
-            });
-          }
-          out.push({ role: "user", content: parts });
-        } else {
-          out.push({ role: "user", content: m.text ?? "" });
+        // #3642: canonical granularity gives one core per content part, so
+        // user cores from ONE wire message are a RUN that rebuilds as ONE
+        // wire message (multi-part content array when any core carries
+        // media/opaque sidecars, plain string otherwise). A wireIndex step
+        // (or a core without one — kernel-rendered) still joins the run;
+        // cores from DIFFERENT wire messages (both indexed) rebuild as
+        // separate messages, byte-shaped like the host sent them. The
+        // assistant run closes here first (mirror of the assistant branch).
+        flush();
+        const prev = userRun[userRun.length - 1];
+        if (prev && prev.wireIndex !== undefined && m.wireIndex !== undefined && prev.wireIndex !== m.wireIndex) {
+          flushUserRun();
         }
+        userRun.push(m);
       } else if (m.role === "tool") {
         out.push({
           role: "tool",
@@ -307,6 +448,7 @@ export function coreToOpenai(messages: BiliMessage[]): OpenAIMessage[] {
     }
   }
   flush();
+  flushUserRun();
   return out;
 }
 
@@ -359,43 +501,3 @@ function stringContent(content: OpenAIMessage["content"]): string {
   return "";
 }
 
-type OpenAIImagePart = { type: "image_url"; image_url: { url: string } };
-
-/** Collect ALL image_url parts in a user content array, in wire order —
- *  data: URLs and remote http(s) URLs alike. (firstImagePart only kept the
- *  first, which silently dropped images 2..N on the coreToOpenai rebuild;
- *  a later data-URL-only filter then silently dropped every remote-URL
- *  image — issues #187/#291.) */
-function allImageParts(content: OpenAIMessage["content"]): OpenAIImagePart[] {
-  if (!Array.isArray(content)) return [];
-  const out: OpenAIImagePart[] = [];
-  for (const p of content) {
-    if (typeof p !== "object" || p === null) continue;
-    if (!("type" in p) || p.type !== "image_url" || !("image_url" in p))
-      continue;
-    // The union's index-signature member leaves image_url as `unknown`, so
-    // narrow via a named const before reading the url.
-    const imagePart = p as { image_url?: { url?: unknown } | null };
-    const url = imagePart.image_url?.url;
-    if (typeof url === "string") out.push(p as OpenAIImagePart);
-  }
-  return out;
-}
-
-/** Collect ALL non-text object parts of a user content array, in wire order —
- *  image_url parts plus any unknown part type. Unknown parts are opaque
- *  payloads (e.g. DeepSeek Files API `{type:"file",file_id}` refs) that the
- *  kernel must never drop: they ride rawOpenaiContentParts verbatim and
- *  coreToOpenai re-emits them unchanged (billion-context#1205). */
-function allNonTextParts(
-  content: OpenAIMessage["content"],
-): OpenAIContentPart[] {
-  if (!Array.isArray(content)) return [];
-  const out: OpenAIContentPart[] = [];
-  for (const p of content) {
-    if (typeof p !== "object" || p === null) continue;
-    if (p.type === "text") continue;
-    out.push(p);
-  }
-  return out;
-}

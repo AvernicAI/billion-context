@@ -331,7 +331,7 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
         }
         const errs = errorLines(logs);
         assert.equal(errs.length, 1, "exactly ONE error for the whole episode");
-        assert.match(errs[0].msg, /compression substrate appears destroyed/);
+        assert.match(errs[0].msg, /fold epoch confirmation required/);
         assert.match(errs[0].msg, /host-native compaction/);
         assert.match(errs[0].msg, /#2193/);
         // #2297: the per-pass warn now STOPS once the episode escalated —
@@ -451,7 +451,7 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
             reconcileFoldCoverage(session, freshPass(`p${pass}`), opts);
         }
         assert.equal(errorLines(logs).length, 1, "real destruction still escalates on its own streak");
-        assert.match(errorLines(logs)[0].msg, /compression substrate appears destroyed/);
+        assert.match(errorLines(logs)[0].msg, /fold epoch confirmation required/);
     });
 
     // #2709: at the destruction point the refusal-ledger witness turns the
@@ -822,7 +822,7 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         const snapshot = JSON.stringify(session.metadata);
         resetNormalizedIdentityWork();
         const second = reconcileFoldCoverage(session, msgs, opts);
-        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 });
+        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 });
         assert.equal(normalizedIdentityWorkCount(), 0,
             "the overflow tail must not be normalized+hashed and dropped AGAIN every pass (#2334)");
         assert.equal(JSON.stringify(session.metadata), snapshot, "steady-state resend leaves metadata byte-stable");

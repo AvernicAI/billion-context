@@ -389,12 +389,14 @@ describe("reconcileFoldCoverage positional wiring (#2480)", () => {
         const coveredNow = (session.state.blocks as { effectiveMessageIds: string[] }[])[0].effectiveMessageIds;
         const tailIds = compacted.slice(1).map((m) => m.id as string);
         for (const id of tailIds) assert.ok(coveredNow.includes(id), `tail id ${id} stays covered`);
-        // self-heal trajectory: the next full pass on the compacted history is
-        // steady for the tail; the compacted-away head ids stay missing and the
-        // #2193 drift streak starts counting toward its one error line
+        // #3641 doctrine: the compacted-away head is a sanctioned host-side
+        // deletion (summary + surviving tail = wire suffix-continuation of the
+        // previous order). The fold keeps the snapshot, no drift streak ever
+        // starts, and one benign truncation note is latched for the panel.
         const r2 = reconcileFoldCoverage(session, [...compacted, msg("post_1", "user", "resume")], opts("repair"));
         assert.equal(r2.byPos, 0);
-        assert.equal(session.metadata.foldDriftStreak, 1, "total-loss streak begins (existing machinery owns the landing)");
+        assert.equal(session.metadata.foldDriftStreak, undefined, "#3641: sanctioned compaction never starts the collapse streak");
+        assert.equal(session.metadata.foldTruncationNoted, true, "one benign truncation note is latched");
     });
 
     test("side-request-shaped passes take no positional evidence", () => {

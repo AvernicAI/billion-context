@@ -36,6 +36,13 @@ export interface BiliMessage extends CoreMessage {
   /** Responses API: the original input item (for input_image, or a raw
    *  function_call / function_call_output we pass through). */
   rawResponsesItem?: unknown;
+  /** #3642: this core IS an image part of a split multi-part wire message
+   *  (canonical granularity: one core per content part). Set by every codec
+   *  at parse time; rebuild paths key off this flag — NEVER off text
+   *  equality with the "[image]" marker, because render/ref-tag injection
+   *  rewrites the marker text ("[image]<acp ...>") and a wire image part
+   *  has no text slot to carry a tag anyway. */
+  imagePart?: true;
   /** Google/Gemini: the original content parts of this message, in wire
    *  order (inlineData/fileData, executableCode, functionCall/Response ids,
    *  thought parts and unknown future part types). coreToGoogle rebuilds

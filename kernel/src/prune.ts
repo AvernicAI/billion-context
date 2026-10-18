@@ -65,9 +65,10 @@ export interface PruneOptions {
   /**
    * Chronological head anchoring for views with NO provider prefix cache at
    * stake (session handoff/restore docs). Default (false) is the pin-safe
-   * placement: an anchor whose ids are absent from the input parks at the
-   * tail, and no summary may precede the first user message — the pin is the
-   * provider prefix-cache head (#2733).
+   * placement: an anchor whose ids are absent from the input parks before
+   * the newest user message (never at the tail, #3640), and no summary may
+   * precede the first user message — the pin is the provider prefix-cache
+   * head (#2733).
    */
   headSummaryAnchors?: boolean;
   /**
@@ -95,6 +96,21 @@ export function prune(
   const firstUserIndex = messages.findIndex(
     (message) => message.role === "user",
   );
+  // #3640: an unresolved anchor (no covered id present in this input) parks
+  // immediately BEFORE the newest user message, never at the list tail.
+  // Tail-parking put days-old summaries after the user's current question,
+  // and the model answered the stale recap instead of the question for every
+  // subsequent turn. Parking before the newest user turn also keeps the
+  // provider prefix cache intact: the insertion point sits inside the
+  // turn-over region that the next request rewrites anyway (#2733 trade-off
+  // reassessed). No user message at all: keep the legacy tail.
+  let lastUserIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]!.role === "user") {
+      lastUserIndex = i;
+      break;
+    }
+  }
 
   const baseIndexById = new Map<string, number>();
   const summaryIndexById = new Map<string, number>();
@@ -112,7 +128,11 @@ export function prune(
         state,
         baseIndexById,
         summaryIndexById,
-        options.headSummaryAnchors ? 0 : messages.length,
+        options.headSummaryAnchors
+          ? 0
+          : lastUserIndex >= 0
+            ? lastUserIndex
+            : messages.length,
       )
     : [];
   // Summary ids of every block this session has ever created — active or
@@ -149,6 +169,14 @@ interface SummaryAnchor {
   summary: string;
   topic?: string;
   insertAt: number;
+  /** True when no anchor id was present in the input (the substrate is off
+   *  the wire). Unresolved anchors park before the newest user message and
+   *  are exempt from the first-user-pin lower bound of firstUserIndex + 1:
+   *  riding AFTER the user's current question is the functional bug #3640
+   *  (the model answered the stale recap instead of the question for five
+   *  consecutive turns), and the rendered summary is role "system", so
+   *  leading the view is provider-safe. */
+  unresolved?: boolean;
 }
 
 function collectSummaryAnchors(
@@ -197,10 +225,12 @@ function collectSummaryAnchors(
       blockId: block.blockId,
       summary: block.summary,
       topic: block.topic,
-      // Unresolved (no anchor id present in this input): park at the tail —
-      // index 0 would splice the summary ahead of the session head and nuke
-      // the provider's cached prefix for every subsequent turn (#2733).
+      // Unresolved (no anchor id present in this input): park before the
+      // newest user message — see prune() for the #3640/#2733 reasoning.
+      // Tail-parking (the pre-#3640 behavior) let stale summaries land after
+      // the user's current question, which the model then answered instead.
       insertAt: earliest ?? fallbackIndex,
+      unresolved: earliest === null,
     });
   }
   anchors.sort((left, right) => left.insertAt - right.insertAt);
@@ -314,6 +344,13 @@ function pairSafeAnchorIndex(
   return safe;
 }
 
+/** #3642: the wire message index a core was flattened from (set by every
+ *  codec; kernel-rendered cores carry none). Declared locally so prune stays
+ *  free of wire-module imports. */
+type WireIndexedCore = { wireIndex?: number };
+const wireIndexOf = (m: CoreMessage): number | undefined =>
+  (m as WireIndexedCore).wireIndex;
+
 function rebuildMessages(
   messages: CoreMessage[],
   coveredBases: Set<string>,
@@ -322,6 +359,28 @@ function rebuildMessages(
   knownSummaryIds: Set<string>,
   headAnchors: boolean,
 ): CoreMessage[] {
+  // #3642: canonical granularity splits one wire message into one core per
+  // content part, so the opening user message can be a RUN of user cores
+  // (text + image + …) sharing one wireIndex. The first-user pin protects
+  // the OPENING WIRE MESSAGE, not merely its first core: a multimodal
+  // opening keeps its image bytes through folds (pre-split the merged core
+  // carried them in its sidecar and the single-core pin preserved both).
+  // Kernel-rendered cores (no wireIndex) never extend the run, and neither
+  // does an adjacent but different wire message. Run length 1 keeps the
+  // legacy shape byte-for-byte.
+  let firstUserPinEnd = firstUserIndex + 1;
+  if (firstUserIndex >= 0) {
+    const firstWire = wireIndexOf(messages[firstUserIndex]!);
+    if (firstWire !== undefined) {
+      while (
+        firstUserPinEnd < messages.length &&
+        messages[firstUserPinEnd]!.role === "user" &&
+        wireIndexOf(messages[firstUserPinEnd]!) === firstWire
+      ) {
+        firstUserPinEnd++;
+      }
+    }
+  }
   const ix = anchors.length > 0 ? buildAnchorPairingIndex(messages) : null;
   const safeAnchors = anchors
     .map((anchor) => ({
@@ -341,9 +400,16 @@ function rebuildMessages(
     // head placement for summaries of older, absent material.
     .map((anchor) => ({
       ...anchor,
+      // #2733/#3642: a summary may NEVER precede the pinned opening wire
+      // message — now measured to the END of the opening core run
+      // (firstUserPinEnd), so an anchor can never land between the opening
+      // message's split parts either.
       insertAt: headAnchors
         ? anchor.insertAt
-        : Math.max(anchor.insertAt, firstUserIndex + 1),
+        : Math.max(
+            anchor.insertAt,
+            anchor.unresolved === true ? firstUserIndex : firstUserPinEnd,
+          ),
     }))
     .sort((left, right) => left.insertAt - right.insertAt);
   const result: CoreMessage[] = [];
@@ -358,8 +424,12 @@ function rebuildMessages(
     // PRECEDES the covered check below — swapping them would let a compress
     // range strip the last guaranteed user message off the wire. Strict
     // providers reject conversations with no user message. See DESIGN.md §8.1.
+    // #3642: the pin spans the opening wire message's whole core run.
     if (index === firstUserIndex && firstUserIndex >= 0) {
-      result.push(messages[index]!);
+      for (let k = index; k < firstUserPinEnd; k++) {
+        result.push(messages[k]!);
+      }
+      index = firstUserPinEnd - 1;
       continue;
     }
     if (isCovered(messages[index]!.id, coveredBases)) continue;

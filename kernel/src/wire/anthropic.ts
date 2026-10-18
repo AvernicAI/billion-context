@@ -1,6 +1,12 @@
 import type { BiliMessage } from "./bili-message.js";
+import {
+  CANONICAL_IMAGE_TEXT,
+  CANONICAL_REDACTED_THINKING_TEXT,
+  canonicalToolArgs,
+  deriveCanonicalMessageId,
+} from "./identity.js";
 import { hashId } from "./util.js";
-import { ClusterCounter, deriveMessageId } from "./message-id.js";
+import { ClusterCounter } from "./message-id.js";
 
 export type AnthropicTextBlock = {
   type: "text";
@@ -102,21 +108,26 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
     for (const b of blocks) {
       switch (b.type) {
         case "text": {
-          const base = deriveMessageId(m.role, "text", b.text);
+          // #3642 canonical identity: the 5-slot seed keeps its layout with
+          // the toolCallId slot empty, so text ids are byte-identical to the
+          // legacy derivation (zero churn on the busiest lane).
+          const base = deriveCanonicalMessageId(m.role, "text", b.text);
           const id = clusters.next(base);
           msgs.push({ id, role: m.role, contentType: "text", text: b.text });
           if (b.cache_control) cacheControls.set(id, b.cache_control);
           break;
         }
         case "tool_use": {
-          const base = deriveMessageId(
+          // #3642: the seed uses canonical (key-sorted, compact) args and
+          // drops the wire toolCallId from the seed — it is transport
+          // plumbing, not content; the ClusterCounter's `_N` keeps duplicate
+          // calls distinct. `text` KEEPS the host's insertion order so
+          // coreToAnthropic rebuilds byte-stable input objects.
+          const base = deriveCanonicalMessageId(
             "assistant",
             "tool-call",
-            safeStringify(b.input),
-            {
-              toolCallId: b.id,
-              toolName: b.name,
-            },
+            canonicalToolArgs(safeStringify(b.input)),
+            { toolName: b.name },
           );
           const id = clusters.next(base);
           msgs.push({
@@ -143,11 +154,15 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
               : b.content
                   .map((c) => (c.type === "text" ? c.text : ""))
                   .join("\n");
-          const base = deriveMessageId("tool", "tool-result", text, {
-            toolCallId: b.tool_use_id,
+          // #3642: canonical result identity = toolName + text (the wire
+          // tool_use_id is transport plumbing). toolName is backfilled from
+          // the paired tool_use above; a result whose call is not in this
+          // pass keeps an empty toolName slot.
+          const name = toolNames.get(b.tool_use_id);
+          const base = deriveCanonicalMessageId("tool", "tool-result", text, {
+            toolName: name,
           });
           const id = clusters.next(base);
-          const name = toolNames.get(b.tool_use_id);
           msgs.push({
             id,
             role: "tool",
@@ -162,7 +177,11 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
           break;
         }
         case "thinking": {
-          const base = deriveMessageId("assistant", "reasoning", b.thinking);
+          const base = deriveCanonicalMessageId(
+            "assistant",
+            "reasoning",
+            b.thinking,
+          );
           msgs.push({
             id: clusters.next(base),
             role: "assistant",
@@ -173,13 +192,38 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
           break;
         }
         case "image": {
-          const base = deriveMessageId(m.role, "text", "[image]");
+          const base = deriveCanonicalMessageId(
+            m.role,
+            "text",
+            CANONICAL_IMAGE_TEXT,
+          );
+          // #3642: parse the base64 source into the shared media sidecars so
+          // every dialect presents the same image core (marker text +
+          // imageMediaType/imageBase64); the raw block keeps verbatim
+          // round-trip. Other source shapes keep the raw-only sidecar.
+          const source =
+            b.source &&
+            typeof b.source === "object" &&
+            !Array.isArray(b.source)
+              ? (b.source as { type?: unknown; media_type?: unknown; data?: unknown })
+              : undefined;
+          const mediaSidecar =
+            source?.type === "base64" &&
+            typeof source.media_type === "string" &&
+            typeof source.data === "string"
+              ? {
+                  imageMediaType: source.media_type,
+                  imageBase64: source.data,
+                }
+              : {};
           msgs.push({
             id: clusters.next(base),
             role: m.role,
             contentType: "text",
-            text: "[image]",
+            text: CANONICAL_IMAGE_TEXT,
+            imagePart: true,
             rawAnthropicBlock: b,
+            ...mediaSidecar,
           });
           break;
         }
@@ -190,7 +234,11 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
           // modified"). Dropping it here silently rewrites that message, so it
           // rides the sidecar exactly like images (#366) — coreToAnthropic
           // re-emits rawAnthropicBlock verbatim.
-          const base = deriveMessageId(m.role, "text", "[redacted_thinking]");
+          const base = deriveCanonicalMessageId(
+            m.role,
+            "text",
+            CANONICAL_REDACTED_THINKING_TEXT,
+          );
           msgs.push({
             id: clusters.next(base),
             role: m.role,

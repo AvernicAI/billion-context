@@ -6,6 +6,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { driveWire, WIRES } from "../tests/golden-storage-drive.ts";
 
+// Parity with tests/golden-storage-render.test.ts (#3400): the test pins the
+// legacy wire shape before driving, so goldens must be regenerated under the
+// same condition — without it every per-turn wire digest drifts by the image-
+// rescale delta and the suite reds on the next CI run.
+process.env.BILI_IMAGE_RESCALE = "0";
+
 const GOLDEN_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "tests", "golden", "storage-render");
 fs.mkdirSync(GOLDEN_DIR, { recursive: true });
 for (const wire of WIRES) {
