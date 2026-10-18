@@ -486,7 +486,7 @@ test("applyCompression reports error for unknown boundary ref", () => {
   assert.equal(result.result.errors.length, 1);
 });
 
-test("batch compress attributes per-range errors and keeps partial success", () => {
+test("batch compress rejects the whole batch when a summary fails length validation (#3003)", () => {
   const core = createCore();
   const state = createInitialState();
   const messages = [
@@ -526,11 +526,16 @@ test("batch compress attributes per-range errors and keeps partial success", () 
     }),
   });
 
-  assert.equal(result.result.blocksCreated, 1, "valid range still compresses");
+  // #3003: a length-class failure in ANY candidate rejects the WHOLE batch —
+  // the valid sibling no longer lands (that partial commit opened a seam that
+  // the retry then paid twice). All-or-nothing means zero blocks here.
+  assert.equal(result.result.blocksCreated, 0, "no sibling may land while one summary fails length");
+  assert.equal(result.state.blocks.length, 0);
   assert.equal(result.result.errors.length, 1);
+  assert.match(result.result.errors[0]!, /Batch rejected before folding any range/);
   assert.match(
     result.result.errors[0]!,
-    /^range m00003\.\.m00004: Summary too short \(22 chars, min 50\)/,
+    /range m00003\.\.m00004: Summary too short \(22 chars, min 50\)/,
   );
 });
 
@@ -1024,9 +1029,11 @@ test("empty summary is attributed to its range", () => {
 
   assert.equal(result.result.blocksCreated, 0);
   assert.equal(result.result.errors.length, 1);
+  // #3003: single-range length failures now surface through the all-or-nothing
+  // batch gate; the per-range detail is embedded verbatim in that message.
   assert.match(
     result.result.errors[0]!,
-    /^range m00001\.\.m00002: Summary is empty/,
+    /range m00001\.\.m00002: Summary is empty/,
   );
 });
 

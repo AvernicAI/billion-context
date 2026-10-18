@@ -600,6 +600,58 @@ export function createCore(ports: Ports = {}): CompressionCore {
       }
     }
 
+    // #3003: all-or-nothing summary-LENGTH pre-check. Length-class failures are
+    // pure functions of (spec.summary, spec.summaryMaxChars, cfg) — no state and
+    // no cross-range coverage — so they can be screened BEFORE any block commits.
+    // Screening them here turns the common PARTIAL outcome (one oversized summary
+    // rejects while sibling ranges land and open a seam) into a clean 0-commit
+    // reject: nothing lands, so the model's single retry pays ONE seam instead of
+    // two. Content-class failures (protected-zone / turn-integrity / no-new-
+    // messages) DO depend on state + cross-range coverage and stay per-range below.
+    // Scope is EXACTLY the fold-candidate set that mutates state in the loop —
+    // never every requested range, else a consumed range whose summary happens to
+    // be long would wrongly kill a batch whose real candidates all validate.
+    {
+      const lengthFailures: string[] = [];
+      for (const spec of input.ranges) {
+        if (skipSpecs.has(spec)) continue;
+        const resolution = classifications.get(spec);
+        if (resolution === undefined) continue;
+        const foldsFresh = resolution.status === "ok";
+        const foldsRefold =
+          resolution.status === "consumed" &&
+          refoldDecisions.get(spec)?.kind === "refold";
+        if (!foldsFresh && !foldsRefold) continue;
+        try {
+          validateSummaryLength(spec, input.config.compress);
+        } catch (error) {
+          lengthFailures.push(
+            rangeError(
+              spec,
+              error instanceof Error ? error.message : String(error),
+            ),
+          );
+        }
+      }
+      if (lengthFailures.length > 0) {
+        // Rejected batches carry their dead-ref tombstone side effect (#2362):
+        // the clone differs from input.state only in deadRefs before this point,
+        // so returning it is safe (same contract as the minCompressRange gate).
+        return {
+          state,
+          result: {
+            blocksCreated: 0,
+            tokensCompressed: 0,
+            errors: [
+              `Batch rejected before folding any range — ${lengthFailures.length} of ${input.ranges.length} requested range(s) failed summary-length validation: ${lengthFailures.join(" | ")}. Nothing was folded, so no prefix was rewritten. Fix it one way or the other and resend: shorten or split each offending range's summary to fit its cap, then resend the whole batch; or drop the offending range(s) and resend only the rest that validate.`,
+              ...classificationErrors,
+            ],
+            warnings: [],
+          },
+        };
+      }
+    }
+
     for (const spec of input.ranges) {
       if (skipSpecs.has(spec)) continue;
       const resolution = classifications.get(spec);
