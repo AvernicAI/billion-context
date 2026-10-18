@@ -93,7 +93,7 @@ export function foldHoldPressure(tokenCount: number, limit: number): boolean {
     return limit > 0 && tokenCount > 0 && tokenCount >= FOLD_HOLD_PRESSURE_PCT * limit;
 }
 
-export interface PrepareHoldDecision {
+interface PrepareHoldDecision {
     /** Serve this view build from the RAW history (held folds stay deferred). */
     hold: boolean;
     /** The held ids when `hold` is true (empty otherwise). */
@@ -230,9 +230,3 @@ export function processTurnWithHold(
     return turn;
 }
 
-/** Test seam: forget every hold (simulates process restart). */
-export function _resetFoldHoldsForTests(): void {
-    // WeakMap has no clear(); entries are unreachable once the sessions are.
-    // Tests construct fresh sessions per case, so this is a no-op kept for
-    // API symmetry with other test seams.
-}
