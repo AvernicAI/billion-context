@@ -119,7 +119,7 @@ const LATCH_FINGERPRINT_KEY = "externalSummaryFailFingerprint";
 /** Consecutive all-candidate-failed batches before the tier>=2 distillation
  *  nudge is replaced by the standing notice. Two strikes: one fully-failed
  *  batch can be a transient blip; two across turns is persistence. */
-export const EXTERNAL_FAIL_LATCH_THRESHOLD = 2;
+const EXTERNAL_FAIL_LATCH_THRESHOLD = 2;
 
 /** Stable identity of an enabled external-summary chain — enough to tell
  *  "the user fixed the same chain" (fingerprint unchanged) from "a different

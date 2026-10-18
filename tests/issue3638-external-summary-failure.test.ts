@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { afterEach, test } from "node:test";
 import { ExternalSummaryExecutor, type SummaryCandidate, type SummaryWork } from "../src/external-summary.ts";
-import { createSummaryHttpCandidate, type SummaryHttpTarget } from "../src/external-summary-http.ts";
+import { createSummaryHttpCandidate, _setSummaryRetryDelayForTest, type SummaryHttpTarget } from "../src/external-summary-http.ts";
 import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 import { composeExternalFailureMessage } from "../src/external-summary-compress.ts";
 import { ConfiguredSummaryPlan } from "../src/external-summary-runtime.ts";
@@ -95,20 +95,28 @@ test("#3638 hard overflow dispatches nothing and classifies input_budget_overflo
 });
 
 test("#3638 provider rejection is classified with the HTTP status only (no body)", async () => {
-    await upstream((req, res) => {
-        res.setHeader("content-type", "text/plain");
-        res.statusCode = 429;
-        res.end("rate limited — bearer super-secret-key echoed by upstream");
-    }, async (url) => {
-        const candidate = createSummaryHttpCandidate(target(url), 4096);
-        const result = await new ExternalSummaryExecutor(1).execute({ content: "c", instructions: "i" }, [candidate], budget);
-        assert.equal(result.status, "failed");
-        if (result.status === "failed") {
-            assert.equal(result.attempts[0]?.outcome, "error");
-            assert.equal(result.attempts[0]?.failure?.cls, "provider_rejected");
-            assert.equal(result.attempts[0]?.failure?.detail, "HTTP 429");
-        }
-    });
+    // Zero the retry backoff via the #3488 seam: with real sleeps the three
+    // attempts consume most of totalTimeoutMs and slow machines classify the
+    // last attempt as a deadline timeout instead of the rejection.
+    _setSummaryRetryDelayForTest(0);
+    try {
+        await upstream((req, res) => {
+            res.setHeader("content-type", "text/plain");
+            res.statusCode = 429;
+            res.end("rate limited — bearer super-secret-key echoed by upstream");
+        }, async (url) => {
+            const candidate = createSummaryHttpCandidate(target(url), 4096);
+            const result = await new ExternalSummaryExecutor(1).execute({ content: "c", instructions: "i" }, [candidate], budget);
+            assert.equal(result.status, "failed");
+            if (result.status === "failed") {
+                assert.equal(result.attempts[0]?.outcome, "error");
+                assert.equal(result.attempts[0]?.failure?.cls, "provider_rejected");
+                assert.equal(result.attempts[0]?.failure?.detail, "HTTP 429");
+            }
+        });
+    } finally {
+        _setSummaryRetryDelayForTest(null);
+    }
 });
 
 test("#3638 composed failure message distinguishes per-candidate classes and stays bounded", async () => {
