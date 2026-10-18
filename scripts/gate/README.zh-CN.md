@@ -120,5 +120,5 @@ node scripts/gate/plugin-lanes.mjs
 
 车道脚本随仓库走(和被测代码同版本);容器化包装(Dockerfile、 verdaccio、
 自建镜像、模型端点)在各自的 gate harness 仓库/机器上,不进本仓库。
-远程 CI 默认不跑:`.github/workflows/ci-gate-plugins.yml` 仅 workflow_dispatch
+远程 CI 默认不跑:`.github/workflows/ci-gate-plugins-manual.yml` 仅 workflow_dispatch
 手动触发,没有 push/PR 触发器。

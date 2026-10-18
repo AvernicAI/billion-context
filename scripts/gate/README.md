@@ -148,5 +148,5 @@ node scripts/gate/plugin-lanes.mjs
 The lane scripts live in this repo (versioned with the code under test); the
 containerized wrapper (Dockerfile, verdaccio, custom image, model endpoints)
 stays in its own gate-harness repo / machine and does not enter this repo.
-Remote CI does not run by default: `.github/workflows/ci-gate-plugins.yml` is
+Remote CI does not run by default: `.github/workflows/ci-gate-plugins-manual.yml` is
 workflow_dispatch-only, with no push/PR triggers.
