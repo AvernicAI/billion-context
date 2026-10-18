@@ -139,9 +139,16 @@ test("2xx with a context-looking phrase is NOT an overflow (only 400/413)", () =
     assert.equal(info.isOverflow, false);
 });
 
-test("5xx is NOT an overflow (server error, not context)", () => {
-    const info = inspectContextOverflow(500, "context length exceeded");
-    assert.equal(info.isOverflow, false);
+test("a 5xx carrying an overflow marker IS an overflow (gateway-relayed rejection, #2484)", () => {
+    // Some gateways relay the model provider's overflow rejection under
+    // 502/503 instead of 400 — the body marker is the real gate, so these count.
+    assert.equal(inspectContextOverflow(502, '{"error":{"message":"exceeds the context window","type":"upstream_error"}}').isOverflow, true);
+    assert.equal(inspectContextOverflow(500, "context length exceeded").isOverflow, true);
+});
+
+test("a bare 5xx without an overflow marker is NOT an overflow", () => {
+    assert.equal(inspectContextOverflow(500, "Internal Server Error").isOverflow, false);
+    assert.equal(inspectContextOverflow(503, '{"error":"upstream unavailable"}').isOverflow, false);
 });
 
 test("empty body is NOT an overflow", () => {

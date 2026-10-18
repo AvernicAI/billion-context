@@ -4,6 +4,14 @@ on:
     pull_request:
         branches: [master]
 
+# #2637: same-ref supersede-cancel (pattern of merged #2635) — a rapid re-push
+# must not queue a second build+publish behind its own predecessor. The temp
+# version is monotonic per run_number (#1385), so a cancelled mid-publish run
+# leaves no residue: its version string is simply never published.
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
 permissions:
     contents: read
     pull-requests: write
@@ -39,8 +47,9 @@ jobs:
                   # prerelease suffix keeps it unresolvable by any semver range —
                   # builds are addressed by their full version string. run_number is
                   # unique+monotonic per workflow (gaps OK) and this workflow is the
-                  # sole 0.0.x publisher; -a<attempt> makes a
-                  # rerun of one run publish a fresh version instead of E409.
+                  # sole 0.0.x-pr publisher (the master lane owns 0.0.x-master,
+                  # #2049); -a<attempt> makes a rerun of one run publish a fresh
+                  # version instead of E409.
                   PR_VERSION="0.0.${RUN_NUMBER}-pr.${PR_NUMBER}.${GITHUB_SHA:0:7}"
                   if [ "$RUN_ATTEMPT" != "1" ]; then
                       PR_VERSION="${PR_VERSION}-a${RUN_ATTEMPT}"

@@ -97,8 +97,8 @@ test("round-trip: params.system merges ahead of inline system messages (single s
     });
     const unwrapped = unwrapCommandcodeBody(src);
     assert.ok(unwrapped);
-    assert.equal((unwrapped.body.messages[0] as any).content, "sys-a\nsys-b\n\ninline sys");
-    const back = rewrapCommandcodeBody(unwrapped.body, unwrapped.meta) as any;
+    assert.equal((unwrapped.body.messages as Array<Record<string, unknown>>)[0].content, "sys-a\nsys-b\n\ninline sys");
+    const back = rewrapCommandcodeBody(unwrapped.body, unwrapped.meta) as { params: { system: unknown } };
     assert.equal(back.params.system, "sys-a\nsys-b\n\ninline sys");
 });
 
@@ -111,7 +111,7 @@ test("round-trip: error-text tool results keep their type across the trip", () =
     });
     const unwrapped = unwrapCommandcodeBody(src);
     assert.ok(unwrapped);
-    const back = rewrapCommandcodeBody(unwrapped.body, unwrapped.meta);
+    const back = rewrapCommandcodeBody(unwrapped.body, unwrapped.meta) as { params: { messages: Array<{ content: Array<{ output: unknown }> }> } };
     assert.deepEqual(back.params.messages[1].content[0].output, { type: "error-text", value: "exit 1" });
 });
 

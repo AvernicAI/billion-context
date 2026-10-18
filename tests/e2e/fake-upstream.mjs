@@ -124,7 +124,8 @@ const server = http.createServer((req, res) => {
 				if (summary) text = buildFakeSummary(allInputText(parsed.input));
 				else text = answerFor(lastUserText(parsed.input));
 				try {
-					fs.appendFileSync(REQLOG, JSON.stringify({ t: Date.now(), model: parsed.model, stream: !!parsed.stream, isSummary: summary, inputLen: raw.length, input: parsed.input }) + "\n");
+					const ins = typeof parsed.instructions === "string" ? parsed.instructions : "";
+					fs.appendFileSync(REQLOG, JSON.stringify({ t: Date.now(), model: parsed.model, stream: !!parsed.stream, isSummary: summary, inputLen: raw.length, insLen: ins.length, input: parsed.input }) + "\n");
 				} catch { /* noop */ }
 				const inTok = estIn(raw);
 				if (parsed.stream) sse(res, messageEvents(text, inTok));

@@ -10,7 +10,8 @@ import type { Session } from "../src/session.ts";
 import { diagnoseSuccessWithoutUsage, listSessions, reanchorNudgeOnUsageDrop, storeEffectiveConfig, _resetSessionsForTest } from "../src/session.ts";
 import { applyUsageSample } from "../src/plugin.ts";
 import { setLogCapture } from "../src/logger.ts";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
@@ -44,7 +45,7 @@ function makeSession(): Session {
     return {
         id: "issue1595-test",
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -52,6 +53,7 @@ function makeSession(): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -230,7 +232,7 @@ async function withProxy(sessionId: string, streamBody: string, jsonBody: string
     const relay = makeRelay(streamBody, jsonBody);
     relay.server.listen(0, "127.0.0.1");
     await once(relay.server, "listening");
-    const upstreamPort = relay.server.address().port;
+    const upstreamPort = (relay.server.address() as { port: number }).port;
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer({
@@ -246,17 +248,25 @@ async function withProxy(sessionId: string, streamBody: string, jsonBody: string
         log: true,
         debug: false,
         passthrough: false,
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        proxyFallback: { explicitDirect: true, globalSource: "direct" },
+        auxProxyFallback: { explicitDirect: true, globalSource: "direct" },
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        compat: { roles: {} }, streamErrorShape: "protocol", passthroughSource: null, autoRestartOnUpdate: false, updateTag: "latest", advisoryCheck: false, releaseNotesCheck: false,
     } as ProxyOptions);
     await once(proxy, "listening");
     try {
-        await fn(`http://127.0.0.1:${proxy.address().port}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, logs);
+        await fn(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, logs);
     } finally {
         setLogCapture(null);
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         relay.server.close();
+        relay.server.closeIdleConnections?.();
         await once(relay.server, "close");
     }
 }
@@ -287,7 +297,16 @@ test("#1595 I-A: real usage report retires a phantom-high nudge reference armed 
         const s2 = listSessions().find((x) => x.id === s!.id)!;
         assert.equal(s2.stats.lastInputTokens, 5000, "real usage report overwrote the armed estimate");
         assert.equal(s2.stats.lastInputTokensSource, "usage", "provenance flipped back to usage");
-        assert.ok(logs.some((l) => l.includes("nudge reference re-anchored 600000 -> 5000")), `re-anchor log missing: ${JSON.stringify(logs.filter((l) => l.includes("re-anchor")))}`);
+        // Phantom retirement can now happen on EITHER side: acp-kernel >= 0.0.100
+        // (ak#479 / ak#478) re-anchors the shown reference inside the nudge node
+        // the moment the incoming count drops below it, BEFORE bc's usage-settle
+        // hook runs — in that case there is no bc log line. bc's reanchorNudge-
+        // OnUsageDrop stays as defense-in-depth and still logs when it is the
+        // one that retires the reference. The invariant under test is the END
+        // STATE: the phantom never survives a real usage report.
+        if (s2.state.nudge.lastNudgeShownTokens !== 0 || Number(s2.state.nudge.lastPerMessageNudgeTokens) !== 5000) {
+            assert.ok(logs.some((l) => l.includes("nudge reference re-anchored 600000 -> 5000")), `re-anchor log missing: ${JSON.stringify(logs.filter((l) => l.includes("re-anchor")))}`);
+        }
         assert.equal(s2.state.nudge.lastNudgeShownTokens, 0, "phantom shown reference retired");
         assert.equal(s2.state.nudge.lastPerMessageNudgeTokens, 5000, "baseline re-anchored to reality");
         assert.deepEqual(s2.state.nudge.lastShownByTier, {}, "per-tier stamps cleared");

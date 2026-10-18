@@ -6,6 +6,8 @@
 // package as the proxy ⇒ same version ⇒ no kernel-skew bug class.
 
 import { envMillis } from "./native-bootstrap.js";
+import { parseBlocksCreated, parseToolOutcome, partialOutcomeNote } from "../proxy-tool-result.js";
+import type { ToolOutcomeKind } from "../proxy-tool-result.js";
 
 export type ManifestTool = {
     name: string;
@@ -15,9 +17,30 @@ export type ManifestTool = {
 
 const MANIFEST_TIMEOUT_MS = 5000;
 const TOOL_TIMEOUT_MS = 60000;
+// #2652: slack added on top of a proxy-advertised summary budget when sizing the
+// compress-call HTTP wait — covers the non-budgeted work around the batch (preflight
+// split / token count / kernel apply / serialize) outside the totalTimeoutMs clock.
+const TOOL_TIMEOUT_OVERHEAD_MARGIN_MS = 30_000;
 const STATUS_TIMEOUT_MS = 5000;
 const ATTACH_HEALTH_DEADLINE_MS = 15000;
 const ATTACH_HEALTH_POLL_MS = 250;
+
+// #2455: HTTP header values are ByteStrings — a char above U+00FF (e.g. a
+// Chinese provider/model id like "浮生云算/gpt-6.1-sol") makes undici throw a
+// TypeError when the host BUILDS the request, so the whole turn dies locally
+// before it ever reaches the proxy. Guard every user/host-controllable string
+// we stamp into an x-bili-plugin-* header through this one gate. Returns the
+// value unchanged only when it is stamp-safe: printable ASCII (VCHAR, no
+// whitespace/control) within the 1..256 span the proxy's own reader honors
+// (/^\S{1,256}$/ in pluginReportedModel). Anything else yields undefined so the
+// caller SKIPS the header — the proxy then falls back to the body model /
+// registry table with no side effect (a missing header is explicitly trusted
+// by pluginHeadersMatchModel). Deliberately stricter than raw latin1: a value
+// with whitespace would pass a bare ByteString check yet be rejected by the
+// proxy's \S gate anyway, so excluding it here changes nothing observable.
+export function asciiHeaderValue(value: string): string | undefined {
+    return /^[\x21-\x7e]{1,256}$/.test(value) ? value : undefined;
+}
 
 /** Detect the proxy from a provider baseUrl's `/bili/` zero-config prefix.
  *  The real prefix embeds the full upstream URL (`/bili/https://…`), so the
@@ -32,7 +55,7 @@ export function proxyBaseFromUrl(baseUrl: string | undefined): string | undefine
         const segments = url.pathname.split("/").filter((s) => s.length > 0);
         if (segments[0] !== "bili") return undefined;
         const rest = url.pathname.slice(url.pathname.indexOf("bili") + "bili".length);
-        if (!/^\/https?:\/\//.test(rest)) return undefined;
+        if (!/^\/(?:responses\/)?https?:\/\//.test(rest)) return undefined;
         return `${url.protocol}//${url.host}`;
     } catch {
         return undefined;
@@ -61,11 +84,23 @@ export function detectProxyBase(baseUrl: string | undefined): string | undefined
 // can tell which destinations the proxy will actually decrypt. Without it the
 // extension cannot distinguish "proxy will see this request" from "blind
 // tunnel — the field I inject reaches the upstream verbatim".
-export function mitmHostsFromEnv(env: NodeJS.ProcessEnv = process.env): Set<string> {
+function mitmHostsFromEnv(env: NodeJS.ProcessEnv = process.env): Set<string> {
     const out = new Set<string>();
     for (const raw of env.BILI_MITM_HOSTS?.split(",") ?? []) {
         const host = raw.trim().toLowerCase();
         if (host.length > 0) out.add(host);
+    }
+    return out;
+}
+
+/** #1392: opted-in non-http(s) baseUrl providers (BILI_NON_HTTP_PROVIDERS, set by
+ *  buildPiEnv or native-mode users). Provider ids are case-sensitive identifiers —
+ *  unlike the hostnames in mitmHostsFromEnv above, these are NOT lowercased. */
+export function nonHttpProvidersFromEnv(env: NodeJS.ProcessEnv = process.env): Set<string> {
+    const out = new Set<string>();
+    for (const raw of env.BILI_NON_HTTP_PROVIDERS?.split(",") ?? []) {
+        const id = raw.trim();
+        if (id.length > 0) out.add(id);
     }
     return out;
 }
@@ -129,9 +164,32 @@ async function fetchJson(url: string, init: RequestInit | undefined, timeoutMs: 
     }
 }
 
+// #2652: per-proxy advertised ceiling for a summary-producing tool call, learned from
+// the manifest at bootstrap. forwardTool sizes its compress-call HTTP wait from it so
+// the client never times out a fold the proxy is still legitimately running.
+const manifestToolDurations = new Map<string, number>();
+
+function recordManifestToolDuration(proxyBase: string, json: unknown): void {
+    const caps = (json as { capabilities?: { externalSummary?: { maxToolDurationMs?: unknown } } })?.capabilities?.externalSummary;
+    const value = caps?.maxToolDurationMs;
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) manifestToolDurations.set(proxyBase, value);
+}
+
+/** Effective HTTP wait (ms) for a forwarded tool call. Only compress invokes the
+ *  external summary executor (bounded by totalTimeoutMs), so only it grows past the
+ *  base floor — and only when the proxy advertised a budget. Everything else, and any
+ *  proxy that advertises nothing (chain off / older build), keeps the historical floor. */
+export function effectiveToolTimeoutMs(proxyBase: string, tool: string): number {
+    if (tool !== "compress") return TOOL_TIMEOUT_MS;
+    const advertised = manifestToolDurations.get(proxyBase);
+    if (advertised === undefined) return TOOL_TIMEOUT_MS;
+    return Math.max(TOOL_TIMEOUT_MS, advertised + TOOL_TIMEOUT_OVERHEAD_MARGIN_MS);
+}
+
 export async function fetchManifest(proxyBase: string, format: "anthropic" | "openai" = "anthropic"): Promise<ManifestTool[]> {
     const { ok, status, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, undefined, MANIFEST_TIMEOUT_MS);
     if (!ok || !json || typeof json !== "object") throw new Error(`manifest fetch failed: ${status}`);
+    recordManifestToolDuration(proxyBase, json);
     if (format === "openai") {
         // OpenAI function style: {name, description, parameters} (plain JSON Schema).
         const data = json as { tools?: { openai?: { name?: string; description?: string; parameters?: unknown }[] } };
@@ -189,6 +247,42 @@ export type RuntimeInfoReport = {
     source?: string;
 };
 
+// #2943: SessionStart hooks (zcode/kimi) are short-lived child processes the
+// client waits on. The old tail `void main().finally(() => process.exit(0))`
+// force-exited while an async handle was still open/mid-close — on Windows
+// Node 24.14.x that races libuv's win async-handle close path and aborts with
+// `assert(!(handle->flags & UV_HANDLE_CLOSING))` (src/win/async.c) BEFORE any
+// stdout is written, silently killing the whole integration (newer Node ships
+// the libuv endgame restructure that removed this race, which is why only
+// 24.14.x hit it). Never call process.exit() on the normal path: tear down the
+// one handle we always open (stdin) and let the loop drain to a NATURAL exit
+// 0. An unref'd backstop force-exits ONLY if something unexpected keeps the
+// loop alive — by then every handle has long since settled, so the forced exit
+// cannot re-trigger the race. Injectable deps keep the real wiring testable
+// without spawning a child. Fails open: always exits 0.
+const HOOK_EXIT_BACKSTOP_MS = 5_000;
+
+interface SessionStartHookDeps {
+    readonly input?: { destroy?: () => void };
+    readonly exit?: (code: number) => void;
+    readonly backstopMs?: number;
+}
+
+export function runSessionStartHook(main: () => Promise<void>, deps: SessionStartHookDeps = {}): void {
+    const exit = deps.exit ?? ((code: number) => process.exit(code));
+    const input = deps.input ?? process.stdin;
+    void main().finally(() => {
+        try {
+            (input as { destroy?: () => void }).destroy?.();
+        } catch {
+            // already closed
+        }
+        process.exitCode = 0;
+        const backstop = setTimeout(() => exit(0), deps.backstopMs ?? HOOK_EXIT_BACKSTOP_MS);
+        backstop.unref?.();
+    });
+}
+
 /** Runtime-info protocol (#955): push the client's OWN model config (what
  *  the plugin read from the host's config) to the proxy at bootstrap and on
  *  model switch, before any model request. Fire-and-forget by design — the
@@ -231,17 +325,68 @@ export async function reportRuntimeInfoOnChange(proxyBase: string | undefined, i
     }
 }
 
-export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal): Promise<string> {
+type AttributionHealthReport = {
+    agent: string;
+    state: "ok" | "none" | "threw";
+    /** Model requests refused direct in the current degraded episode (0 after recovery). */
+    refusals: number;
+    /** Epoch ms of the first refusal in the current episode (0 while healthy). */
+    since: number;
+};
+
+/** Takeover-attribution health report (#3581): when the host plugin's gate
+ *  refuses model traffic (disposed injection after a version swap — #3578),
+ *  the proxy must learn about it or the silent-direct degradation stays
+ *  invisible in /__bili/status and the panel. Sent ONLY on degradation events
+ *  (first refusal, state change, count doubling, give-up latch, recovery) —
+ *  fire-and-forget at call sites; a missed report delays visibility, never
+ *  touches the request path. */
+export async function reportAttributionHealth(proxyBase: string, health: AttributionHealthReport): Promise<void> {
+    const { ok, status } = await fetchJson(`${proxyBase}/__bili/plugin/attribution`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(health),
+    }, STATUS_TIMEOUT_MS);
+    if (!ok) throw new Error(`attribution report failed (${status})`);
+}
+
+/** #2204: business outcome of a forwarded tool call. ok:true means the tool
+ *  RAN; whether it achieved its effect rides the endpoint's machine-readable
+ *  `outcome` field (#1875). `failed` mirrors mcp.ts's mapping so every host
+ *  lane renders the same receipt the same way. #2752: the structured state now
+ *  rides through (defensively parsed) — hosts with a metadata channel expose it
+ *  (pi `details`, MCP `structuredContent`); string-only lanes read the appended
+ *  partial note in `text`. Absent on legacy envelopes without the fields. */
+export type ForwardedToolResult = { text: string; failed: boolean; outcome?: ToolOutcomeKind; blocksCreated?: number };
+
+export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal, nativeCaller: boolean = false): Promise<ForwardedToolResult> {
+    const body: { conversationId: string; tool: string; args: unknown; nativeCaller?: boolean } = { conversationId, tool, args: args ?? {} };
+    // #2072: host-native agents (pi / dsh / opencode) stamp a per-call id minted
+    // by the host's own session manager — declare it so a stale sibling witness
+    // can neither redirect nor fail-closed the call (ladder rung 0, #2024/#2016).
+    // Truthiness guard (not .length): a host passing a non-string id degrades to
+    // the legacy id-less wire instead of throwing (same shape as src/mcp.ts).
+    if (nativeCaller && conversationId) body.nativeCaller = true;
     const { ok, status, json } = await fetchJson(`${proxyBase}/__bili/plugin/tool`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ conversationId, tool, args: args ?? {} }),
-    }, TOOL_TIMEOUT_MS, signal);
-    const data = json as { ok?: boolean; result?: string; error?: string } | undefined;
+        body: JSON.stringify(body),
+    }, effectiveToolTimeoutMs(proxyBase, tool), signal);
+    const data = json as { ok?: boolean; result?: string; error?: string; outcome?: unknown; blocksCreated?: unknown } | undefined;
     if (!ok || !data?.ok) {
         throw new Error(`bili proxy tool ${tool} failed (${status}): ${data?.error ?? "unknown error"}`);
     }
-    return data.result ?? "";
+    const outcome = parseToolOutcome(data.outcome);
+    const blocksCreated = parseBlocksCreated(data.blocksCreated);
+    let text = data.result ?? "";
+    // #2752: a partial fold must stay distinguishable on lanes whose host shape
+    // carries no structured state — the note rides the text. Applied/refused/
+    // failure envelopes keep their exact historical bytes (no note).
+    if (outcome === "partial") text += `\n${partialOutcomeNote(blocksCreated)}`;
+    const out: ForwardedToolResult = { text, failed: outcome === "failure" || outcome === "refused" };
+    if (outcome !== undefined) out.outcome = outcome;
+    if (blocksCreated !== undefined) out.blocksCreated = blocksCreated;
+    return out;
 }
 
 /** Soft-fail by design: the status read is best-effort UI data; undefined
@@ -270,8 +415,35 @@ export async function fetchStatusLatest(proxyBase: string): Promise<Record<strin
 export async function fetchProxyVersion(proxyBase: string): Promise<string | undefined> {
     const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, undefined, STATUS_TIMEOUT_MS);
     if (!ok || !json || typeof json !== "object") return undefined;
-    const version = (json as { version?: unknown }).version;
-    return typeof version === "string" && version.length > 0 ? version : undefined;
+    const m = json as { version?: unknown; commit?: unknown };
+    const version = m.version;
+    if (typeof version !== "string" || version.length === 0) return undefined;
+    // Append the build commit so status surfaces show WHICH build answers,
+    // matching /__bili/status and `--version` (they all include it). Consumers
+    // only display or liveness-check this string — none parses it.
+    const commit = m.commit;
+    if (typeof commit === "string" && commit.length > 0) return `${version} (${commit})`;
+    return version;
+}
+
+/** #1603: one-line staleness warning for status UIs — the on-disk install is
+ *  newer than the running process, so a host restart is needed to activate the
+ *  new code. Soft-fail by design (same contract as fetchStatus): undefined when
+ *  not stale OR the proxy can't be reached — a failed probe must never break /acp. */
+export async function fetchStaleNotice(proxyBase: string): Promise<string | undefined> {
+    const { ok, json } = await fetchJson(`${proxyBase}/__bili/status`, undefined, STATUS_TIMEOUT_MS);
+    if (!ok || !json || typeof json !== "object") return undefined;
+    const s = json as { stale?: unknown; version?: unknown; diskVersion?: unknown; autoRestartOnUpdate?: unknown; commit?: unknown };
+    if (s.stale !== true) return undefined;
+    const running = typeof s.version === "string" ? s.version : "?";
+    const installed = typeof s.diskVersion === "string" ? s.diskVersion : "?";
+    // Same-version builds can differ (dev vs released); the running side gets
+    // its commit so users can tell which build is actually answering.
+    const runningCommit = typeof s.commit === "string" && s.commit.length > 0 ? s.commit : undefined;
+    const tail = s.autoRestartOnUpdate === true
+        ? " — auto-restart is enabled but did not fire this cycle; check the bili log"
+        : " — restart the host to activate (or enable --auto-restart-on-update)";
+    return `⚠️ billion-context is stale: running v${running}${runningCommit ? ` (${runningCommit})` : ""} but v${installed} is installed${tail}.`;
 }
 
 /** #1365: poll the attach liveness probe until it answers or the deadline

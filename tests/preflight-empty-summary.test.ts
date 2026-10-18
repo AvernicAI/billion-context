@@ -6,11 +6,19 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 // Fail fast on 4xx retries so the stream-learn path exercises immediately.
 process.env.BILI_REPLAY_RETRY_MAX = "1";
-// Short dead-end cooldown so the expiry leg of the #726 test stays fast.
-process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS = "400";
+// Zero backoff so #1767's transient-retry legs (truncation is now retried) run instantly.
+process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
+// #3274: keep the dead-end marker warm across the r1->r2 retry gap even on slow
+// CI runners — a 400ms window expired under load and the "immediate" retry
+// re-walked preflight instead of replaying the cached diagnosis, drifting the
+// local token estimate and re-spending upstream calls (#3279 windows node22).
+// The #726 expiry leg cools the marker directly (below) rather than sleeping,
+// so this window can stay wide without slowing the suite.
+process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS = "60000";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
@@ -153,7 +161,14 @@ function startProxy(upstreamPort: number, models: Record<string, { context: numb
         debug: false,
         passthrough: false,
         autoUpdate: false,
-        mitm: { enabled: false, domains: [] },
+autoRestartOnUpdate: false,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        updateTag: "latest",
+mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
 }
 
@@ -191,7 +206,9 @@ test("changed over-window content bypasses a previous dead-end cooldown", async 
         assert.ok(calls.length > callsBefore, "changed content must retry preflight even at the same length/model/window");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await Promise.all([once(proxy, "close"), once(upstream, "close")]);
     }
 });
@@ -228,7 +245,9 @@ test(`temporary summary HTTP ${status} failure does not cache a deterministic de
         assert.ok(calls > callsBefore, "next request must reach the upstream");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await Promise.all([once(proxy, "close"), once(upstream, "close")]);
     }
 });
@@ -267,7 +286,9 @@ test("#726 size-driven empty summary: oversized chunk fails, halved chunk recove
         assert.equal(sess?.metadata?.preflightDeadEnd, undefined, "successful preflight must not leave a dead-end marker");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -315,14 +336,23 @@ test("#726 systemic empty summary: diagnosis surfaced, bounded calls, cooldown b
         assert.equal(j2.error?.message, j1.error?.message, "cooldown replays the cached diagnosis");
         assert.equal(calls.length, callsBeforeRetry, "cooldown must spend ZERO upstream calls");
 
-        await new Promise((resolve) => setTimeout(resolve, 450));
+        // #3274: cool the marker deterministically (set `until` into the past) rather than
+        // sleeping past the window — the wide #3274 window makes an expiry sleep slow, and a
+        // fixed sleep is itself runner-timing-dependent. This hits the same de.until > now branch.
+        {
+            const expired = listSessions().find((x) => x.id.includes("s726-deadend"))?.metadata?.preflightDeadEnd as { until: number } | undefined;
+            assert.ok(expired, "dead-end marker still present before simulated expiry");
+            expired.until = Date.now() - 1;
+        }
         const callsBeforeExpire = calls.length;
         const r3 = await driveResponses(proxyPort, upstreamPort, "s726-deadend", "gpt-7-sol", longResponsesInput(12));
         assert.equal(r3.status, 502, `post-expiry retry must fail again, got ${r3.status}`);
         assert.ok(calls.length > callsBeforeExpire, "after the cooldown expires the walk must run again");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -362,7 +392,9 @@ test("#726 dead-end cooldown must not block safe-forwards: fitting payload under
         assert.ok(calls.length > callsBeforeSmall && calls[calls.length - 1].summary === false, "the small payload was forwarded to the upstream");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -408,19 +440,25 @@ test("#987 diagnoseEmptySummary names plain-JSON empty completions precisely", (
         id: "chatcmpl-1789806312367", object: "chat.completion", model: "muse-spark-1.3-contributor",
         choices: [{ index: 0, message: { role: "assistant", content: "" }, finish_reason: "stop" }],
     });
+    // #2832: the diagnosis now carries the block-level fingerprint — the
+    // text_chars/text_blocks parts are what separate a thinking-only answer
+    // from a relay that stripped the text.
     assert.match(
         diagnoseEmptySummary(openai, JSON.parse(openai)),
-        /plain-JSON completion with empty content \(finish_reason=stop, answered as model=muse-spark-1\.3-contributor\)/,
+        /plain-JSON completion with empty content \(finish_reason=stop, text_chars=0, answered as model=muse-spark-1\.3-contributor\)/,
     );
     const anthropic = JSON.stringify({ id: "msg_1", model: "claude-x", content: [], stop_reason: "max_tokens" });
     assert.match(
         diagnoseEmptySummary(anthropic, JSON.parse(anthropic)),
-        /plain-JSON completion with empty content \(stop_reason=max_tokens, answered as model=claude-x\)/,
+        /plain-JSON completion with empty content \(stop_reason=max_tokens, text_blocks=0, answered as model=claude-x\)/,
     );
+    // #2309: an explicit Responses terminal state now gets its own precise
+    // diagnosis (the old string claimed "empty content", which is false when
+    // partial text rides the body).
     const responses = JSON.stringify({ id: "resp_1", status: "incomplete", output: [] });
     assert.match(
         diagnoseEmptySummary(responses, JSON.parse(responses)),
-        /plain-JSON completion with empty content \(status=incomplete\)/,
+        /incomplete Responses summary \(status=incomplete\)/,
     );
     // Unrecognized JSON keeps the generic diagnosis (shape guard).
     assert.match(
@@ -450,7 +488,9 @@ test("#780 truncated summary stream is unusable: diagnosis names truncation, bou
             `fail-fast message must carry the truncation diagnosis, got: ${j.error?.message}`,
         );
         const summaries = calls.filter((c) => c.summary);
-        assert.ok(summaries.length >= 2 && summaries.length <= 9, `summary calls must be bounded, got ${summaries.length}: ${JSON.stringify(summaries)}`);
+        // #1767: truncation is now transient-classified, so each span gets up to
+        // two extra same-span draws; the ceiling is 2 protection regimes x 16.
+        assert.ok(summaries.length >= 2 && summaries.length <= 32, `summary calls must be bounded, got ${summaries.length}: ${JSON.stringify(summaries)}`);
         assert.ok(!calls.some((c) => !c.summary), "nothing may be forwarded on failure");
 
         const sess = listSessions().find((s) => s.id.includes("s780-trunc"));
@@ -462,7 +502,9 @@ test("#780 truncated summary stream is unusable: diagnosis names truncation, bou
         assert.equal(calls.length, callsBeforeRetry, "cooldown must spend ZERO upstream calls");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });

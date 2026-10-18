@@ -125,7 +125,7 @@ test("emit*: every emission is a bare JSONL line of the right event type", () =>
     const parse = (b: Buffer) => JSON.parse(b.toString("utf8").replace(/\n$/, ""));
     const t = parse(adapter.emitText("hi"));
     assert.deepEqual(t, { type: "text-delta", text: "hi" });
-    const r = parse(adapter.emitReasoning("think"));
+    const r = parse(adapter.emitReasoning!("think"));
     assert.deepEqual(r, { type: "reasoning-delta", text: "think" });
     const tc = parse(adapter.emitToolCall({ name: "bash", callId: "id1", arguments: '{"a":1}' }));
     assert.deepEqual(tc, { type: "tool-call", toolCallId: "id1", toolName: "bash", input: { a: 1 } });

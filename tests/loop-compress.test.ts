@@ -1,5 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
 import type { Session } from "../src/session.ts";
@@ -15,6 +17,7 @@ function makeCtx(messages: CoreMessage[] = []): {
     log: (m: string) => void;
     proxyUrl?: string;
     textProtocol?: boolean;
+    refreshFolded?: (current: CoreMessage[]) => CoreMessage[] | Promise<CoreMessage[]>;
 } {
     return {
         core: createCore(),
@@ -23,7 +26,8 @@ function makeCtx(messages: CoreMessage[] = []): {
         session: {
             id: "loop-compress-test",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 , compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+            pendingRetrievals: [],
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -202,6 +206,62 @@ test("loop #7: successful compress (real block) → re-request fires (model cont
         assert.ok(/event: response\.completed/.test(out), "graceful completion");
     } finally {
         probe.restore();
+    }
+});
+
+test("loop external summary: streaming compress uses the configured model and credential", async () => {
+    const summaryUrl = "http://127.0.0.1/summary";
+    const previousKey = process.env.E2E_SUMMARY_KEY;
+    const originalFetch = globalThis.fetch;
+    const ctx = withRefs(makeCtx([
+        textMsg("raw_1", "user", bigText(5000)),
+        textMsg("raw_2", "assistant", bigText(5000)),
+        textMsg("raw_3", "user", bigText(5000)),
+        textMsg("raw_4", "assistant", bigText(5000)),
+        textMsg("raw_5", "user", bigText(5000)),
+        textMsg("raw_6", "assistant", bigText(5000)),
+        textMsg("raw_7", "user", bigText(5000)),
+    ]));
+    const summary = "Dedicated summary: preserve src/example.ts:27 and the pending test task.".repeat(3);
+    const round1 = [
+        sse("response.created", { response: { id: "resp_external", status: "in_progress" } }),
+        fcEvents(0, "call_external", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002" }] })),
+        COMPLETED,
+    ].join("");
+    // The chain rides the request config rail (#833): ctx.config is the
+    // session's effective resolved config, like the proxy serves it.
+    (ctx.config as Config & { externalSummary?: unknown }).externalSummary = {
+        enabled: true,
+        targets: [{ name: "dedicated", protocol: "responses", url: summaryUrl, model: "summary-model", credentialRef: "env:E2E_SUMMARY_KEY" }],
+    };
+    process.env.E2E_SUMMARY_KEY = "dedicated-test-key";
+    let summaryCalls = 0;
+    try {
+        globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+            const url = String(input);
+            if (url === summaryUrl) {
+                summaryCalls++;
+                const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+                assert.equal(init?.headers && new Headers(init.headers).get("authorization"), "Bearer dedicated-test-key");
+                assert.equal(body.model, "summary-model");
+                return new Response(JSON.stringify({ status: "completed", output_text: summary }), { status: 200, headers: { "content-type": "application/json" } });
+            }
+            return new Response(REFETCH_DONE, { status: 200, headers: { "content-type": "text/event-stream" } });
+        }) as typeof fetch;
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "main-model", input: [], stream: true },
+            { url: "http://mock/upstream", headers: {} },
+        );
+        assert.equal(summaryCalls, 1);
+        assert.equal(ctx.session.state.blocks[0]?.summary, summary);
+        assert.ok(out.includes("[ACP]"));
+        assert.ok(out.includes("response.completed"));
+    } finally {
+        globalThis.fetch = originalFetch;
+        if (previousKey === undefined) delete process.env.E2E_SUMMARY_KEY;
+        else process.env.E2E_SUMMARY_KEY = previousKey;
     }
 });
 

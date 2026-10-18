@@ -28,10 +28,16 @@
 // and re-probe only after HEALTH_PROBE_TTL_MS, so a healthy proxy costs no
 // per-request RTT and a dead one is found within at most one TTL. If no origin
 // can be made healthy the request goes DIRECT (uncompressed) and a one-time
-// stderr warning fires — recovery is automatic once a proxy is healthy again
-// (no permanent latch; re-checked at least every TTL). Bootstrap retries are
-// rate-limited to one attempt per RESPAWN_COOLDOWN_MS so a persistently
-// failing spawn does not become a per-request spawn storm.
+// diagnostic lands in bili.log — EXCEPT when the body provably exceeds the
+// model's context window: per the #2924 ruling (always compress OR always
+// refuse) such a request is refused locally with a host-visible retryable
+// error instead of riding the direct fallback into a guaranteed upstream 400
+// (#3308 — on an over-window session history that 400 then repeats on every
+// later turn until restart). Unknown window/body keeps the fail-open.
+// Recovery is automatic once a proxy is healthy again (no permanent latch;
+// re-checked at least every TTL). Bootstrap retries are rate-limited to one
+// attempt per RESPAWN_COOLDOWN_MS so a persistently failing spawn does not
+// become a per-request spawn storm.
 //
 // Skipped when opted out (BILI_NATIVE_OPENCODE=0 / BILLION_CONTEXT_PLUGIN=0)
 // or when a `bili` /bili/ launch owns routing (BILI_PROVIDER_REWRITES). A
@@ -70,11 +76,13 @@ import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestTarget, routedBiliModelUrl, setDeclaredModelEndpoints, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, setDeclaredModelEndpoints, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
 import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
+import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
-import { fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion } from "./shared.js";
+import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
+import { logHostEvent } from "./host-log.js";
 
 /** Decides whether the native bootstrap should run in this process. */
 export function shouldBootstrapNativeOpencode(env: NodeJS.ProcessEnv): boolean {
@@ -101,6 +109,35 @@ export function planNativeOpencode(env: NodeJS.ProcessEnv): { mode: "off" | "att
 
 export type OpencodeNativeRouteDeps = LiveOriginResolverDeps;
 
+/** #3308: client-side mirror of #2924's refuse-oversized arm for this lane
+ *  (the V2 route has no takeover gate to carry it). Returns a host-visible
+ *  refusal when the proxy is unavailable AND the body provably cannot fit the
+ *  model's context window — the FLOOR estimate (bytes/4) already exceeds the
+ *  window, and #2924's ledger evidence says real bodies run ABOVE the floor
+ *  (calibratedEstimate ~1.14), so the comparison cannot false-refuse. Unknown
+ *  model, unknown window, unreadable or absent body all return undefined and
+ *  keep the documented fail-open direct send. The size is measured through a
+ *  CLONE — the original Request must stay sendable (#2496 discipline). */
+async function oversizeDirectRefusal(e: V2HttpRequestEvent, s: V2State): Promise<Error | undefined> {
+    const model = e.model;
+    if (model === undefined || typeof model.providerID !== "string" || typeof model.id !== "string") return undefined;
+    const window = s.windows?.get(`${model.providerID}/${model.id}`);
+    if (window === undefined || !Number.isFinite(window) || window <= 0) return undefined;
+    const req = e.request as Request | undefined;
+    if (req === null || typeof req !== "object" || typeof req.clone !== "function") return undefined;
+    let bytes: number;
+    try {
+        bytes = (await req.clone().arrayBuffer()).byteLength;
+    } catch {
+        return undefined;
+    }
+    const floorTokens = Math.ceil(bytes / 4);
+    if (floorTokens <= window) return undefined;
+    return new Error(
+        `bili: proxy unavailable and this request cannot be sent uncompressed — body ~${floorTokens} tok (floor estimate ${bytes}B/4) exceeds the ${model.providerID}/${model.id} context window (${window}); upstream would reject it. Recovery is automatic (#3308); retry shortly, or start a fresh session if the local history has outgrown the window.`,
+    );
+}
+
 /** Build the native-mode route callback consumed by createOpencodeV2Setup.
  *  #1135: spawn and attach share ONE liveness gate — attach arms
  *  state.respawn (verifyAttachAndRecover), so a dead external proxy is
@@ -109,19 +146,63 @@ export type OpencodeNativeRouteDeps = LiveOriginResolverDeps;
 export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNativeRouteDeps = {}): (e: V2HttpRequestEvent, s: V2State) => Promise<void> {
     const resolveLive = createLiveOriginResolver(state, deps);
     let warned = false;
+    let refusedNoticed = false;
+    // #1958: conflicting pre-routed config is exposed once per (session, origin).
+    const conflictWarned = new Set<string>();
     return async (e, s) => {
         const url = typeof e.request?.url === "string" ? e.request.url : undefined;
         if (url === undefined) return;
         // #1365: routed URLs are skipped by isModelApiUrl by design — record
         // the pinned model channel before that gate so attach recovery can see it.
-        if (routedBiliModelUrl(url) !== undefined) noteRoutedOrigin(state, url);
+        if (routedBiliModelUrl(url) !== undefined) {
+            noteRoutedOrigin(state, url);
+            // #1958: a hand-written /bili/ prefix while the native plugin is
+            // active means two access paths claiming routing ownership of the
+            // same request — a conflicting configuration, not something the
+            // plugin should silently absorb. Expose it loudly, once per
+            // session+origin, with a fix-it guide, and leave the request on
+            // the plain-proxy path it already encodes: no rewrite, no plugin
+            // stamping. An explicit pin of THIS origin (BILLION_CONTEXT_PROXY
+            // pointing at the proxy the URLs already ride) is the supported
+            // attach posture — silent. Compared against the env, NOT
+            // state.origin: attach arming does not freeze state.origin
+            // synchronously, so early requests would false-warn against a
+            // benign pin.
+            const baked = new URL(url).origin;
+            const declaredRaw = process.env.BILLION_CONTEXT_PROXY;
+            let declared: string | undefined;
+            try {
+                declared = declaredRaw !== undefined && declaredRaw !== "" ? new URL(declaredRaw).origin : undefined;
+            } catch {
+                declared = undefined;
+            }
+            if (declared !== baked) {
+                const key = `${String(e.sessionID ?? "_")}\u0000${baked}`;
+                if (!conflictWarned.has(key)) {
+                    conflictWarned.add(key);
+                    logHostEvent("error", "[native-client]", `bili-native-opencode: conflicting configuration — model requests already carry a /bili/ prefix (origin ${baked}) while the native plugin is active. The plugin routes model requests itself; hand-written /bili/ prefixes belong to the no-plugin plain-proxy path. Pick ONE: (1) remove the /bili/ prefix from your opencode provider baseURL(s) so the plugin routes them, or (2) run \`bili plugin remove opencode\` and keep the pre-routed URLs. Until resolved, these requests continue to ${baked} in plain proxy mode WITHOUT the plugin session markers.`);
+                }
+            }
+        }
         if (!isModelApiUrl(url)) return;
 
         const target = await resolveLive();
         if (target === undefined) {
+            // #3308: a direct send that provably cannot fit the window is not
+            // "availability" — refuse it locally (#2924 ruling) instead of
+            // handing upstream a request that can only 400.
+            const refusal = await oversizeDirectRefusal(e, s);
+            if (refusal !== undefined) {
+                if (!refusedNoticed) {
+                    refusedNoticed = true;
+                    logHostEvent("error", "[native-client]", `bili-native-opencode: proxy unavailable — model request refused locally instead of going direct into a guaranteed upstream 400 (#3308): ${refusal.message}`);
+                }
+                s.proxyBase = undefined;
+                throw refusal;
+            }
             if (!warned) {
                 warned = true;
-                console.error("bili-native-opencode: proxy unavailable — model requests go direct (uncompressed)");
+                logHostEvent("error", "[native-client]", "bili-native-opencode: proxy unavailable — model requests go direct (uncompressed)");
             }
             s.proxyBase = undefined;
             return;
@@ -133,6 +214,9 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
 }
 
 const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+// #3304: the opencode swap stamps the turn id atomically with the body, so the
+// strict shared guard applies — mutated + unrestorable ⇒ refuse locally.
+state.prepareDirectSend = createPrepareDirectSend();
 
 async function bootstrap(): Promise<string | undefined> {
     try {
@@ -144,7 +228,7 @@ async function bootstrap(): Promise<string | undefined> {
         process.env.BILLION_CONTEXT_PROXY = handle.origin;
         return handle.origin;
     } catch (err) {
-        console.error(`bili-native-opencode: proxy bootstrap failed — model traffic goes direct (uncompressed): ${err instanceof Error ? err.message : String(err)}`);
+        logHostEvent("error", "[native-client]", `bili-native-opencode: proxy bootstrap failed — model traffic goes direct (uncompressed): ${err instanceof Error ? err.message : String(err)}`);
         return undefined;
     }
 }
@@ -192,14 +276,14 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
         if (back !== undefined) {
             state.origin = back;
             process.env.BILLION_CONTEXT_PROXY = back;
-            console.log(`bili-native-opencode: attach target ${pinned} is healthy again — attached, no second instance spawned`);
+            logHostEvent("info", "[native-client]", `bili-native-opencode: attach target ${pinned} is healthy again — attached, no second instance spawned`);
             return back;
         }
-        console.error(`bili-native-opencode: attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
+        logHostEvent("error", "[native-client]", `bili-native-opencode: attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
         state.origin = undefined;
         return undefined;
     }
-    console.error(`bili-native-opencode: attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
+    logHostEvent("error", "[native-client]", `bili-native-opencode: attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
     delete process.env.BILLION_CONTEXT_PROXY;
     state.attach = false;
     state.origin = undefined;
@@ -258,7 +342,7 @@ export function armNativeOpencode(p: typeof plan): void {
                     if (version === undefined || state.origin === origin) return;
                     state.origin = origin;
                     process.env.BILLION_CONTEXT_PROXY = origin;
-                    console.warn(`bili-native-opencode: model channel pinned to ${origin} — rebinding bili tools there`);
+                    logHostEvent("warn", "[native-client]", `bili-native-opencode: model channel pinned to ${origin} — rebinding bili tools there`);
                 });
             };
             state.ready = start();
@@ -303,7 +387,7 @@ export function _resetNativeStateForTest(): void {
 
 // ———— OpenCode 1.x native surface (V1 `.server()`) ————————————————————
 
-type ZodLike = typeof import("zod");
+export type ZodLike = typeof import("zod");
 
 interface V1ToolContext {
     sessionID: string;
@@ -473,8 +557,9 @@ export function extractV1Outputs(cfg: V1Config): Map<string, number> {
 export interface V1NativeDeps {
     /** zod module (tests inject; runtime lazy-imports "zod"). */
     z?: ZodLike;
-    /** Tool forwarder (tests inject; runtime POSTs /__bili/plugin/tool). */
-    forward?: (origin: string, conversationId: string, tool: string, args: unknown) => Promise<string>;
+    /** Tool forwarder (tests inject; runtime POSTs /__bili/plugin/tool). #2204:
+     *  carries the business outcome so failures surface as host errors. */
+    forward?: (origin: string, conversationId: string, tool: string, args: unknown, nativeCaller?: boolean) => Promise<ForwardedToolResult>;
     /** Absorbed opencode-acp for legacy sessions (#920); when present its DCP
      *  tool slots serve BOTH lanes (legacy → acp executor, new → forward). */
     legacy?: LegacyAcpModule;
@@ -508,7 +593,9 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
     const acp = createAcpCommandHooks(getOrigin, ctx);
     const legacy = deps.legacy;
     const isLegacy = deps.isLegacy ?? isLegacyAcpSession;
-    const log = deps.log ?? ((msg: string) => console.log(msg));
+    // #2831: the per-session "rewrote provider baseURL(s)" notice is a diagnostic, not a
+    // user deliverable — file-only so it can't land on the live TUI mid-session.
+    const log = deps.log ?? ((msg: string) => logHostEvent("info", "[native-client]", msg));
     let windows = new Map<string, number>();
     let outputs = new Map<string, number>();
     // #1362: derived-session inheritance for the V1 lane (same register
@@ -631,12 +718,13 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                 if (w !== undefined) output.headers["x-bili-plugin-context-window"] = String(w);
                 const o = outputs.get(key);
                 if (o !== undefined) output.headers["x-bili-plugin-max-output"] = String(o);
-                output.headers["x-bili-plugin-model"] = model.id;
+                const modelHeader = asciiHeaderValue(model.id);
+                if (modelHeader !== undefined) output.headers["x-bili-plugin-model"] = modelHeader;
                 reportRuntimeInfoOnChange(base, { agent: "opencode", model: model.id, contextWindow: w, maxOutput: o, source: "client-config" });
             }
             maybeReportDerived(base, input.sessionID);
         };
-        const forward = deps.forward ?? ((o, conversationId, tool, args) => import("./shared.js").then((m) => m.forwardTool(o, conversationId, tool, args)));
+        const forward = deps.forward ?? ((o, conversationId, tool, args, nativeCaller) => import("./shared.js").then((m) => m.forwardTool(o, conversationId, tool, args, undefined, nativeCaller === true)));
         if (legacy !== undefined) {
             // Tool slots carry acp's DCP schemas (kernel-parseable object form)
             // for BOTH lanes; executors route per session. acp_context_recap
@@ -654,7 +742,11 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                         }
                         const base = getOrigin();
                         if (base === undefined) return "bili: no live proxy yet — compression temporarily unavailable";
-                        return forward(base, v1ctx.sessionID, name, args);
+                        const out = await forward(base, v1ctx.sessionID, name, args, true);
+                        // #2204: V1 tool results are plain strings — a business
+                        // failure throws so the host renders an error, not text.
+                        if (out.failed) throw new Error(out.text);
+                        return out.text;
                     },
                 };
             }
@@ -670,7 +762,11 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                         execute: async (args, v1ctx) => {
                             const base = getOrigin();
                             if (base === undefined) return "bili: no live proxy yet — compression temporarily unavailable";
-                            return forward(base, v1ctx.sessionID, fn.name, args);
+                            const out = await forward(base, v1ctx.sessionID, fn.name, args, true);
+                            // #2204: same as the legacy-lane slot above — plain-string
+                            // results have no error flag, so failures throw.
+                            if (out.failed) throw new Error(out.text);
+                            return out.text;
                         },
                     };
                 }
@@ -718,7 +814,14 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     console.log(`[bili-opencode-native] v1 active (proxy ${origin})`);
     let z: ZodLike | undefined;
     try {
-        z = (await import("zod")) as ZodLike;
+        // Opaque specifier on purpose (#3511 P0 follow-up): zod is now bundled
+        // into dist for the jimp lane, and a literal import("zod") here would
+        // let esbuild rewrite it to that inlined copy. The V1 interop needs the
+        // HOST's zod instance when running inside opencode (the host registry
+        // safeParses with its own zod object shapes), and thin installs without
+        // node_modules must keep the documented degrade to proxy mode.
+        const zodSpecifier = "zod";
+        z = (await import(zodSpecifier)) as ZodLike;
     } catch {
         z = undefined;
     }
@@ -737,4 +840,148 @@ const server = async (ctx: V1PluginContext): Promise<V1Hooks> => {
     return createV1ServerHooks(() => state.origin, ctx, { z, legacy });
 };
 
-export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state) }), server };
+export default { id: "billion-context-opencode-native", setup: createOpencodeV2Setup({ route: createNativeRoute(state), incremental: maybeIncrementalOpencode }), server };
+
+/** #3248 phase 2: incremental-turn divert for opencode. Runs LAST in the
+ *  http.request hook (routing + header stamping already happened, so the
+ *  stamped plugin headers ride the SAME request object we replace). The
+ *  conversation id is opencode's own session id (x-bili-plugin-conversation
+ *  was just stamped with it — identity upgrades, never forks). #3329: each
+ *  planned turn is keyed by a fresh per-request turn id stamped onto the
+ *  outgoing request (x-bili-turn-id) — several sessions share one provider
+ *  URL, and keying by URL mis-attributes a late response to whichever
+ *  session planned last on that URL. The #3378 single-flight guard per URL
+ *  is KEPT on top of turn-id keying (#3340 rebase decision): while a
+ *  marker'd request for this URL is still awaiting its ack, later requests
+ *  on the same URL ride the normal pipeline — attribution answers "which
+ *  ack consumes which pending", the guard answers "no second conversion on
+ *  this URL until the first is acked or ages out"; dropping the guard is a
+ *  separate follow-up. Exported for the native suites; wired above. */
+export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State): Promise<void> {
+    try {
+        const sid = typeof e.sessionID === "string" ? e.sessionID : "";
+        const base = s.proxyBase;
+        const req = e.request as Request | undefined;
+        if (!sid || !base || req === undefined || typeof req.clone !== "function") return;
+        const url = req.url;
+        sweepStale(incPendingOpencode, INC_PENDING_TTL_MS);
+        // #3304: keep the ORIGINAL body string — stashed under the turn id
+        // below so the direct-send guard can restore it when the proxy dies
+        // before the swapped payload lands.
+        let origText: string;
+        try {
+            origText = await req.clone().text();
+        } catch {
+            return;
+        }
+        let body: unknown;
+        try {
+            body = JSON.parse(origText);
+        } catch {
+            return;
+        }
+        if (body === null || typeof body !== "object") return;
+        const b = body as { messages?: unknown; model?: unknown; system?: unknown };
+        if (typeof b.model !== "string" || !wireMessagesLookAnthropic(b.messages)) return; // anthropic-wire only; OpenAI-tool shapes resend full
+        if (!(await probeIncrementalTurns(base))) return;
+        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown> });
+        if (plan.mode === "skip") return;
+        // #3378 single-flight (kept over #3329's removal per the rebase
+        // decision): while a marker'd request for this URL is still awaiting
+        // its ack, later requests ride the normal pipeline. Pending entries
+        // are keyed by turn id (#3329), so the guard scans for a live entry
+        // stashed on THIS url (sweepStale above already aged out the stale
+        // ones — an aged entry must not block a fresh conversion).
+        let inflight = false;
+        for (const pending of incPendingOpencode.values()) {
+            if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
+        }
+        if (inflight) return;
+        const turnId = newIncrementalTurnId();
+        // #3304: stash before the swap — the opencode replacement happens in
+        // this hook, BEFORE the fetch intercept ever sees the request, so
+        // every direct-send fall-back (not just the give-up paths) relies on
+        // these bytes.
+        rememberOriginalBody(turnId, origText);
+        replaceRequestPayload(e, plan.body, { [INCREMENTAL_TURN_MARKER_HEADER]: "1", [INCREMENTAL_TURN_ID_HEADER]: turnId });
+        incPendingOpencode.set(turnId, { sid, url, messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, base, at: Date.now() });
+    } catch {
+        // never break the host's request on adapter failure
+    }
+}
+
+interface IncrementalPendingTurn {
+    /** Conversation (opencode session id) this planned turn belongs to. */
+    sid: string;
+    /** Model-endpoint URL this turn was planned on — carried for the #3378
+     *  single-flight scan; attribution itself is by turn id (#3329). */
+    url: string;
+    messages: IncrementalWireMessage[];
+    system: unknown;
+    base: string;
+    at: number;
+}
+
+/** Planned turns age out: onResponse only fires on a SUCCESSFUL send, so a
+ *  request that died network-level would otherwise pin its slot forever.
+ *  Memory hygiene only (#3329) — attribution is exact per turn id, so a
+ *  lingering entry can no longer mis-attribute another request's ack. */
+const INC_PENDING_TTL_MS = 30_000;
+
+/** Keyed by per-request turn id (#3329); each entry remembers the URL it
+ *  was planned on so the #3378 single-flight guard can scan for live
+ *  same-URL entries — see maybeIncrementalOpencode. */
+const incPendingOpencode = new Map<string, IncrementalPendingTurn>();
+
+/** Test hook: drop all planned turns (the map is module state across suites). */
+export function __resetOpencodeIncrementalForTests(): void {
+    incPendingOpencode.clear();
+}
+
+/** Ack collector registered on the module's NativeInterceptState: the
+ *  model-API and routed branches both fire onResponse(url, resp, headers)
+ *  after a successful send. #3329: attribution is by the per-request turn id
+ *  read back from THIS dispatch's outgoing headers (third argument) — the
+ *  url is only ever shared context, never the key. A response without a
+ *  turn-id header is not an incremental ack at all. Exported for the native
+ *  suites; wired below. */
+export function opencodeIncrementalOnResponse(_url: string, response: Response, headers?: Record<string, string>): void {
+    const turnId = headers?.[INCREMENTAL_TURN_ID_HEADER];
+    if (turnId === undefined) return; // not an incremental dispatch — nothing to attribute (#3329)
+    const pending = incPendingOpencode.get(turnId);
+    if (pending === undefined) return; // unknown/stale turn — nothing to attribute
+    const seq = response.headers.get("x-bili-applied-seq");
+    if (response.status === 200 && (seq === null || !Number.isFinite(Number(seq)))) {
+        // 200 without an ack header CANNOT be the marker'd response — the
+        // lane stamps x-bili-applied-seq on every diverted response that
+        // reaches the forward (incremental-lane.ts writeHead wrap). It is a
+        // concurrent full-resend response on the shared model-endpoint URL:
+        // keep the pending entry for the marker'd response still in flight.
+        return;
+    }
+    incPendingOpencode.delete(turnId);
+    try {
+        if (response.status === 200) {
+            noteIncrementalAck(pending.sid, Number(seq), pending.messages, pending.system);
+            return;
+        }
+        if (response.status === 409) {
+            // Lane rejected the plan (seq mismatch): #3369 — reset (re-seed
+            // next turn) unless the rejection circuit trips; a single drift
+            // must not permanently kill the conversation.
+            const verdict = noteIncrementalRejection(pending.sid);
+            logHostEvent("warn", "[native-client]", `[opencode] incremental turn rejected (409) — conversation ${pending.sid} ${verdict === "dead" ? "falls back to full resend (rejection circuit)" : "re-seeds with a full resync next turn"} (#3369)`);
+            return;
+        }
+        if (response.status === 503) {
+            // #3369: lane temporarily unavailable — keep the conversation's
+            // ack state; just force a re-probe on the next turn.
+            clearIncrementalProbe(pending.base);
+            logHostEvent("warn", "[native-client]", `[opencode] incremental turns unavailable (503) — conversation ${pending.sid} state preserved, re-probing next turn (#3369)`);
+        }
+    } catch {
+        // observability only
+    }
+}
+
+state.onResponse = opencodeIncrementalOnResponse;

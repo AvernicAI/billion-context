@@ -170,6 +170,13 @@ async function startHarness(script: ChatRelayScript, marker: boolean): Promise<H
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);

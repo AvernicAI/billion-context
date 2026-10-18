@@ -114,7 +114,14 @@ test("e2e #150: guardian subagent request bypasses the main session's compressio
         log: false,
         debug: false,
         passthrough: false,
+        passthroughSource: null,
         autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
@@ -181,7 +188,7 @@ test("e2e #150: guardian subagent request bypasses the main session's compressio
         assert.ok(!bodies[2].includes("FILLER"), "guardian request does not inherit the main conversation's history");
         assert.ok(!bodies[3].includes(AUTH_SENTENCE), "guardian content does not leak into the main namespace");
 
-        const stats = await (await fetch(`http://127.0.0.1:${proxyPort}/__bili/stats`)).json();
+        const stats = await (await fetch(`http://127.0.0.1:${proxyPort}/__bili/stats`)).json() as { sessions: Array<{ id: string; label?: string }> };
         assert.equal(stats.sessions.length, 2, "main and subagent land in separate compression namespaces");
         assert.ok(stats.sessions.every((s: { label?: string }) => s.label === SESSION_ID), "both namespaces share the client session label");
         assert.notEqual(stats.sessions[0].id, stats.sessions[1].id);

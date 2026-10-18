@@ -11,7 +11,8 @@ import { once } from "node:events";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
@@ -167,7 +168,7 @@ describe("reportRuntimeInfoOnChange (#955)", () => {
 
     beforeEach(() => {
         posts.length = 0;
-        globalThis.fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+        globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
             posts.push({ url: String(_url), body: JSON.parse(String(init?.body)) });
             return new Response(JSON.stringify({ ok: true }), { status: 200 });
         }) as typeof fetch;
@@ -197,7 +198,7 @@ describe("reportRuntimeInfoOnChange (#955)", () => {
         globalThis.fetch = (async () => new Response("err", { status: 500 })) as typeof fetch;
         reportRuntimeInfoOnChange("http://proxy", { agent: "pi", model: "m1" });
         await new Promise((r) => setTimeout(r, 10));
-        globalThis.fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+        globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
             posts.push({ url: String(_url), body: JSON.parse(String(init?.body)) });
             return new Response(JSON.stringify({ ok: true }), { status: 200 });
         }) as typeof fetch;
@@ -272,7 +273,7 @@ async function startHarness(): Promise<Harness> {
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -295,11 +296,13 @@ async function startHarness(): Promise<Harness> {
     await once(proxy, "listening");
 
     return {
-        proxyPort: proxy.address().port,
+        proxyPort: (proxy.address() as { port: number }).port,
         upstreamPort,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             upstream.close();
+            upstream.closeIdleConnections?.();
             await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
             if (prevStateHome === undefined) delete process.env.XDG_STATE_HOME;
             else process.env.XDG_STATE_HOME = prevStateHome;
@@ -418,7 +421,7 @@ describe("runtime-info in the native-window chain (#955, e2e)", () => {
                 body: JSON.stringify({ model, stream: false, prompt_cache_key: sid, messages: [{ role: "user", content: "hello" }] }),
             });
             assert.equal(resp.status, 200);
-            return (await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/status?conversationId=${sid}`)).json() as { windowSource: string | null; contextLimit: number | null };
+            return (await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/status?conversationId=${sid}`)).json() as Promise<{ windowSource: string | null; contextLimit: number | null }>;
         };
 
         await postReport("astra", 262144, 32768, "sid-a");

@@ -6,7 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { defaultConfig } from "acp-kernel";
-import { startServer, type ProxyOptions } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
@@ -89,6 +90,13 @@ function proxyBaseOptions(upstreamPort: number, window: number): ProxyOptions {
         modelContextLimit: window,
         kernelConfig: defaultConfig(window),
         compress: { injectTool: true, injectNudge: true },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -133,13 +141,13 @@ test("e2e #987/#1195 T1: a stated-window overflow arms the one-shot shrink, lear
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer(proxyBaseOptions(upstreamPort, 400_000));
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
@@ -177,8 +185,10 @@ test("e2e #987/#1195 T1: a stated-window overflow arms the one-shot shrink, lear
         assert.equal(s2?.metadata.confirmedContextLimits, undefined, "still nothing learned after recovery");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -214,13 +224,13 @@ test("e2e #987 T2: an overflow WITHOUT a window number arms at the declared wind
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer(proxyBaseOptions(upstreamPort, 400_000));
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
@@ -234,7 +244,11 @@ test("e2e #987 T2: an overflow WITHOUT a window number arms at the declared wind
         assert.ok(s, "session exists");
         assert.equal(s!.metadata.confirmedContextLimits, undefined, "nothing learned");
         assert.ok(s!.stats.lastInputTokens > 10_000 && s!.stats.lastInputTokens < 400_000, `armed at the payload's own size (~16k, not the 400k declaration): ${s!.stats.lastInputTokens}`);
-        assert.equal(s!.stats.lastInputTokensSource, "usage", "a rejection the upstream itself issued is usage-grade");
+        // #1839 ask 3: an arm is NOT a billing report — it carries its own
+        // provenance grade "overflow-arm" (still rescue-grade: effectiveTokenCount's
+        // fast path, the #496 evidence gate and the preflight floors accept it;
+        // billing-grade consumers keep excluding it).
+        assert.equal(s!.stats.lastInputTokensSource, "overflow-arm", "the arm carries its own provenance grade, never billing-grade \"usage\"");
 
         // r2: forwarded as-is (no arm, nothing learned) — the pass-through
         // shape the old #969 test asserted is unchanged.
@@ -244,8 +258,10 @@ test("e2e #987 T2: an overflow WITHOUT a window number arms at the declared wind
         assert.equal(summaryCalls, 0, "no fold");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });
@@ -284,7 +300,7 @@ test("e2e #987 T3: with a CORRECT declared window, an oversized turn still recov
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as { port: number }).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -292,7 +308,7 @@ test("e2e #987 T3: with a CORRECT declared window, an oversized turn still recov
     // through the declared window + the one-shot arm. No learning required.
     const proxy = await startServer(proxyBaseOptions(upstreamPort, 8192));
     await once(proxy, "listening");
-    const proxyPort = proxy.address().port;
+    const proxyPort = (proxy.address() as { port: number }).port;
 
     try {
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
@@ -321,8 +337,10 @@ test("e2e #987 T3: with a CORRECT declared window, an oversized turn still recov
         assert.ok(lastForward.includes(SUMMARY_TEXT), "the forwarded body carries the fold summary");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
     }
 });

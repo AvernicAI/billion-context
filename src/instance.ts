@@ -165,6 +165,28 @@ export function findSameLanePredecessor(
     return undefined;
 }
 
+/** #3044 follow-up: a live holder on the same lane running OUR build — a
+ *  twin, not a predecessor. Nothing is draining (it is healthy and serving),
+ *  so waiting cannot help; laddering +1 strands the newcomer as an orphan
+ *  nobody routes to while the twin keeps serving (the second trigger path of
+ *  #3044: a host respawn racing a live instance). The newcomer must exit
+ *  loudly instead — the duplicate loses, the serving instance wins. Missing
+ *  fingerprints never match: an unknown build is not our twin. */
+export function findSameLaneTwin(
+    entries: RegistryEntry[],
+    port: number,
+    lane: string | undefined,
+    ownFingerprint: string | undefined,
+): RegistryEntry | undefined {
+    if (!lane || !ownFingerprint) return undefined;
+    for (const e of entries) {
+        if (e.port !== port || e.lane !== lane) continue;
+        if (!isPidAlive(e.pid)) continue;
+        if (e.codeFingerprint === ownFingerprint) return e;
+    }
+    return undefined;
+}
+
 /** #1225: content identity of a bili entry script (sha256 of its bytes).
  *  The spawned child records this for ITS script; an attaching launcher
  *  compares it against the hash of the script it would spawn — so "same
@@ -493,19 +515,48 @@ function lanesOverlap(a: string | undefined, b: string | undefined): boolean {
     return a === undefined || b === undefined || a === b;
 }
 
-export function registerInstanceAndWarn(entry: RegistryEntry, warn: (msg: string) => void): void {
-    const others = readAllRegistryEntries().filter((e) => e.instanceId !== entry.instanceId && isPidAlive(e.pid));
-    for (const other of others) {
-        if (!lanesOverlap(entry.lane, other.lane)) continue;
+/** Live registered peers whose lanes overlap ours (undeclared lane overlaps
+ *  everything — a manual `bili start` daemon can serve any client). */
+function liveOverlappingPeers(ownInstanceId: string, ownLane: string | undefined): RegistryEntry[] {
+    return readAllRegistryEntries().filter((e) => e.instanceId !== ownInstanceId && isPidAlive(e.pid) && lanesOverlap(ownLane, e.lane));
+}
+
+export function registerInstanceAndWarn(entry: RegistryEntry, warn: (msg: string) => void): string[] {
+    const warned: string[] = [];
+    for (const other of liveOverlappingPeers(entry.instanceId, entry.lane)) {
         const laneNote = entry.lane !== undefined && other.lane !== undefined ? ` on lane "${entry.lane}"` : "";
         warn(
             `another bili instance is running (pid ${other.pid}, ${other.origin})${laneNote} — both processes will write the same sessions directory; stop one to avoid state pollution (#394)`,
         );
+        warned.push(other.instanceId);
     }
     reapDeadMarkers(entry.instanceId);
     try {
         atomicWriteJson(entry, registryEntryFile(entry.instanceId));
     } catch {}
+    return warned;
+}
+
+/** #2401: registration warns only the LATE starter — the long-lived resident
+ *  stays blind to a peer that appears minutes later, which is exactly the
+ *  dual-generation coexistence shape behind the stale-serving report. Rescan
+ *  the registry on a slow tick and warn once per newly-seen live peer.
+ *  Returns the newly-warned instance ids so the caller can remember them. */
+export function warnOnNewPeers(
+    own: { instanceId: string; lane?: string },
+    previouslyWarned: ReadonlySet<string>,
+    warn: (msg: string) => void,
+): string[] {
+    const fresh: string[] = [];
+    for (const other of liveOverlappingPeers(own.instanceId, own.lane)) {
+        if (previouslyWarned.has(other.instanceId)) continue;
+        const laneNote = own.lane !== undefined && other.lane !== undefined ? ` on lane "${other.lane}"` : "";
+        warn(
+            `another bili instance appeared while this process was already running (pid ${other.pid}, ${other.origin})${laneNote} — both processes write the same sessions directory; stop one to avoid state pollution (#394/#2401)`,
+        );
+        fresh.push(other.instanceId);
+    }
+    return fresh;
 }
 
 /** #1232: every LIVE registered instance as a full identity record. The

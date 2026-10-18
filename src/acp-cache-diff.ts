@@ -7,10 +7,10 @@ import path from "node:path";
 import { defaultLogFile } from "./paths.js";
 import { safeSessionId } from "./server/headers.js";
 
-export type PairCategory = "pure-append" | "mid-stream-rewrite" | "prefix-stable-miss";
+type PairCategory = "pure-append" | "mid-stream-rewrite" | "prefix-stable-miss";
 export type Attribution = "proxy" | "client" | "both" | "unknown";
 
-export interface DivergenceDetail {
+interface DivergenceDetail {
     offset: number;
     messageIndex: number | null;
     roleType: string | null;
@@ -18,7 +18,7 @@ export interface DivergenceDetail {
     after: string;
 }
 
-export interface UsagePair {
+interface UsagePair {
     inputA: number;
     cachedB: number;
     inputB: number;
@@ -26,7 +26,7 @@ export interface UsagePair {
     hitPctB: number | null;
 }
 
-export interface AppendInfo {
+interface AppendInfo {
     // strict: B's bytes start with A's bytes verbatim.
     // json-tail: every shared message element is byte-identical; the only
     //   divergence sits at/after the last shared element (array closer +
@@ -38,7 +38,7 @@ export interface AppendInfo {
     countB: number;
 }
 
-export interface PairReport {
+interface PairReport {
     index: number;
     tsA: number;
     tsB: number;
@@ -59,7 +59,7 @@ export interface PairReport {
     notes: string[];
 }
 
-export interface SessionReport {
+interface SessionReport {
     sid: string;
     requests: number;
     unpairedIncoming: number;
@@ -67,7 +67,7 @@ export interface SessionReport {
     pairs: PairReport[];
 }
 
-export interface DiffReport {
+interface DiffReport {
     dir: string;
     logSource: string | null;
     usageSamples: number;
@@ -96,7 +96,7 @@ const INC_NEW_RE = /^(\d+)-([a-zA-Z0-9._-]+)-INCOMING\.txt$/;
 const INC_LEGACY_RE = /^(\d+)-INCOMING\.txt$/;
 const REQ_RE = /^(\d+)-([a-zA-Z0-9._-]+)-REQ\.txt$/;
 
-export function collectDumps(root: string): DumpMeta[] {
+function collectDumps(root: string): DumpMeta[] {
     const dirs: string[] = [root];
     for (const sub of ["raw", "dumps"]) {
         const p = path.join(root, sub);
@@ -125,14 +125,23 @@ export function collectDumps(root: string): DumpMeta[] {
 function parseDumpFile(file: string): DumpContent | null {
     let buf: Buffer;
     try { buf = fs.readFileSync(file); } catch { return null; }
-    const sep = buf.indexOf("\n\n");
-    if (sep < 0) return null;
+    // #3331: the request-line + headers block can be terminated by \r\n\r\n as
+    // well as \n\n (dump files written on Windows / by CRLF-emitting clients);
+    // a bare \n\n probe misses the header block entirely on such files.
+    const lf = buf.indexOf("\n\n");
+    const crlf = buf.indexOf("\r\n\r\n");
+    let sep: number;
+    let sepLen: number;
+    if (crlf >= 0 && (lf < 0 || crlf < lf)) { sep = crlf; sepLen = 4; }
+    else if (lf >= 0) { sep = lf; sepLen = 2; }
+    else return null;
     const head = buf.subarray(0, sep).toString("utf8");
-    const body = buf.subarray(sep + 2);
+    const body = buf.subarray(sep + sepLen);
     const headers: Record<string, string> = {};
     const lines = head.split("\n");
     for (let i = 1; i < lines.length; i++) {
-        const line = lines[i]!;
+        let line = lines[i]!;
+        if (line.endsWith("\r")) line = line.slice(0, -1); // CRLF header lines
         if (!line.trim()) continue;
         const c = line.indexOf(": ");
         if (c > 0) headers[line.slice(0, c).toLowerCase()] = line.slice(c + 2);
@@ -280,7 +289,7 @@ function locateMessage(items: unknown[], spans: Array<[number, number]>, offset:
 // SHARED element to be byte-identical and the first divergence to sit at/after
 // the last shared element (glue-only gaps tolerated). Anything else is a
 // genuine mid-stream rewrite.
-export interface WireRel {
+interface WireRel {
     rel: "append" | "diverge";
     byteOffset: number;
     extra: number;
@@ -460,7 +469,7 @@ function classifyPair(index: number, tsA: number, tsB: number, aOut: DumpContent
     };
 }
 
-export interface DiffOptions {
+interface DiffOptions {
     logFile?: string;
     noLog?: boolean;
     session?: string;

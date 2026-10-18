@@ -9,7 +9,9 @@
  * replaced by a length hint.
  */
 
-export const PRIVATE_HOST = "<private-host>";
+import { createHash } from "node:crypto";
+
+const PRIVATE_HOST = "<private-host>";
 
 /** Well-known public LLM API host suffixes safe to log verbatim. Suffix
  *  matching covers subdomains (api.openai.com,
@@ -68,6 +70,25 @@ function hostMaskedOff(host: string): boolean {
 
 export function maskHostForLog(host: string): string {
     return hostMaskedOff(host) ? host : PRIVATE_HOST;
+}
+
+/** #2317: a distinguishable-but-non-reversible identifier for an upstream endpoint
+ *  (a full URL, origin, or bare host) in logs and client-facing diagnostics. Public
+ *  API hosts (or masking disabled) pass through verbatim; anything else becomes
+ *  `<host:<8-hex sha256 of host:port>>`. Unlike maskUrlForLog's `<private-host>`
+ *  placeholder — which collapses EVERY private relay to one string and so cannot say
+ *  WHICH relay missed a route — this keeps several self-hosted relays tellable apart
+ *  without leaking the domain (#255/#897 keep domains out of paste-able logs; see also
+ *  the #2131 credential-fingerprint precedent). The PORT is part of the fingerprint so
+ *  two lanes on one host with different ports stay distinct too. */
+export function hostIdForLog(endpoint: string): string {
+    let ident: string;
+    try { ident = new URL(endpoint).host; } catch { ident = endpoint; }
+    ident = ident.toLowerCase();
+    if (!ident) return "<no-host>";
+    const hostname = ident.startsWith("[") ? ident.slice(1, ident.indexOf("]")) : ident.split(":")[0];
+    if (hostMaskedOff(hostname)) return ident;
+    return `<host:${createHash("sha256").update(ident).digest("hex").slice(0, 8)}>`;
 }
 
 /** Mask a URL for logging: non-public host → placeholder; userinfo, query and
@@ -188,6 +209,7 @@ export function redactSecretsInText(text: string): string {
     return text
         .replace(/\b(bearer|basic)\s+([A-Za-z0-9._~+\/=-]{8,})/gi, (_m, scheme: string, tok: string) => `${scheme} <masked ${tok.length} chars>`)
         .replace(/(?<![A-Za-z0-9])(?:sk|xai)-[A-Za-z0-9_-]{8,}/g, "<masked key>")
+        .replace(/(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{20,}/g, "<masked key>")
         .replace(/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}/g, "<masked jwt>")
         .replace(/(\b(?:api[_-]?key|access[_-]?token|auth(?:orization)?|secret|passwd|password|token)\b\s*[:=]\s*)(["']?)([A-Za-z0-9._~+\/=-]{8,})\2/gi, (_m, pre: string, q: string, val: string) => `${pre}${q}<masked ${val.length} chars>${q}`);
 }

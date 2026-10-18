@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { dumpRejectedBody } from "../src/error-dump.js";
+import { dumpRejectedBody, dumpSummaryRejection } from "../src/error-dump.js";
 import { setLogCapture } from "../src/logger.js";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -109,6 +109,70 @@ test("on: Buffer bodies work and session ids are sanitized", () => {
         const out = dumpRejectedBody(400, "a/b c", Buffer.from('{"a":1}', "utf8"));
         assert.ok(out);
         assert.match(path.basename(out!), /^err-\d+-a_b_c-400\.json$/);
+    } finally {
+        restoreDumpEnv();
+    }
+});
+
+function summaryErrFiles(): string[] {
+    return fs.readdirSync(dir).filter((f) => f.startsWith("summary-err-"));
+}
+
+// #1993: the preflight summary exchange is built independently of the forwarded
+// wire body, so it needs its own dump call site carrying BOTH sides.
+
+test("#1993 summary dump off by default: no file written", () => {
+    delete process.env.BILI_DUMP_4XX;
+    try {
+        assert.equal(dumpSummaryRejection(400, "s1", '{"instructions":"i"}', '{"error":"e"}'), null);
+        assert.deepEqual(summaryErrFiles(), []);
+    } finally {
+        restoreDumpEnv();
+    }
+});
+
+test("#1993 summary dump on: envelope carries status plus both sides as strings", () => {
+    process.env.BILI_DUMP_4XX = "1";
+    try {
+        const out = dumpSummaryRejection(400, "s1", '{"instructions":"compress it","model":"gpt"}', '{"error":{"message":"too large"}}');
+        assert.ok(out && out.startsWith(dir));
+        const files = summaryErrFiles();
+        assert.equal(files.length, 1);
+        assert.match(files[0]!, /^summary-err-\d+-s1-400\.json$/);
+        const parsed = JSON.parse(fs.readFileSync(out!, "utf8")) as { status: number; request: unknown; response: unknown };
+        assert.equal(parsed.status, 400);
+        assert.equal(typeof parsed.request, "string");
+        assert.equal(typeof parsed.response, "string");
+        assert.deepEqual(JSON.parse(parsed.request as string), { instructions: "compress it", model: "gpt" });
+        assert.deepEqual(JSON.parse(parsed.response as string), { error: { message: "too large" } });
+    } finally {
+        restoreDumpEnv();
+    }
+});
+
+test("#1993 summary dump on: non-JSON sides stay raw, oversized side is capped", () => {
+    process.env.BILI_DUMP_4XX = "1";
+    process.env.BILI_DUMP_4XX_MAX_BYTES = "2048";
+    try {
+        const out = dumpSummaryRejection(413, "s1", "<html>req</html>", "x".repeat(5000));
+        assert.ok(out);
+        const text = fs.readFileSync(out!, "utf8");
+        assert.match(text, /\[truncated: \d+ more character\(s\)\]/);
+        assert.ok(text.length < 2048 * 3 + 512, `capped file should be far smaller than raw (${text.length})`);
+        const parsed = JSON.parse(text) as { request: unknown; response: unknown };
+        assert.equal(parsed.request, "<html>req</html>");
+        assert.ok(typeof parsed.response === "string" && (parsed.response as string).includes("[truncated:"));
+    } finally {
+        restoreDumpEnv();
+    }
+});
+
+test("#1993 summary dump on: empty exchange is skipped", () => {
+    process.env.BILI_DUMP_4XX = "1";
+    const before = summaryErrFiles().length;
+    try {
+        assert.equal(dumpSummaryRejection(400, "s1", "", ""), null);
+        assert.equal(summaryErrFiles().length, before);
     } finally {
         restoreDumpEnv();
     }

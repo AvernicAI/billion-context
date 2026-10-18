@@ -31,7 +31,7 @@ function makeSession(id: string): Session {
     return {
         id,
         meta: {},
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0, compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -39,6 +39,7 @@ function makeSession(id: string): Session {
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
+        pendingRetrievals: [],
     };
 }
 
@@ -464,10 +465,12 @@ test("SessionStore routes write failures through the EPERM detector (no false al
         store.scheduleSave(makeSession("wire-1"));
         // acp-kernel 0.0.53 retries the whole write cycle on transient
         // ENOTDIR (~1.5s ladder) before the failure line is logged — poll
-        // with headroom instead of a fixed settle().
+        // with headroom instead of a fixed settle(). The ladder stretches past
+        // its nominal duration on loaded machines (observed >5s), so the
+        // window leaves wide margin rather than racing the retry schedule.
         await waitFor(
             () => captured.find((c) => c.level === "error" && c.msg.startsWith("[persist] write failed for ")) ?? null,
-            5000,
+            15000,
             "kernel write-failure line to reach the wrapped log",
         );
         const failLines = captured.filter((c) => c.level === "error" && c.msg.startsWith("[persist] write failed for "));

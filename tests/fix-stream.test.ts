@@ -22,7 +22,7 @@ function makeCtx(): {
         session: {
             id: "fix-stream-test",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -30,6 +30,7 @@ function makeCtx(): {
             blockContents: new Map(),
             inFlight: 0,
             persisted: false,
+            pendingRetrievals: [],
         },
         log: () => {},
     };
@@ -82,7 +83,7 @@ test("client-abort: pre-aborted signal suppresses upstream re-request fetch", as
     ac.abort();
     let fetchCalls = 0;
     const orig = globalThis.fetch;
-    globalThis.fetch = (() => { fetchCalls++; return new Response(mutatingRound(), { status: 200 }); }) as typeof fetch;
+    globalThis.fetch = (() => { fetchCalls++; return new Response(mutatingRound(), { status: 200 }); }) as unknown as typeof fetch;
     try {
         const out = await drainSig(new Response(mutatingRound(), { status: 200 }).body!, makeCtx(), ac.signal);
         assert.equal(fetchCalls, 0, "no re-request fetch when signal is pre-aborted");
@@ -100,7 +101,7 @@ test("client-abort: signal aborted during a re-request stops further re-requests
         fetchCalls++;
         ac.abort();
         return new Response(mutatingRound(), { status: 200 });
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
     try {
         await drainSig(new Response(mutatingRound(), { status: 200 }).body!, makeCtx(), ac.signal);
         assert.equal(fetchCalls, 1, "exactly one re-request fetch; subsequent rounds were skipped after abort");
@@ -123,7 +124,7 @@ test("client-abort control: without a signal, mutating rounds keep re-requesting
             COMPLETED,
         ].join("");
         return new Response(round, { status: 200 });
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
     try {
         await drainSig(new Response(mutatingRound(), { status: 200 }).body!, makeCtx(), undefined);
         assert.ok(fetchCalls > 1, `control path re-requested multiple times (fetchCalls=${fetchCalls}); abort is what stops it`);
@@ -192,7 +193,7 @@ function roundWithUsage(cached: number | undefined): string {
 test("recordUsage: cacheSamples only increments when cachedTokens is a number", async () => {
     const ctxNoCache = makeCtx();
     const orig = globalThis.fetch;
-    globalThis.fetch = (() => new Response(roundWithUsage(42), { status: 200 })) as typeof fetch;
+    globalThis.fetch = (() => new Response(roundWithUsage(42), { status: 200 })) as unknown as typeof fetch;
     try {
         await drainSig(new Response(roundWithUsage(undefined), { status: 200 }).body!, ctxNoCache, undefined);
     } finally {

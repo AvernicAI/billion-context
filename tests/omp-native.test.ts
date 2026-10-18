@@ -4,10 +4,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import factory, { shouldBootstrapNativeOmp } from "../src/agent/omp-native.ts";
-import { nativeProxyScriptPath } from "../src/agent/native-bootstrap.ts";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import factory, { ompTrafficRidesBili, shouldBootstrapNativeOmp, planNativeOmp, armNativeOmp, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest } from "../src/agent/omp-native.ts";
+import { applyOmpFirstEventTimeout, nativeProxyScriptPath, ompFirstEventTimeoutValue, OMP_FIRST_EVENT_TIMEOUT_DEFAULT_MS, OMP_FIRST_EVENT_TIMEOUT_ENV } from "../src/agent/native-bootstrap.ts";
 import { pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot, ompPluginLoadedFrom } from "../src/plugin-install.ts";
 import { rmrf } from "./tmp-rm.ts";
+
+// #1135 wiring tests drive verifyAttachAndRecover against a dead target — cap
+// the routed-evidence grace so the probe fails fast instead of paying the 5s default.
+process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
 
 // #957 coexistence: markNativeHost must be set synchronously during module
 // evaluation so any in-process bili extension backs off in THIS process.
@@ -29,6 +35,34 @@ test("shouldBootstrapNativeOmp: false when a bili launch already owns a proxy", 
     assert.equal(shouldBootstrapNativeOmp({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485" }), false);
     assert.equal(shouldBootstrapNativeOmp({ BILLION_CONTEXT_PROXY: "  " }), true);
     assert.equal(shouldBootstrapNativeOmp({ BILI_PROVIDER_REWRITES: '{"vllm":"http://127.0.0.1:1/bili/http://x"}' }), false);
+});
+
+test("ompTrafficRidesBili: true for self-bootstrap, launcher proxy, /bili/ rewrites", () => {
+    assert.equal(ompTrafficRidesBili({}), true, "bare host: gate passes, self-bootstrap will own the proxy");
+    assert.equal(ompTrafficRidesBili({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:8787" }), true, "launcher/MITM launch");
+    assert.equal(ompTrafficRidesBili({ BILI_PROVIDER_REWRITES: '{"vllm":"http://127.0.0.1:1/bili/http://x"}' }), true, "/bili/-rewrite launch");
+    assert.equal(ompTrafficRidesBili({ BILI_NATIVE_OMP: "0", BILLION_CONTEXT_PROXY: "  " }), false, "opted out + blank proxy — traffic goes direct");
+    assert.equal(ompTrafficRidesBili({ BILI_NATIVE_OMP: "0" }), false, "opted out — traffic goes direct");
+    assert.equal(ompTrafficRidesBili({ BILI_NATIVE_OMP: "0", BILLION_CONTEXT_PROXY: "http://127.0.0.1:8787" }), true, "launcher wins over the native opt-out");
+});
+
+test("#1774 first-event timeout value: default when unset, user-pinned values (incl. 0) win", () => {
+    assert.equal(OMP_FIRST_EVENT_TIMEOUT_DEFAULT_MS, 1_800_000);
+    assert.equal(ompFirstEventTimeoutValue({}), "1800000");
+    assert.equal(ompFirstEventTimeoutValue({ [OMP_FIRST_EVENT_TIMEOUT_ENV]: "60000" }), undefined);
+    assert.equal(ompFirstEventTimeoutValue({ [OMP_FIRST_EVENT_TIMEOUT_ENV]: "0" }), undefined, "explicit disable sentinel respected");
+    assert.equal(ompFirstEventTimeoutValue({ [OMP_FIRST_EVENT_TIMEOUT_ENV]: "   " }), "1800000", "blank counts as unset");
+});
+
+test("#1774 applyOmpFirstEventTimeout: stamps only when unpinned, idempotent on stamped env", () => {
+    const clean: NodeJS.ProcessEnv = {};
+    applyOmpFirstEventTimeout(clean);
+    assert.equal(clean[OMP_FIRST_EVENT_TIMEOUT_ENV], "1800000");
+    applyOmpFirstEventTimeout(clean);
+    assert.equal(clean[OMP_FIRST_EVENT_TIMEOUT_ENV], "1800000");
+    const pinned: NodeJS.ProcessEnv = { [OMP_FIRST_EVENT_TIMEOUT_ENV]: "45000" };
+    applyOmpFirstEventTimeout(pinned);
+    assert.equal(pinned[OMP_FIRST_EVENT_TIMEOUT_ENV], "45000");
 });
 
 test("nativeProxyScriptPath: dist/agent/omp-native.js resolves to the package bin", () => {
@@ -146,3 +180,96 @@ test("ompPluginLoadedFrom: launcher skips -e only for a loadable entry (either f
     fs.writeFileSync(file, `extensions:\n  - ${NATIVE_ENTRY}\n`);
     if (fs.existsSync(NATIVE_ENTRY)) assert.equal(ompPluginLoadedFrom(home), true, "loadable native entry counts");
 }));
+
+// —— #1795: preset BILLION_CONTEXT_PROXY is an attach target, never a stand-down ——
+
+test("planNativeOmp: default is spawn; opt-out and /bili/ launches are off", () => {
+    assert.deepEqual(planNativeOmp({}), { mode: "spawn" });
+    assert.deepEqual(planNativeOmp({ BILLION_CONTEXT_PLUGIN: "0" }), { mode: "off" });
+    assert.deepEqual(planNativeOmp({ BILI_NATIVE_OMP: "0" }), { mode: "off" });
+    assert.deepEqual(planNativeOmp({ BILI_PROVIDER_REWRITES: '{"vllm":"http://127.0.0.1:1/bili/http://x"}' }), { mode: "off" });
+});
+
+test("planNativeOmp: a preset BILLION_CONTEXT_PROXY is an attach target, not a stand-down", () => {
+    // #1795 regression: the pseudo-attach hole used to resolve a preset proxy
+    // to "off" (gate closed), disarming the fetch intercept entirely so every
+    // model request went direct and uncompressed.
+    assert.deepEqual(
+        planNativeOmp({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485" }),
+        { mode: "attach", attachOrigin: "http://127.0.0.1:36485" },
+    );
+    assert.deepEqual(
+        planNativeOmp({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485/" }),
+        { mode: "attach", attachOrigin: "http://127.0.0.1:36485" },
+    );
+    // kill switches and a /bili/ launch still win over the preset
+    assert.deepEqual(planNativeOmp({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILLION_CONTEXT_PLUGIN: "0" }), { mode: "off" });
+    assert.deepEqual(planNativeOmp({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILI_PROVIDER_REWRITES: "{}" }), { mode: "off" });
+    // a garbage / blank preset falls back to spawn (self-managed), never dead-off
+    assert.deepEqual(planNativeOmp({ BILLION_CONTEXT_PROXY: "garbage" }), { mode: "spawn" });
+    assert.deepEqual(planNativeOmp({ BILLION_CONTEXT_PROXY: "  " }), { mode: "spawn" });
+});
+
+test("planNativeOmp: explicit BILLION_CONTEXT_ATTACH wins over the env preset", () => {
+    assert.deepEqual(
+        planNativeOmp({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILLION_CONTEXT_ATTACH: "http://10.0.0.5:9000" }),
+        { mode: "attach", attachOrigin: "http://10.0.0.5:9000" },
+    );
+});
+
+test("#1135 wiring: a dead attach target falls back to a spawned proxy", async () => {
+    const savedProxy = process.env.BILLION_CONTEXT_PROXY;
+    try {
+        _resetNativeStateForTest();
+        let spawned = 0;
+        _setSpawnForTest(async () => {
+            spawned++;
+            return "http://127.0.0.1:7777";
+        });
+        armNativeOmp({ mode: "attach", attachOrigin: "http://127.0.0.1:9" });
+        assert.equal(typeof _stateRespawnForTest(), "function", "respawn seam armed at load");
+        // port 9 refuses connections instantly — the manifest probe fails fast,
+        // the fallback spawn lands and replaces the env origin
+        const landed = await _stateRespawnForTest()!();
+        assert.equal(landed, "http://127.0.0.1:7777");
+        assert.ok(spawned >= 1);
+        assert.equal(process.env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:7777");
+    } finally {
+        if (savedProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
+        else process.env.BILLION_CONTEXT_PROXY = savedProxy;
+        _resetNativeStateForTest();
+    }
+});
+
+test("#1135 wiring: a healthy attach target stays attached (no migration, no spawn)", async () => {
+    const savedProxy = process.env.BILLION_CONTEXT_PROXY;
+    const server = createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({ version: "0.1.175", tools: [] }));
+            return;
+        }
+        res.statusCode = 404;
+        res.end();
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const port = (server.address() as AddressInfo).port;
+    try {
+        _resetNativeStateForTest();
+        let spawned = 0;
+        _setSpawnForTest(async () => {
+            spawned++;
+            return "http://127.0.0.1:7778";
+        });
+        armNativeOmp({ mode: "attach", attachOrigin: `http://127.0.0.1:${port}` });
+        const landed = await _stateRespawnForTest()!();
+        assert.equal(landed, `http://127.0.0.1:${port}`, "healthy target resolves to itself");
+        assert.equal(spawned, 0, "no fallback spawn for a healthy target");
+        assert.equal(process.env.BILLION_CONTEXT_PROXY, `http://127.0.0.1:${port}`);
+    } finally {
+        server.close();
+        if (savedProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
+        else process.env.BILLION_CONTEXT_PROXY = savedProxy;
+        _resetNativeStateForTest();
+    }
+});

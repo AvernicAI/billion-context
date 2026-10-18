@@ -132,6 +132,7 @@ test("adapter: duplicate tool names replay raw lines without cross-wiring", asyn
     const events: Array<Record<string, unknown>> = [];
     for await (const ev of adapter.parseStream(
         new ReadableStream<Uint8Array>({ start(c) { for (const l of lines) c.enqueue(enc.encode(l + "\n")); c.close(); } }),
+        0,
     )) {
         events.push(ev as Record<string, unknown>);
     }

@@ -12,6 +12,7 @@
  *   bili start --passthrough      forward without compression
  *   bili pi/codex/claude/omp [args]   start a proxy + launch a client via cert-MITM
  *   bili export [id] [--full]     export a persisted session as a handoff doc
+ *                                  (--jsonl: deterministic JSONL dump #2671)
  *   bili acp-cache diff <dir>     attribute cache breaks from ACP_DUMP_BODY dumps
  *   bili test pi                  non-polluting pi smoke test
  *   bili --version
@@ -22,20 +23,23 @@
  * — flags are just convenient overrides).
  */
 import { loadOptions, ensureConfigTemplate } from "./config.js";
-import { startServer } from "./server.js";
+import { startServer, restartForceCloseOf } from "./server.js";
+import { ensureSqliteEngine } from "./storage/engine-bootstrap.js";
+import { recordEngineBootstrap } from "./storage/runtime-status.js";
 import { configFile as defaultConfigFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createAutoRestartHandler } from "./restart.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
-import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring } from "./advisory.js";
+import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion } from "./advisory.js";
+import { startReleaseNotesWatcher } from "./update-notes.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
-import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, type PluginAgent } from "./plugin-install.js";
+import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
-import { renderDoctorReport, runDoctor } from "./doctor.js";
-import { VERSION, PACKAGE_NAME } from "./version.js";
+import { fixDshLedgers, renderDoctorReport, renderLedgerFixReport, runDoctor } from "./doctor.js";
+import { VERSION, PACKAGE_NAME, BUILD_COMMIT } from "./version.js";
 
 const HELP = `bili ${VERSION} — billion-context proxy
 
@@ -57,14 +61,19 @@ Usage:
   bili gemini [opts --] [args]     start a proxy + launch Gemini CLI against it (GOOGLE_GEMINI_BASE_URL /bili/ rewrite)
   bili iflow [opts --] [args]      start a proxy + launch iFlow CLI against it (IFLOW_BASE_URL /bili/ rewrite)
   bili qwen [opts --] [args]       start a proxy + launch Qwen Code against it (cert-MITM)
+  bili antigravity [opts --] [args] start a proxy + launch Antigravity CLI (agy) against it (CLOUD_CODE_URL /bili/ rewrite)
   bili mcode [opts --] [args]      start a proxy + launch MiniMax Code against it (cert-MITM)
   bili aider [opts --] [args]      start a proxy + launch aider against it (cert-MITM)
   bili copilot [opts --] [args]    start a proxy + launch Copilot CLI against it (cert-MITM)
   bili amp [opts --] [args]        start a proxy + launch Amp against it (cert-MITM)
+  bili crush [opts --] [args]      start a proxy + launch Crush against it (cert-MITM)
+  bili zed [opts --] [args]        start a proxy + launch the Zed editor against it (cert-MITM)
   bili goose [opts --] [args]      start a proxy + launch Goose against it (base-URL redirect)
   bili test pi                     non-polluting pi smoke test through the proxy
   bili export [session] [--full]   list sessions / export one as a Markdown handoff
-                                    (--full includes original messages; --output FILE)
+                                    (--full includes original messages; --output FILE;
+                                    --jsonl renders a deterministic JSONL dump from the
+                                    unified tables, falling back to the legacy tail)
   bili acp-cache diff <dir>        offline prefix-diff attribution over ACP_DUMP_BODY
                                    dumps: pairs adjacent requests per session and classifies
                                    each (pure-append / mid-stream-rewrite / prefix-stable-miss);
@@ -73,7 +82,10 @@ Usage:
   bili update                      check for & install a newer version now
   bili doctor                      audit every install lane: versions, owners,
                                     freshness vs registry, running proxy processes
-                                    (read-only; --json for machine-readable output)
+                                    (read-only; --json for machine-readable output);
+                                    --fix converges drifted dsh-profile ledgers
+                                    (manifest/lockfile/copy) to the on-disk copy
+                                    and prints every change it makes
   bili plugin install <agent>      install the thin plugin into a host (pi/omp/
                                     claude/codex/opencode/dsh/kimi; original backed up once)
                                     --with-mcp (opencode only) also adds the mcp.bili
@@ -84,19 +96,19 @@ Usage:
                                     global install, dsh bundles refresh through
                                     dsh's channel, host-owned copies are pointed
                                     at their host's updater — never overwritten
-  bili plugin list                 show install status for every host
+  bili plugin list                 show install status + installed (on-disk) version for every host
   bili mcp                         run the bili MCP server standalone (stdio)
   bili plugin-register <id>        pre-bind a conversation to the plugin mode
                                     (--origin URL, --agent name)
   bili --version                   print version
   bili --help                      show this help
 
-Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae / bili jcode / bili kimi / bili gemini / bili iflow / bili qwen / bili mcode / bili aider / bili copilot / bili amp / bili goose):
+Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh / bili codebuddy / bili qoder / bili trae / bili jcode / bili kimi / bili gemini / bili iflow / bili qwen / bili antigravity / bili mcode / bili aider / bili copilot / bili amp / bili crush / bili zed / bili goose):
   Brings up a proxy on an independent port (a fresh instance every launch), then runs the client pointed at it via HTTPS_PROXY + the proxy's
   MITM CA — no config-file edits. Discovered HTTPS upstream domains are
   auto-whitelisted for MITM so the proxy TLS-terminates exactly the hosts the
   client uses; HTTP / localhost providers go direct. pi/claude/qoder trust the CA
-  via NODE_EXTRA_CA_CERTS, codex/trae/jcode/aider/copilot/amp via SSL_CERT_FILE
+  via NODE_EXTRA_CA_CERTS, codex/trae/jcode/aider/copilot/amp/crush/zed via SSL_CERT_FILE
   (aider also REQUESTS_CA_BUNDLE). Goose trusts neither (rustls), so it is redirected per-endpoint instead. Proxy killed on client exit.
   bili flags (-F, --mitm-domain, --port, ...) must precede the client name;
   everything after the client name is passed through to the client.
@@ -116,10 +128,13 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili gemini                           # launch Gemini CLI through the proxy (GOOGLE_GEMINI_BASE_URL /bili/ rewrite; API-key & gateway auth)
     bili iflow                            # launch iFlow CLI through the proxy (IFLOW_BASE_URL /bili/ rewrite of apis.iflow.cn/v1)
     bili qwen                             # launch Qwen Code through the proxy (cert-MITM; DashScope/Qwen gateways whitelisted by default, custom relays via --mitm-domain)
+    bili antigravity                      # launch Antigravity CLI (agy) through the proxy (CLOUD_CODE_URL /bili/ rewrite of daily-cloudcode-pa.googleapis.com — real default upstream, #3129)
     bili mcode                            # launch MiniMax Code through the proxy (cert-MITM; provider hosts from ~/.minimax*/config.yaml or the official agent.minimax.* endpoints)
     bili aider                            # launch aider through the proxy (cert-MITM; endpoint from OPENAI_API_BASE/--openai-api-base/.aider.conf.yml or api.openai.com+api.anthropic.com by default)
     bili copilot                          # launch Copilot CLI through the proxy (cert-MITM; api.githubcopilot.com + plan subdomains whitelisted by default)
     bili amp                              # launch Amp through the proxy (cert-MITM; ampcode.com whitelisted by default)
+    bili crush                            # launch Crush through the proxy (cert-MITM; api.anthropic.com/api.openai.com/openrouter.ai + crush.json base_urls whitelisted)
+    bili zed                              # launch the Zed editor through the proxy (cert-MITM; built-in provider hosts + settings.json api_urls whitelisted; Linux TLS env)
     bili goose                            # launch Goose through the proxy (openai/anthropic legs via *_HOST envs, custom providers via a regenerated config overlay — real config untouched)
     bili test pi                          # quick end-to-end check of the pi path
     bili --mitm-domain api.foo.com pi     # add a domain to the MITM whitelist (flags precede the client)
@@ -154,6 +169,7 @@ type Parsed = {
     exportSelector?: string;
     exportOutput?: string;
     exportFull?: boolean;
+    exportJsonl?: boolean;
     registerConversationId?: string;
     pluginAction?: "install" | "remove" | "update" | "list";
     pluginAgent?: PluginAgent;
@@ -164,6 +180,7 @@ type Parsed = {
     acpCacheSession?: string;
     jsonOutput?: boolean;
     doctorJson?: boolean;
+    doctorFix?: boolean;
 };
 
 export function parseArgs(argv: string[]): Parsed {
@@ -177,6 +194,7 @@ export function parseArgs(argv: string[]): Parsed {
     let registerConversationId: string | undefined;
     let exportOutput: string | undefined;
     let exportFull = false;
+    let exportJsonl = false;
     let pluginAction: Parsed["pluginAction"];
     let pluginAgent: Parsed["pluginAgent"];
     let pluginWithMcp = false;
@@ -186,6 +204,7 @@ export function parseArgs(argv: string[]): Parsed {
     let acpCacheSession: string | undefined;
     let jsonOutput = false;
     let doctorJson = false;
+    let doctorFix = false;
 
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!;
@@ -234,6 +253,9 @@ export function parseArgs(argv: string[]): Parsed {
             case "--full":
                 exportFull = true;
                 break;
+            case "--jsonl":
+                exportJsonl = true;
+                break;
             case "--output": {
                 const val = argv[++i];
                 if (val === undefined) {
@@ -249,6 +271,9 @@ export function parseArgs(argv: string[]): Parsed {
             case "--json":
                 jsonOutput = true;
                 doctorJson = true;
+                break;
+            case "--fix":
+                doctorFix = true;
                 break;
             case "--no-log":
                 acpCacheNoLog = true;
@@ -376,17 +401,19 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson, doctorFix };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson, doctorFix } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
     }
     if (command === "version") {
-        process.stdout.write(VERSION + "\n");
+        // "0.1.187 (8f9faf9e)" — the commit identifies the exact build for
+        // locally-installed test trees whose semver matches a released version.
+        process.stdout.write(`${VERSION} (${BUILD_COMMIT})\n`);
         return;
     }
     if (command === "acp-cache") {
@@ -434,10 +461,7 @@ export async function main(): Promise<void> {
         // proxy-origin discovery file would silently win over the flag.
         if (overrides.BILI_MCP_PROXY !== undefined) process.env.BILI_MCP_PROXY = overrides.BILI_MCP_PROXY;
         if (pluginAction === "list") {
-            for (const row of pluginStatusAll()) {
-                const channel = row.status === "not installed" || row.status.startsWith("error") ? "" : ` | updates via ${row.channel}`;
-                console.log(`${row.agent.padEnd(10)} ${row.status}${channel}`);
-            }
+            process.stdout.write(renderPluginList(pluginStatusAll()));
             return;
         }
         if (pluginAction === "update") {
@@ -483,7 +507,10 @@ export async function main(): Promise<void> {
         }
         if (pluginAction === "remove") {
             try {
-                console.log(pluginRemove(pluginAgent!));
+                // #2155: best-effort note about still-open client windows.
+                const removed = pluginRemove(pluginAgent!);
+                const warn = await warnActivePluginSessions(pluginAgent!);
+                console.log(warn === "" ? removed : removed + "\n" + warn);
             } catch (error) {
                 console.error(`bili plugin: ${error instanceof Error ? error.message : String(error)}`);
                 process.exit(1);
@@ -493,7 +520,7 @@ export async function main(): Promise<void> {
     }
     if (command === "export") {
         try {
-            const text = await exportSession(exportSelector, { output: exportOutput, full: exportFull });
+            const text = await exportSession(exportSelector, { output: exportOutput, full: exportFull, jsonl: exportJsonl });
             process.stdout.write(text + "\n");
         } catch (error) {
             console.error(`bili export: ${error instanceof Error ? error.message : String(error)}`);
@@ -509,16 +536,28 @@ export async function main(): Promise<void> {
         }
         let updaterResolveProxy: ((url: string) => string | undefined) | undefined;
         let updateTag: string | undefined;
+        let advisoryUrl: string | undefined;
         try {
             const o = loadOptions();
             updaterResolveProxy = (url) => resolveProxy(o.routes, o.proxy, url, o.proxyFallback);
             updateTag = o.updateTag;
+            advisoryUrl = o.advisoryUrl;
         } catch {
             // config unloadable — registry egress goes direct
         }
         try {
-            const report = await runDoctor({ packageName: PACKAGE_NAME, runningVersion: VERSION, resolveProxy: updaterResolveProxy, updateTag });
-            process.stdout.write(doctorJson ? JSON.stringify(report, null, 2) + "\n" : renderDoctorReport(report));
+            const report = await runDoctor({ packageName: PACKAGE_NAME, runningVersion: VERSION, resolveProxy: updaterResolveProxy, updateTag, advisoryUrl });
+            if (doctorFix) {
+                // #3496: explicit repair pass — the read-only audit above stays
+                // read-only; --fix is the only thing that writes dsh-profile
+                // ledgers, and it prints every change it makes.
+                const fixes = fixDshLedgers();
+                report.ledgerFixes = fixes;
+                process.stdout.write(doctorJson ? JSON.stringify(report, null, 2) + "\n" : renderDoctorReport(report) + "\n" + renderLedgerFixReport(fixes));
+                if (fixes.some((f) => f.error !== undefined || f.residualFindings.length > 0)) process.exitCode = 1;
+            } else {
+                process.stdout.write(doctorJson ? JSON.stringify(report, null, 2) + "\n" : renderDoctorReport(report));
+            }
         } catch (error) {
             console.error(`bili doctor: ${error instanceof Error ? error.message : String(error)}`);
             process.exit(1);
@@ -573,6 +612,14 @@ export async function main(): Promise<void> {
     // than a bare error. No-op if it already exists.
     ensureConfigTemplate();
     const opts = loadOptions();
+    // #2833: SQLite engine self-bootstrap — bounded (~10s) and fail-safe; only
+    // fetches when unified storage is requested AND no builtin/host engine
+    // exists, so the common case costs nothing. Must complete before the first
+    // session store opens (the store resolves its engine at construction).
+    const bootstrapOutcome = await ensureSqliteEngine({
+        resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
+    });
+    recordEngineBootstrap(bootstrapOutcome);
     const server = await startServer(opts);
 
     // Start background auto-update after the server is listening so a slow
@@ -590,8 +637,12 @@ export async function main(): Promise<void> {
             // registry must not stall the normal self-update loop forever —
             // advisoryDeferring() goes false while lastError says "cannot resolve".
             advisoryActive: advisoryDeferring,
+            // #1588-A: even when no advisory is active against this machine,
+            // never install a candidate that falls inside a freshly parsed
+            // affected range (rollback-form advisories cover latest too).
+            advisoryBlocksVersion,
             onStaleInstall: createAutoRestartHandler({
-                enabled: opts.autoRestartOnUpdate,
+                enabled: opts.autoRestartOnUpdate ?? false,
                 packageName: PACKAGE_NAME,
                 server,
                 host: opts.host,
@@ -600,6 +651,7 @@ export async function main(): Promise<void> {
                     return addr && typeof addr === "object" ? addr.port : opts.port;
                 },
                 log: loggerLog,
+                destroyLingeringSockets: restartForceCloseOf(server),
             }),
         });
     }
@@ -612,7 +664,7 @@ export async function main(): Promise<void> {
             advisoryUrl: opts.advisoryUrl,
             resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
             onStaleInstall: createAutoRestartHandler({
-                enabled: opts.autoRestartOnUpdate,
+                enabled: opts.autoRestartOnUpdate ?? false,
                 packageName: PACKAGE_NAME,
                 server,
                 host: opts.host,
@@ -621,7 +673,20 @@ export async function main(): Promise<void> {
                     return addr && typeof addr === "object" ? addr.port : opts.port;
                 },
                 log: loggerLog,
+                destroyLingeringSockets: restartForceCloseOf(server),
             }),
+        });
+    }
+    // #1870 release-notes visibility (#1977 silent by default) — fetch +
+    // cache only (never installs, never restarts). Runs independently of
+    // autoUpdate for the same reason as the advisory watcher: installs with
+    // auto-update off still deserve to learn when a critical-tier fix exists.
+    if (opts.releaseNotesCheck) {
+        startReleaseNotesWatcher({
+            packageName: PACKAGE_NAME,
+            currentVersion: VERSION,
+            releaseNotesUrl: opts.releaseNotesUrl,
+            resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
         });
     }
 }

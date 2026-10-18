@@ -7,7 +7,7 @@ import { runCompressLoop, createOpenaiAdapter, createAnthropicAdapter, createRes
 import type { ParsedStreamEvent } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import { responsesToCore } from "acp-kernel/wire";
-import type { ResponsesRequestBody } from "acp-kernel/wire";
+import type { ResponsesRequestBody, AnthropicTextBlock } from "acp-kernel/wire";
 
 function makeCtx(id: string, messages: CoreMessage[] = []): {
     core: ReturnType<typeof createCore>;
@@ -25,7 +25,7 @@ function makeCtx(id: string, messages: CoreMessage[] = []): {
         session: {
             id,
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 , compressCreditTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -33,6 +33,7 @@ function makeCtx(id: string, messages: CoreMessage[] = []): {
             blockContents: new Map(),
             inFlight: 0,
             persisted: false,
+            pendingRetrievals: [],
         },
         log: () => {},
     };
@@ -731,7 +732,7 @@ test("F6: responses buildRequest preserves instructions + additional_tools prefi
 });
 
 test("F7: anthropic buildRequest preserves client system + cache_control + merges compress prompt (prefix-cache fix)", () => {
-    const clientSystem = [{ type: "text", text: "YOU_ARE_CLAUDE", cache_control: { type: "ephemeral" } }];
+    const clientSystem: AnthropicTextBlock[] = [{ type: "text", text: "YOU_ARE_CLAUDE", cache_control: { type: "ephemeral" } }];
     const systemPrompt = buildCompressSystemPrompt();
     const adapter = createAnthropicAdapter({ model: "claude" }, clientSystem);
     const rebuilt = adapter.buildRequest([], systemPrompt, { model: "claude", messages: [] }) as Record<string, unknown>;
@@ -744,6 +745,24 @@ test("F7: anthropic buildRequest preserves client system + cache_control + merge
     assert.ok(text.includes(systemPrompt), "compress prompt merged into system");
     const hasCc = Array.isArray(system) && (system as Array<Record<string, unknown>>).some((b) => b.cache_control);
     assert.ok(hasCc, "cache_control marker preserved on system block (Anthropic prefix-cache anchor)");
+});
+
+test("F7b (#1876): anthropic buildRequest keeps client system blocks byte-exact, appends prompt as trailing unmarked block", () => {
+    const clientSystem: AnthropicTextBlock[] = [
+        { type: "text", text: "x-anthropic-billing-header: attribution cc_entrypoint=cli" },
+        { type: "text", text: "YOU_ARE_CLAUDE", cache_control: { type: "ephemeral" } },
+        { type: "text", text: "EXTRA_CONTEXT_BLOCK" },
+    ];
+    const systemPrompt = buildCompressSystemPrompt();
+    const adapter = createAnthropicAdapter({ model: "claude" }, clientSystem);
+    const rebuilt = adapter.buildRequest([], systemPrompt, { model: "claude", messages: [] }) as Record<string, unknown>;
+    const system = rebuilt.system;
+    assert.ok(Array.isArray(system), "system stays a structured array");
+    const blocks = system as Array<Record<string, unknown>>;
+    assert.equal(blocks.length, 4, "3 client blocks + 1 appended prompt block — no merge into one block");
+    assert.deepEqual(blocks.slice(0, 3), clientSystem, "client blocks byte-exact in order, cache_control stays on its own (non-first) block");
+    assert.equal(blocks[3]?.text, systemPrompt, "appended block carries the compress prompt verbatim (no '---' separator)");
+    assert.equal(blocks[3]?.cache_control, undefined, "appended block carries no breakpoint (client-managed caching wins)");
 });
 
 function byteStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {

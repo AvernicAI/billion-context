@@ -87,6 +87,21 @@ let capture: ((level: string, msg: string) => void) | null = null;
 
 let stderrDead = false;
 
+// #2864: launcher-spawned children have their stderr redirected to
+// %TEMP%/bili-proxy-<port>.log — a raw append fd that never rotates, so the
+// port log became an unbounded 1:1 duplicate of bili.log (31.7MB/5 days,
+// including every other session the shared proxy serves). Once the FILE leg
+// is live, spawned children mute the stderr leg: the temp file keeps only its
+// pre-logger crash-sink role (node startup failures still land there via the
+// raw fd, before any of our code runs). If the file leg later degrades,
+// warnReopenFailed() un-mutes so the stderr fallback still works.
+let stderrMuted = false;
+
+/** #2864: stop writing to stderr (file-only mode). See the state comment. */
+export function muteStderrLeg(): void {
+    stderrMuted = true;
+}
+
 const STREAM_WRITE_ERROR_CODES = new Set(["EPIPE", "EIO", "EBADF", "ERR_STREAM_DESTROYED"]);
 
 /** Stream-write failures (closed pipe, destroyed stream) — the errors that storm
@@ -95,6 +110,25 @@ export function isStreamWriteError(err: unknown): boolean {
     if (typeof err !== "object" || err === null) return false;
     const code = (err as { code?: unknown }).code;
     return typeof code === "string" && STREAM_WRITE_ERROR_CODES.has(code);
+}
+
+const BENIGN_SOCKET_RACE_MESSAGE = "Cannot read properties of undefined (reading '_writableState')";
+
+/** Socket-teardown race on an already-closed socket (#1574): a Node-internal
+ *  callback (socketOnTimeout / socketOnEnd / closeIdleConnections) reaches a
+ *  socket whose writable side was already torn down. #1574 triage proved this
+ *  signature unreachable via bili's own call paths or stock Node v22.23.2
+ *  dispatch (all cited frames pass bound receivers; states are never nulled;
+ *  every graceful close funnels through destroy(), which clears the keep-alive
+ *  timer), and empirically verified that end()/destroy() on a fully closed
+ *  socket are harmless no-ops — so an occurrence touches no live resource.
+ *  Matched exactly (message + core frame provenance) so nothing else can be
+ *  demoted by accident. */
+export function isBenignSocketRaceError(err: unknown): boolean {
+    if (!(err instanceof TypeError) || err.message !== BENIGN_SOCKET_RACE_MESSAGE) return false;
+    const stack = err.stack;
+    if (typeof stack !== "string") return false;
+    return stack.includes("node:_http_server") || stack.includes("node:internal/streams/writable");
 }
 
 /** Flip to file-only logging after stderr died. Idempotent; the [warn] goes
@@ -177,6 +211,9 @@ function closeQuietly(s: WriteStream): void {
 function warnReopenFailed(err: unknown): void {
     if (reopenWarned) return;
     reopenWarned = true;
+    // #2864: the file leg just died — restore the muted stderr fallback so a
+    // launcher-spawned child keeps SOME durable output instead of going silent.
+    stderrMuted = false;
     const reason = err instanceof Error ? err.message : String(err);
     const msg = `log file ${logPath ?? "?"} unavailable (${reason}); continuing with stderr-only logging`;
     if (capture) {
@@ -248,8 +285,9 @@ export const log: Logger = (level, msg) => {
     // stderr (foreground terminal / shell redirect). MUST NOT throw and must
     // never re-enter its own error path: a sync failure (Windows) or the async
     // 'error' event (Linux, module-init listener above) both flip us to
-    // file-only once, after which this branch is skipped entirely.
-    if (!stderrDead) {
+    // file-only once, after which this branch is skipped entirely. #2864 adds
+    // the muted leg (launcher-spawned children, see state comment).
+    if (!stderrDead && !stderrMuted) {
         try {
             process.stderr.write(line);
         } catch (err) {
@@ -302,4 +340,10 @@ export function closeLogger(): Promise<void> {
 
 export function getLogPath(): string | undefined {
     return logPath;
+}
+
+/** #2864: true while a usable file stream is open (the stderr-mute decision
+ *  must not fire when file logging already degraded to stderr-only). */
+export function isFileLoggingActive(): boolean {
+    return stream !== undefined && stream.writable;
 }

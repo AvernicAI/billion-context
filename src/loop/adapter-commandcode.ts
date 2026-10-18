@@ -141,7 +141,7 @@ export function createCommandcodeAdapter(
                     reason: finishReason,
                     terminalReason: "stop",
                     toolCalls: toolCallsEmitted,
-                    text: { inputChars: st.inputChars, outputChars: visibleTextChars, dropped: st.dropped },
+                    text: { inputChars: st.inputChars, outputChars: visibleTextChars, dropped: st.dropped, dropCount: st.dropCount },
                     sawThinking: sawReasoning,
                     wire: "commandcode-proxy",
                 });

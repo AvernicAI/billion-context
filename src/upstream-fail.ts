@@ -40,7 +40,7 @@ export type UpstreamFailureKind =
     | "tls"
     | "unknown";
 
-export interface UpstreamFailCtx {
+interface UpstreamFailCtx {
     /** A proxy dispatcher is in the path — changes reset/refused attribution. */
     viaProxy?: boolean;
     /** True when the caller's EXTERNAL abort signal (client disconnect) has
@@ -77,7 +77,11 @@ export function classifyUpstreamFailure(error: unknown, ctx: UpstreamFailCtx = {
         if (code === "ECONNRESET" || code === "EPIPE" || code === "ECONNABORTED" || code === "UND_ERR_SOCKET") return ctx.viaProxy ? "proxy-reset" : "upstream-reset";
         if (code === "ECONNREFUSED") return "connect-refused";
         if (code === "ENOTFOUND" || code === "EAI_AGAIN") return "dns";
-        if (code === "EPROTO" || code.startsWith("ERR_TLS") || code.startsWith("ERR_SSL") || code.startsWith("CERT_")) return "tls";
+        // #1987: OpenSSL/undici certificate-TRUST codes (corporate interception /
+        // MITM) are TLS failures too — before this they classified as "unknown",
+        // losing the CA-remediation hint in logs and status output.
+        if (code === "EPROTO" || code.startsWith("ERR_TLS") || code.startsWith("ERR_SSL") || code.startsWith("CERT_")
+            || code.startsWith("DEPTH_ZERO_") || code === "UNABLE_TO_VERIFY_LEAF_SIGNATURE" || code === "SELF_SIGNED_CERT_IN_CHAIN" || code === "UNABLE_TO_GET_ISSUER_CERT_LOCALLY") return "tls";
     }
     return "unknown";
 }
@@ -104,3 +108,49 @@ export const UPSTREAM_FAIL_HINTS: Record<UpstreamFailureKind, string> = {
     tls: "TLS/certificate failure at CONNECT or upstream handshake — CA/proxy MITM config",
     unknown: "unclassified transport failure — report with full error chain",
 };
+
+/** Mask proxy credentials for display surfaces (log lines, 502 detail, the
+ *  #2809 skipped-proxy note, alert payloads). Lives HERE instead of
+ *  upstream-proxy so every renderer below that layer can share one
+ *  implementation without a new import edge. */
+export function redactProxyUrl(value: string | undefined): string | undefined {
+    if (!value) return undefined;
+    try {
+        const url = new URL(value);
+        if (url.username || url.password) {
+            url.username = "***";
+            url.password = "***";
+        }
+        return url.href;
+    } catch {
+        return "(invalid proxy URL)";
+    }
+}
+
+/** #2809: an AVAILABLE proxy that default-direct mode skipped for this host —
+ *  the value the auto-detect chain would have resolved. Raw on purpose: each
+ *  display channel redacts per its own needs (see redactedSkippedProxy). */
+export type SkippedProxyInfo = {
+    proxy: string;
+    /** Tier that offered it: an env var name ("HTTPS_PROXY") or "windows-system". */
+    source: string;
+};
+
+/** Display form of a skipped proxy: credentials masked, the normalization
+ *  trailing slash stripped so the note reads like a human wrote it. */
+export function redactedSkippedProxy(skipped: SkippedProxyInfo): string {
+    return (redactProxyUrl(skipped.proxy) ?? "").replace(/\/$/, "");
+}
+
+/** #2809 dead-end: a fail-fast failure under UNSET proxy mode reads
+ *  "unreachable/blackholed" while the machine's own env/system proxy could
+ *  reach the host fine — and no channel ever named that proxy. This appends
+ *  the conditional suffix naming it plus the opt-in paths. Only fail-fast
+ *  kinds qualify: a post-connect failure may have run on a working path,
+ *  where "skipped proxy" would mislead. Diagnostic text only — egress
+ *  decisions never read it. */
+export function hintWithSkippedProxy(kind: UpstreamFailureKind, skipped: SkippedProxyInfo | undefined): string {
+    const base = UPSTREAM_FAIL_HINTS[kind];
+    if (!skipped || !isFailFastUpstreamKind(kind)) return base;
+    return `${base}; available proxy ${redactedSkippedProxy(skipped)} (${skipped.source}) was skipped because upstreamProxyMode is unset (direct is the default by design, #346/#357) — follow it with "upstreamProxyMode": "auto" or BILI_UPSTREAM_PROXY_MODE=auto, or give this provider a "proxy" lane`;
+}

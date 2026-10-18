@@ -43,7 +43,7 @@ function makeCtx(): {
         session: {
             id: "vm-marker-test",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -51,6 +51,7 @@ function makeCtx(): {
             blockContents: new Map(),
             inFlight: 0,
             persisted: false,
+            pendingRetrievals: [],
         },
         log: () => {},
     };
@@ -91,6 +92,18 @@ test("loop: explicit visibilityMarkers=true keeps the marker (default parity)", 
     const { out, fetchCalls } = await drainRound({ ...makeCtx(), visibilityMarkers: true });
     assert.ok(out.includes("[ACP]"), "marker shown when explicitly enabled");
     assert.ok(fetchCalls >= 1, "re-request still fires");
+});
+
+test("loop: visibility marker message item carries an upstream-legal msg id (WC-015)", async () => {
+    const { out } = await drainRound({ ...makeCtx(), visibilityMarkers: true });
+    assert.ok(out.includes("[ACP]"), "marker emitted in this round");
+    const messageItems = [...out.matchAll(/event: (response\.output_item\.(?:added|done))\ndata: ([^\n]+)\n\n/g)]
+        .map((m) => JSON.parse(m[2]) as { item?: { type?: string; id?: unknown } })
+        .map((e) => e.item)
+        .filter((item): item is { type?: string; id?: unknown } => item?.type === "message");
+    assert.ok(messageItems.length > 0, "marker rode a message item");
+    for (const item of messageItems)
+        assert.ok(typeof item.id === "string" && item.id.startsWith("msg"), `message item id must begin with 'msg'; got ${JSON.stringify(item.id)}`);
 });
 
 test("loop: visibilityMarkers=false suppresses the marker but executes + re-requests", async () => {

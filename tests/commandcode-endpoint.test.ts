@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
+import type { AddressInfo } from "node:net";
 import test from "node:test";
 
 process.env.NODE_ENV = "test";
@@ -55,7 +56,7 @@ async function startRig(): Promise<Rig> {
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as AddressInfo).port;
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -77,7 +78,7 @@ async function startRig(): Promise<Rig> {
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
     await once(proxy, "listening");
-    return { proxyPort: proxy.address().port, upstreamPort, forwards, proxy, upstream };
+    return { proxyPort: (proxy.address() as AddressInfo).port, upstreamPort, forwards, proxy, upstream };
 }
 
 const envelope = (overrides: Record<string, unknown> = {}, messages: unknown[] = [{ role: "user", content: [{ type: "text", text: "hello" }] }]) => ({
@@ -183,7 +184,7 @@ test("#1295: declaration drives classification for known families (declared → 
     });
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
-    const upstreamPort = upstream.address().port;
+    const upstreamPort = (upstream.address() as AddressInfo).port;
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const proxy = await startServer({
@@ -206,7 +207,7 @@ test("#1295: declaration drives classification for known families (declared → 
     await once(proxy, "listening");
     try {
         const body = JSON.stringify({ model: MODEL, stream: true, messages: [{ role: "user", content: "hi" }] });
-        const r1 = await fetch(`http://127.0.0.1:${proxy.address().port}/bili/http://127.0.0.1:${upstreamPort}/custom/complete`, {
+        const r1 = await fetch(`http://127.0.0.1:${(proxy.address() as AddressInfo).port}/bili/http://127.0.0.1:${upstreamPort}/custom/complete`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "declared-openai" },
             body,
@@ -216,7 +217,7 @@ test("#1295: declaration drives classification for known families (declared → 
         const s1 = listSessions().find((s) => s.id === "declared-openai");
         assert.equal(s1?.stats.lastInputTokens, 555, "declared path enters the pipeline (usage accounted)");
 
-        const r2 = await fetch(`http://127.0.0.1:${proxy.address().port}/bili/http://127.0.0.1:${upstreamPort}/other/path`, {
+        const r2 = await fetch(`http://127.0.0.1:${(proxy.address() as AddressInfo).port}/bili/http://127.0.0.1:${upstreamPort}/other/path`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "undeclared-path" },
             body,
@@ -231,12 +232,12 @@ test("#1295: declaration drives classification for known families (declared → 
         const t0 = getUnrecognizedPathStats().total;
         // A GET probe against the DECLARED endpoint must NOT be flagged
         // ("unrecognized path" for a URL the user declared is pure noise).
-        const probeGet = await fetch(`http://127.0.0.1:${proxy.address().port}/bili/http://127.0.0.1:${upstreamPort}/custom/complete`);
+        const probeGet = await fetch(`http://127.0.0.1:${(proxy.address() as AddressInfo).port}/bili/http://127.0.0.1:${upstreamPort}/custom/complete`);
         await probeGet.text();
         assert.equal(getUnrecognizedPathStats().total, t0, "declared-endpoint probe did NOT add an unrecognized-path entry");
         // A fresh UNDECLARED path still warns — the F6 carve-out is scoped to
         // declared endpoints only.
-        const undeclared = await fetch(`http://127.0.0.1:${proxy.address().port}/bili/http://127.0.0.1:${upstreamPort}/other/probe-path`, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": "f6-undeclared-probe" }, body });
+        const undeclared = await fetch(`http://127.0.0.1:${(proxy.address() as AddressInfo).port}/bili/http://127.0.0.1:${upstreamPort}/other/probe-path`, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": "f6-undeclared-probe" }, body });
         await undeclared.text();
         assert.ok(getUnrecognizedPathStats().total > t0, "undeclared path still counted as unrecognized");
         // review F4: a request URL that pins an explicit protocol conflicting
@@ -245,7 +246,7 @@ test("#1295: declaration drives classification for known families (declared → 
         const c0 = getDeclPinConflictStats().total;
         const pinnedBody = JSON.stringify({ model: MODEL, max_tokens: 64, stream: true, messages: [{ role: "user", content: "hi" }] });
         for (const sess of ["f4-pin-1", "f4-pin-2"]) {
-            const rp = await fetch(`http://127.0.0.1:${proxy.address().port}/bili/anthropic/http://127.0.0.1:${upstreamPort}/custom/complete`, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": sess }, body: pinnedBody });
+            const rp = await fetch(`http://127.0.0.1:${(proxy.address() as AddressInfo).port}/bili/anthropic/http://127.0.0.1:${upstreamPort}/custom/complete`, { method: "POST", headers: { "content-type": "application/json", "x-acp-session": sess }, body: pinnedBody });
             await rp.text();
         }
         assert.equal(getDeclPinConflictStats().total, c0 + 1, "conflict warn fires once per pair, not per request");

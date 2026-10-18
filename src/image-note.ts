@@ -99,3 +99,16 @@ export function imagePlaceholders(m: CoreMessage): string[] {
         return note ? `[image: ${note}]` : IMAGE_PLACEHOLDER;
     });
 }
+
+/** #1995: summary-side placeholders with the message's mNNNNN ref appended
+ *  (`[image: png 1024x768 · m00042]`). The fold's summary is what SURVIVES —
+ *  once the range is compressed the live wire no longer carries these images,
+ *  so recording the ref in the summary text is what tells a later turn that
+ *  `decompress({ imageRef: "m00042" })` can pull the pixels back (the
+ *  #2022 restore channel indexes by exactly this ref). `ref` undefined →
+ *  plain placeholders (callers without a ref mapping degrade gracefully). */
+export function imagePlaceholdersForSummary(m: CoreMessage, ref: string | undefined): string[] {
+    const notes = imagePlaceholders(m);
+    if (ref === undefined) return notes;
+    return notes.map((n) => `${n.slice(0, -1)} · ${ref}]`);
+}

@@ -34,7 +34,7 @@ function sseLine(obj: unknown): string {
 function parseRefIds(body: string): string[] {
     const ids: string[] = [];
     const re = /<(?:acp|dcp-message-id)[^>]*>\s*(m\d+)\s*<\/(?:acp|dcp-message-id)>/g;
-    let m: RegExp.ExecArray | null = null;
+    let m: RegExpExecArray | null = null;
     while ((m = re.exec(body)) !== null) ids.push(m[1]!);
     return ids;
 }
@@ -165,6 +165,14 @@ function proxyOpts(relayUrl: string, forkAdoption: boolean): ProxyOptions {
             compress: { minCompressRange: 200, minSummaryLength: 20, maxSummaryLength: 5000 },
         }),
         compress: { injectTool: true, injectNudge: false },
+        promptCache: { routing: "auto" },
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
         forkAdoption,
         sessionHeader: "x-acp-session",
         log: false,
@@ -234,7 +242,7 @@ async function runForkScenario(forkAdoption: boolean): Promise<{ parentBlocks: n
             childBlockIds: child.state.blocks.filter((b) => b.active).map((b) => b.blockId),
             childBlocks: child.state.blocks.filter((b) => b.active).length,
             childContents: child.state.blocks.filter((b) => child.blockContents.has(b.blockId)).length,
-            lineage: child.metadata.anonymousPrefixAffinity?.lineage?.reason,
+            lineage: (child.metadata.anonymousPrefixAffinity as { lineage?: { reason?: string } } | undefined)?.lineage?.reason,
         };
         assert.equal(snapshot.lineage, "forked", "child lineage must record the fork");
 

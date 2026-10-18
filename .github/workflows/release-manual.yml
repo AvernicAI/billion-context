@@ -18,6 +18,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -69,6 +70,26 @@ jobs:
               ;;
           esac
 
+      - name: Verify release-notes entry (#1870)
+        # Policy (2026-10-04 revision of #1870): entries are OPT-IN severity
+        # declarations. Only severe releases need one; ordinary releases ship
+        # silently with NO entry. Missing entry => notice + pass. A present
+        # entry is validated and logged. Prereleases (dev channel) exempt.
+        run: |
+          VER="${{ steps.version.outputs.version }}"
+          case "$VER" in
+            *-*) echo "prerelease $VER — release-notes gate skipped"; exit 0 ;;
+          esac
+          node -e "
+            const notes = require('./release-notes/package.json').billionContextReleaseNotes;
+            const entry = notes && notes.releases && notes.releases.find((e) => e.version === process.argv[1]);
+            if (!entry) {
+              console.log('::notice::release ' + process.argv[1] + ' has no release-notes entry — shipping silently (entries are opt-in; only severe releases need one). See release-notes/README.md (#1870).');
+              process.exit(0);
+            }
+            console.log('release-notes entry ok:', entry.version, '[' + entry.tier + ']', entry.summary.slice(0, 80));
+          " "$VER"
+
       - name: Bump version
         run: |
           node -e '
@@ -95,14 +116,17 @@ jobs:
             exit 1
           fi
 
-      - name: Pre-flight gate
-        # keep the claude-native live e2e subtests in this pre-publish gate (#1248)
-        env:
-          ACP_TEST_CLAUDE_NATIVE: "1"
+      - name: Pre-flight gate (fast sanity)
+        # #3539: the full `npm test` used to serialize here (~30-40 min on one
+        # shared 2-core runner) and then run AGAIN as the sharded CI matrix —
+        # the same suites twice per release chain. The full suite is now owned
+        # exclusively by the CI lanes dispatched at the exact publish sha
+        # below (policy 2026-10-10 unchanged); the Full CI gate blocks publish
+        # until they are all green, so coverage is identical — only the
+        # executor moved from this job to the parallel lane matrix.
         run: |
           npm ci
           npm run typecheck
-          npm test
           npm run build
 
       - name: Commit and push to master
@@ -134,6 +158,68 @@ jobs:
           echo "needs_pr=true" >> "$GITHUB_OUTPUT"
           echo "pr_branch=${BR}" >> "$GITHUB_OUTPUT"
           exit 0
+
+      - name: Full CI dispatch (missing lanes at the release commit)
+        # Policy (2026-10-10, after the v0.1.192 carve-out): every release
+        # channel must run the COMPLETE CI set at the exact publish sha before
+        # npm publish. The direct-push commit lands on master via GITHUB_TOKEN,
+        # which fires no push events — nothing runs CI on it. Dispatch every
+        # missing lane at master (idempotent); the Full CI gate step below
+        # blocks publish until all lanes are green. The script first refuses
+        # to dispatch if master's head is no longer the release commit
+        # (#3539) and cancels stale in-flight runs from this attempt.
+        if: steps.push.outputs.direct == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_RUN_STARTED_AT: ${{ github.run_started_at }}
+        run: |
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          GITHUB_REF_NAME="master"
+          export GITHUB_SHA GITHUB_REF_NAME
+          node scripts/release-ci-gate.mjs --dispatch
+
+      - name: Full CI gate (all lanes green at the release commit)
+        # Hard precondition for publish: every required lane green at the
+        # publish sha. Any red lane or timeout ⇒ release fails, nothing is
+        # published. The dispatch step above already refused to fire when
+        # master's head was not this commit (#3539); a later push does not
+        # invalidate runs already landed at it.
+        if: steps.push.outputs.direct == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_RUN_STARTED_AT: ${{ github.run_started_at }}
+          CI_GATE_TIMEOUT_MIN: "60"
+        run: |
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          GITHUB_REF_NAME="master"
+          export GITHUB_SHA GITHUB_REF_NAME
+          node scripts/release-ci-gate.mjs --wait
+
+      - name: Dispatch full CI on fallback branch
+        if: steps.push.outputs.needs_pr == 'true'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BRANCH: ${{ steps.push.outputs.pr_branch }}
+          RELEASE_RUN_STARTED_AT: ${{ github.run_started_at }}
+          CI_FULL_DISPATCH: "1"
+        run: |
+          # GITHUB_TOKEN ref updates deliver no push events, so the push
+          # trigger in ci.yml never fires on this branch. An explicit
+          # workflow_dispatch on the same ref produces check runs on the head
+          # sha → required status checks pass → the auto-PR is mergeable
+          # without approving its gated pull_request runs (#772, #1744).
+          # #3539: dispatch the COMPLETE lane set (ci.yml FULL matrix + every
+          # e2e lane) in one pass — previously only ci.yml CORE landed here
+          # and release.yml re-ran the rest after merge, paying for the same
+          # suites up to three times per chain. With everything green at the
+          # PR head, release.yml's gate reuses the runs and publishes without
+          # extra CI. The script verifies the branch head matches before
+          # dispatching and cancels stale in-flight runs from this attempt.
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          GITHUB_REF_NAME="$PR_BRANCH"
+          export GITHUB_SHA GITHUB_REF_NAME
+          node scripts/release-ci-gate.mjs --dispatch
 
       - name: Open fallback PR (best effort)
         if: steps.push.outputs.needs_pr == 'true'
@@ -209,6 +295,28 @@ jobs:
           echo "::warning::NOTHING WAS PUBLISHED YET — auto-PR failed (HTTP ${HTTP_CODE}): $(cat "$RESP_FILE")"
           echo "::warning::Finish the release with one click: ${LINK} (then merge to publish v${VER})"
           exit 0
+
+      - name: Wait for full CI green on fallback branch (track head)
+        if: steps.push.outputs.needs_pr == 'true'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BRANCH: ${{ steps.push.outputs.pr_branch }}
+          RELEASE_RUN_STARTED_AT: ${{ github.run_started_at }}
+          WAIT_TRACK_HEAD: "1"
+          CI_GATE_TIMEOUT_MIN: "60"
+        run: |
+          # Certifies "fallback PR ready": every required lane green at the
+          # CURRENT branch head. If master gets merged into the release branch
+          # mid-wait (the v0.1.198 queue stomp, #3534), the head moves: stale
+          # in-flight runs at the old head are cancelled and missing lanes are
+          # re-dispatched at the new head instead of burning runners on a
+          # superseded sha. On timeout the PR stays open with CI still running
+          # — watch the PR, nothing is lost.
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          GITHUB_REF_NAME="$PR_BRANCH"
+          export GITHUB_SHA GITHUB_REF_NAME
+          node scripts/release-ci-gate.mjs --wait
 
       - name: Check if prerelease
         id: pre

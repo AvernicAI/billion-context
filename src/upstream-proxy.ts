@@ -6,9 +6,10 @@ import type { ProviderRoutes } from "./config.js";
 import { log as loggerLog } from "./logger.js";
 import { maskHostInText, maskUrlForLog } from "./log-mask.js";
 import { upstreamTimeoutMs } from "./fetch-util.js";
-import { classifyUpstreamFailure, UPSTREAM_FAIL_HINTS } from "./upstream-fail.js";
+import { classifyUpstreamFailure, hintWithSkippedProxy, redactProxyUrl, type SkippedProxyInfo } from "./upstream-fail.js";
+import { proxyKeepAliveMaxMs as knobProxyKeepAliveMaxMs } from "./knobs.js";
 
-export type ParsedHttpProxy = {
+type ParsedHttpProxy = {
     url: string;
     host: string;
     port: number;
@@ -28,15 +29,24 @@ export type ProxyFallbackOptions = {
      *  unset mode also parses as "direct" but means "no preference" — in that
      *  case an empty globalProxy must fall through to env proxy discovery. */
     explicitDirect?: boolean;
+    /** #2809: true only when NO proxy mode was set anywhere (unset → defaults
+     *  to direct). Unlike explicitDirect (which gates the SHORT-CIRCUIT), this
+     *  only arms the diagnostic peek: a fail-fast failure may name the proxy
+     *  the auto chain would have picked. Egress stays direct either way. */
+    defaultDirect?: boolean;
 };
 
 export type UpstreamProxyDecision = {
     proxy?: string;
     source: string;
     autoConfigUrl?: string;
+    /** #2809: set when the decision is default-direct while the auto chain
+     *  WOULD have picked a proxy for this host. Diagnostic-only — never read
+     *  by egress decisions, only by failure renderers (log/502/alert). */
+    skippedProxy?: SkippedProxyInfo;
 };
 
-export type WindowsSystemProxy = {
+type WindowsSystemProxy = {
     enabled: boolean;
     http?: string;
     https?: string;
@@ -44,7 +54,7 @@ export type WindowsSystemProxy = {
     autoConfigUrl?: string;
 };
 
-export type UpstreamConnectionStatus = {
+type UpstreamConnectionStatus = {
     url?: string;
     proxy?: string;
     connected?: boolean;
@@ -77,20 +87,6 @@ function proxyAuthorization(url: URL): string | undefined {
     const username = decodeURIComponent(url.username);
     const password = decodeURIComponent(url.password);
     return `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`;
-}
-
-export function redactProxyUrl(value: string | undefined): string | undefined {
-    if (!value) return undefined;
-    try {
-        const url = new URL(value);
-        if (url.username || url.password) {
-            url.username = "***";
-            url.password = "***";
-        }
-        return url.href;
-    } catch {
-        return "(invalid proxy URL)";
-    }
 }
 
 export function parseHttpProxy(proxy?: string, biliPort?: number): ParsedHttpProxy | undefined {
@@ -171,7 +167,20 @@ function parseFallbackProxy(proxy: string | undefined, biliPort?: number): Parse
     }
 }
 
-export function matchesNoProxy(target: URL, noProxy: string | undefined): boolean {
+type NoProxyOptions = {
+    /** Windows ProxyOverride grammar (#2502): mid-token `*` entries (Clash's default
+     *  bypass list is `localhost;127.*;192.168.*;…;<local>`) glob-match the hostname —
+     *  `.` stays literal, `*` matches any characters. NO_PROXY lists keep their
+     *  conventional grammar where `*` only appears as a standalone item. */
+    windowsBypass?: boolean;
+};
+
+function wildcardHostMatch(host: string, token: string): boolean {
+    const pattern = "^" + token.split("*").map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$";
+    return new RegExp(pattern).test(host);
+}
+
+export function matchesNoProxy(target: URL, noProxy: string | undefined, options: NoProxyOptions = {}): boolean {
     if (!noProxy) return false;
     const host = target.hostname.replace(/^\[|\]$/g, "").toLowerCase();
     const port = target.port ? Number.parseInt(target.port, 10) : defaultPort(target.protocol);
@@ -195,6 +204,7 @@ export function matchesNoProxy(target: URL, noProxy: string | undefined): boolea
             }
         }
         if (tokenPort !== undefined && tokenPort !== port) continue;
+        if (options.windowsBypass && !token.startsWith("*") && token.includes("*") && wildcardHostMatch(host, token)) return true;
         const suffix = token.startsWith("*.") ? token.slice(1) : token.startsWith(".") ? token : undefined;
         if (suffix ? host.endsWith(suffix) || host === suffix.slice(1) : host === token) return true;
     }
@@ -225,7 +235,7 @@ function registryValue(output: string, name: string): string | undefined {
     return output.match(new RegExp(`^\\s*${escaped}\\s+REG_\\w+\\s+(.+)$`, "mi"))?.[1]?.trim();
 }
 
-export function readWindowsSystemProxy(): WindowsSystemProxy {
+function readWindowsSystemProxy(): WindowsSystemProxy {
     if (process.platform !== "win32") return { enabled: false };
     const now = Date.now();
     if (windowsProxyCache && now - windowsProxyCache.at < 5000) return windowsProxyCache.value;
@@ -234,7 +244,7 @@ export function readWindowsSystemProxy(): WindowsSystemProxy {
         const output = execFileSync("reg", [
             "query",
             "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
-        ], { encoding: "utf8", windowsHide: true, timeout: 3000 });
+        ], { encoding: "utf8", windowsHide: true, timeout: 3000, stdio: ["ignore", "pipe", "ignore"] });
         const enabledRaw = registryValue(output, "ProxyEnable");
         const enabled = enabledRaw === "0x1" || enabledRaw === "1";
         const staticProxy = enabled ? parseWindowsProxyServer(registryValue(output, "ProxyServer") ?? "") : {};
@@ -274,9 +284,23 @@ export function resolveProxyDecision(
             return { proxy: parsed.url, source: "provider" };
         }
     }
-    if (globalProxy === "" && fallback.explicitDirect) return { source: "direct" };
+    if (globalProxy === "" && fallback.explicitDirect) {
+        // #2809: unset mode defaults to direct like explicit "direct", but means
+        // "no preference". Peek at what the auto chain WOULD have picked so
+        // failure diagnostics can name the skipped proxy. Egress stays direct
+        // either way — only the diagnostic payload changes (#346/#357 intact).
+        if (!fallback.defaultDirect) return { source: "direct" };
+        const peek = autoDetectProxy(target, fallback);
+        return peek.proxy ? { source: "direct", skippedProxy: { proxy: peek.proxy, source: peek.source } } : { source: "direct" };
+    }
     const explicit = parseHttpProxy(globalProxy, fallback.biliPort)?.url;
     if (explicit) return { proxy: explicit, source: fallback.globalSource ?? "global" };
+    return autoDetectProxy(target, fallback);
+}
+
+/** Auto-detect tail shared by the normal flow and the #2809 default-direct
+ *  peek: NO_PROXY → env tier → Windows bypass → Windows system proxy → direct. */
+function autoDetectProxy(target: URL | undefined, fallback: ProxyFallbackOptions): UpstreamProxyDecision {
     if (target && matchesNoProxy(target, fallback.noProxy)) return { source: "no-proxy" };
     const environmentCandidates: Array<[string, string | undefined]> = target?.protocol === "http:"
         ? [["HTTP_PROXY", fallback.httpProxy], ["ALL_PROXY", fallback.allProxy]]
@@ -289,7 +313,7 @@ export function resolveProxyDecision(
         if (scheme) warnUnsupportedScheme(source, value, scheme);
     }
     const system = fallback.systemProxy ?? readWindowsSystemProxy();
-    if (target && matchesNoProxy(target, system.bypass)) {
+    if (target && matchesNoProxy(target, system.bypass, { windowsBypass: true })) {
         return { source: "windows-bypass", ...(system.autoConfigUrl ? { autoConfigUrl: system.autoConfigUrl } : {}) };
     }
     const systemValue = target?.protocol === "http:" ? system.http : system.https ?? system.http;
@@ -325,8 +349,7 @@ export function resolveProxy(
 export const PROXY_KEEPALIVE_MAX_MS = 55_000;
 
 export function proxyKeepAliveMaxMs(): number {
-    const raw = Number(process.env.BILI_PROXY_KEEPALIVE_MAX_MS);
-    return Number.isFinite(raw) && raw < 0 ? PROXY_KEEPALIVE_MAX_MS : raw === 0 ? 0 : Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : PROXY_KEEPALIVE_MAX_MS;
+    return knobProxyKeepAliveMaxMs();
 }
 
 /** Proxy dispatchers carry the same timeout policy as direct ones (#551):
@@ -475,16 +498,6 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
     });
 }
 
-export async function connectTlsThroughProxy(
-    host: string,
-    port: number,
-    proxyUrl: string | undefined,
-    servername?: string,
-): Promise<tls.TLSSocket> {
-    const socket = await connectThroughProxy(host, port, proxyUrl);
-    return tls.connect({ socket, servername: servername ?? host });
-}
-
 function errorChain(error: unknown): Array<Record<string, unknown>> {
     const chain: Array<Record<string, unknown>> = [];
     const seen = new Set<unknown>();
@@ -507,7 +520,7 @@ function errorChain(error: unknown): Array<Record<string, unknown>> {
     return chain;
 }
 
-export function formatUpstreamError(error: unknown, url: string, proxyUrl?: string): string {
+export function formatUpstreamError(error: unknown, url: string, proxyUrl?: string, skipped?: SkippedProxyInfo): string {
     const chain = errorChain(error);
     const kind = classifyUpstreamFailure(error, { viaProxy: proxyUrl !== undefined });
     const fields = ["code", "errno", "syscall", "address", "port"];
@@ -530,16 +543,16 @@ export function formatUpstreamError(error: unknown, url: string, proxyUrl?: stri
     if (messages.length > 0) parts.push(`message=${messages.join(" <- ")}`);
     parts.push(`url=${maskUrlForLog(url)}`);
     parts.push(`proxy=${redactProxyUrl(proxyUrl) ?? "direct"}`);
-    parts.push(`hint=${UPSTREAM_FAIL_HINTS[kind]}`);
+    parts.push(`hint=${hintWithSkippedProxy(kind, skipped)}`);
     return parts.join(" ");
 }
 
-export function recordUpstreamConnection(url: string, proxyUrl: string | undefined, error?: unknown): void {
+export function recordUpstreamConnection(url: string, proxyUrl: string | undefined, error?: unknown, skipped?: SkippedProxyInfo): void {
     lastConnection = {
         url,
         proxy: redactProxyUrl(proxyUrl),
         connected: error === undefined,
-        ...(error === undefined ? {} : { error: formatUpstreamError(error, url, proxyUrl) }),
+        ...(error === undefined ? {} : { error: formatUpstreamError(error, url, proxyUrl, skipped) }),
         checkedAt: new Date().toISOString(),
     };
 }

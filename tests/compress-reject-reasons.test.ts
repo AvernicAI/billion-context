@@ -18,7 +18,7 @@ function makeCtx(): Ctx {
         session: {
             id: "reject-reasons-test",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0 , retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),
@@ -26,6 +26,7 @@ function makeCtx(): Ctx {
             blockContents: new Map(),
             inFlight: 0,
             persisted: false,
+            pendingRetrievals: [],
         },
         log: (m: string) => { logs.push(m); },
         logs,
@@ -36,7 +37,7 @@ test("#362: parse-level rejections surface per-entry reasons in the model-facing
     const out = applyRanges(
         parseCompressInput({ content: [{ summary: "no bounds" }, { startId: "m00001", endId: "m00002" }] }),
         makeCtx(),
-    );
+    ).text;
     assert.ok(out.startsWith("[Compression FAILED"), `expected failure, got: ${out}`);
     assert.ok(out.includes("kind=no-valid-ranges"), `kind reported, got: ${out}`);
     assert.ok(out.includes("dropped=2"), `dropped count reported, got: ${out}`);
@@ -50,7 +51,7 @@ test("#362: shape drift (content vs ranges key) reports kind=missing-content", (
     const out = applyRanges(
         parseCompressInput({ ranges: [{ startId: "m00001", endId: "m00002", summary: "s" }] }),
         makeCtx(),
-    );
+    ).text;
     assert.ok(out.includes("kind=missing-content"), `kind reported, got: ${out}`);
     assert.ok(!out.includes("Rejected entries"), "no per-entry reasons for shape-level failure");
 });

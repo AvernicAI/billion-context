@@ -1,5 +1,10 @@
 export const WEB_STYLES = String.raw`
 :root {
+    /* #2473: bind the document canvas to the SAME signal that drives the
+       palette (prefers-color-scheme). Without this the canvas stays white no
+       matter the scheme, so the embed face (--bg: transparent) painted its
+       light-scheme text on a white ground in dark mode → unreadable stats. */
+    color-scheme: light dark;
     --bg: #ffffff;
     --bg-elev: #f6f8fa;
     --bg-muted: #f0f2f5;
@@ -21,8 +26,14 @@ export const WEB_STYLES = String.raw`
     --radius: 10px;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 }
+/* #2559: an embedding host can pin the face explicitly (?theme=light|dark →
+   <html data-theme=…>) because a host APP-level theme is invisible to the
+   framed document's prefers-color-scheme. An explicit pin outranks the OS
+   signal, so the media query below is narrowed to documents WITHOUT one;
+   the pinned palette repeats the same list (CSS cannot share declarations
+   across media boundaries — keep the two lists in sync). */
 @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme]) {
         --bg: #0d1117;
         --bg-elev: #161b22;
         --bg-muted: #1c2129;
@@ -42,6 +53,30 @@ export const WEB_STYLES = String.raw`
         --purple: #a371f7;
         --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
     }
+}
+:root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0d1117;
+    --bg-elev: #161b22;
+    --bg-muted: #1c2129;
+    --border: #30363d;
+    --border-soft: #21262d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --text-faint: #6e7681;
+    --accent: #4493f8;
+    --accent-soft: rgba(68, 147, 248, 0.14);
+    --green: #3fb950;
+    --green-soft: rgba(63, 185, 80, 0.14);
+    --red: #f85149;
+    --red-soft: rgba(248, 81, 73, 0.12);
+    --amber: #d29922;
+    --amber-soft: rgba(210, 153, 34, 0.14);
+    --purple: #a371f7;
+    --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+:root[data-theme="light"] {
+    color-scheme: light;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
@@ -90,8 +125,8 @@ body {
 .banner.err { background: var(--red-soft); border-color: var(--red); color: var(--red); }
 .banner.info { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
 .banner .banner-title { font-weight: 600; margin-bottom: 6px; }
-.banner .alert-row { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
-.banner .alert-row > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.banner .alert-row, .card .alert-row { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
+.banner .alert-row > span, .card .alert-row > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 
 main { max-width: 1200px; margin: 0 auto; padding: 20px; }
 .page-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
@@ -145,6 +180,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .badge.live { background: var(--green-soft); color: var(--green); border-color: var(--green); }
 .badge.disk { background: var(--bg-muted); color: var(--text-muted); border-color: var(--border); }
 .badge.proto { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); font-family: var(--mono); font-weight: 500; }
+.badge.ext { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); font-family: var(--mono); font-weight: 500; }
 .badge.warn { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
 .badge.ok { background: var(--green-soft); color: var(--green); border-color: var(--green); }
 
@@ -181,8 +217,12 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .section-label { font-size: 12px; font-weight: 650; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 18px 0 8px; }
 .section-label:first-child { margin-top: 0; }
 
-.chart-wrap { width: 100%; overflow-x: auto; }
+.chart-wrap { width: 100%; overflow-x: auto; position: relative; }
 .chart-wrap svg { display: block; width: 100%; height: auto; }
+#traj-chart { cursor: crosshair; user-select: none; }
+.chart-status { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.chart-status[hidden] { display: none; }
+.chart-brush { position: absolute; background: rgba(9, 105, 218, 0.15); border-left: 1px solid #0969da; border-right: 1px solid #0969da; pointer-events: none; }
 .chart-legend { display: flex; gap: 16px; font-size: 12px; color: var(--text-muted); margin-top: 8px; flex-wrap: wrap; }
 .chart-legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
 
@@ -245,7 +285,17 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 @keyframes spin { to { transform: rotate(360deg); } }
 
 @media (max-width: 720px) {
+    .topbar { flex-wrap: wrap; height: auto; min-height: 52px; padding: 10px 12px; gap: 10px; }
+    .topbar .actions { margin-left: auto; }
+    .fork-link { display: none; }
+    .nav { order: 3; flex: 1 1 100%; min-width: 0; }
     table.data th:nth-child(n + 6), table.data td:nth-child(n + 6) { display: none; }
+    /* hiding TDs frees nothing under table-layout: fixed — the <col> tracks of
+       the hidden columns still claim their px, so the SESSION column (the only
+       auto track) collapses to a sliver and its nowrap title overflows onto the
+       adjacent cells (double-exposed rows). Zero the hidden tracks so the freed
+       space lands on the title column again. */
+    table.data colgroup col:nth-child(n + 6) { width: 0 !important; }
     main { padding: 12px; }
     .kv { grid-template-columns: 1fr; row-gap: 3px; }
     .kv .k { margin-top: 6px; }
@@ -332,4 +382,47 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
 /* Log view rows (filtered mode): actual hits vs context / time-window lines. */
 .lm-ctx { opacity: 0.55; }
 .lm-hit { background: rgba(94, 164, 255, 0.14); border-radius: 3px; }
+#summary-settings { margin-top: 16px; }
+.summary-target { min-width: 0; margin: 14px 0; padding: 12px; border: 1px solid var(--border); border-radius: 4px; }
+.summary-target legend { max-width: 100%; overflow-wrap: anywhere; font-size: 13px; }
+.summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 12px; margin-bottom: 12px; }
+.summary-grid label { display: grid; gap: 5px; min-width: 0; font-size: 12px; }
+#summary-settings .field-input { width: 100%; min-width: 0; box-sizing: border-box; }
+.summary-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
+.summary-creds { margin: 14px 0; }
+.summary-creds h4 { margin: 0 0 8px; font-size: 13px; }
+.summary-actions label:has(input[type="password"]) { display: grid; gap: 5px; flex: 1 1 200px; min-width: 0; font-size: 12px; }
+.summary-actions .btn { min-height: 32px; }
+
+/* #2321: embeddable face (?embed=1) — framed inside a host settings page
+   (dsh). The host draws its own chrome and tab bar, so ours hides; tokens
+   flatten toward dsh-like values: transparent ground, translucent gray
+   borders, no shadow, 8px radius. Text colors keep following the scheme. */
+.embed .topbar { display: none; }
+.embed {
+    --shadow: none;
+    --radius: 8px;
+    --bg: transparent;
+    --bg-elev: rgba(127, 127, 127, 0.05);
+    --bg-muted: rgba(127, 127, 127, 0.09);
+    --border: rgba(127, 127, 127, 0.4);
+    --border-soft: rgba(127, 127, 127, 0.22);
+}
+/* #2448: the embed face lives in a NARROW host panel (a dsh settings
+   column), never a full browser tab — reuse the phone-compact column set
+   (cols 6+ hidden, same as the ≤720px rule) at ANY width and drop the
+   standalone-page min-widths so the tables fit the panel instead of
+   scrolling sideways. */
+.embed .tproc table.data { min-width: 0; }
+.embed .twide table.data { min-width: 0; }
+.embed table.data th:nth-child(n + 6), .embed table.data td:nth-child(n + 6) { display: none; }
+/* same fixed-layout trap as the ≤720px rule above — the hidden
+   columns' <col> tracks must release their widths or the title column
+   collapses and rows render double-exposed. */
+.embed table.data colgroup col:nth-child(n + 6) { width: 0 !important; }
+.embed .twide table.data th, .embed .twide table.data td { padding-left: 5px; padding-right: 5px; }
+/* #2560: the frame hugs its edges hard at narrow panel widths — give the
+   embed face a little breathing room instead of zero gutter. */
+.embed main { max-width: none; padding: 8px 10px 16px; }
+.embed .banner { margin: 8px 0 0; }
 `;
