@@ -646,6 +646,11 @@ export async function* runCompressLoop(
         return tail === undefined || tail === threadTailAtSend;
     };
 
+    // #3003: count fold-rounds per turn — each landed fold re-bills the remaining
+    // suffix to the prefix cache (one seam). A turn carrying >=2 folds pays that
+    // re-pay repeatedly; batching ranges into one compress call pays it once.
+    let foldRoundsThisTurn = 0;
+
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
             if (signal?.aborted) break;
@@ -1356,6 +1361,10 @@ export async function* runCompressLoop(
                             // post-fold reality; keeping the credit would net
                             // the savings twice (recordUsage).
                             ctx.session.stats.compressCreditTokens = 0;
+                            foldRoundsThisTurn++;
+                            if (foldRoundsThisTurn >= 2) {
+                                ctx.log(`[acp-loop] turn carried ${foldRoundsThisTurn} fold-round(s) — each landed fold re-bills the remaining suffix to the prefix cache (${foldRoundsThisTurn} seam(s)); batch ranges into ONE compress call to pay once (#3003)`);
+                            }
                             ctx.log(`[acp-loop] round ${round}: re-request view refreshed to post-compress fold`);
                         }
                     } catch (err) {
