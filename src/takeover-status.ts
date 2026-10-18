@@ -8,8 +8,8 @@
 // host stops heartbeating); it never infers health itself. Additive wire field:
 // absent until a host reports, so older clients ignore it — no schema change.
 
-export type TakeoverReportState = "ok" | "none" | "threw";
-export type TakeoverState = TakeoverReportState | "unknown";
+type TakeoverReportState = "ok" | "none" | "threw";
+type TakeoverState = TakeoverReportState | "unknown";
 
 /** What the host pushes via the runtime-info endpoint's optional `takeover`
  *  field. All times are host-clock epoch ms EXCEPT reportedAtMs, which the
@@ -17,7 +17,9 @@ export type TakeoverState = TakeoverReportState | "unknown";
  *  clocks skew, so we never compare across clocks). */
 export interface TakeoverReport {
     state: TakeoverReportState;
-    /** total refusals since the current headline state began */
+    /** cumulative refusals since process start — per-endpoint counts are never
+     *  reset on headline-state transitions, so this is a lifetime total, not a
+     *  since-last-transition count */
     refusals: number;
     /** per-endpoint top-N (desc by count) for debugging who's being refused */
     byEndpoint: { endpoint: string; count: number }[];
@@ -30,7 +32,7 @@ export interface TakeoverReport {
 
 /** Derived wire shape exposed on status/overview. null (absent) when no host
  *  has reported yet; otherwise always present with a derived state. */
-export interface TakeoverStatusWire {
+interface TakeoverStatusWire {
     agent: string;
     /** derived: the reported state, or "unknown" once the report goes stale */
     state: TakeoverState;

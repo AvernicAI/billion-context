@@ -64,12 +64,15 @@ export const name = "bili-native";
 export const inject = ["tools", "commands", "agents"];
 
 const RETRY_INTERVAL_MS = 10000;
-// #3582: host process identity for the takeover-health heartbeat. A real host
-// restart reloads this module → new value, so the panel can tell "recovered"
-// apart from "counters reset because the host restarted". The heartbeat cadence
-// is a fixed 60s (no env knob — this is an internal reporting rhythm, not user
-// config); the proxy's staleness window (TAKEOVER_STALE_MS) is sized to it.
-const HOST_STARTED_AT_MS = Date.now();
+// #3582: host PROCESS identity for the takeover-health heartbeat. Sourced from
+// process.uptime() (not module-top Date.now()) so a plugin hot-reload that
+// re-evaluates this module does NOT read as a restart — only a real process
+// restart resets uptime to ~0 and moves this value, letting the panel tell
+// "recovered via a real restart" apart from "same long-running process, plugin
+// swapped in place" (#3578). Heartbeat cadence is a fixed 60s (no env knob —
+// internal reporting rhythm, not user config); the proxy staleness window
+// (TAKEOVER_STALE_MS) is sized to it.
+const HOST_STARTED_AT_MS = Math.round(Date.now() - process.uptime() * 1000);
 const TAKEOVER_HEARTBEAT_MS = 60_000;
 /** #2082: BILI_DSH_RETRY_INTERVAL_MS — test/ops knob to shrink the retry
  *  wall without wall-clock waits (same pattern as BILI_MODEL_INFO_RETRY_MS). */
@@ -1532,7 +1535,7 @@ export function apply(ctx: PluginContext): void {
             perEndpoint.push({ endpoint, count: v.count });
         }
         perEndpoint.sort((a, b) => b.count - a.count);
-        return { state: headlineState ?? (total > 0 ? "none" : "ok"), refusals: total, byEndpoint: perEndpoint.slice(0, TAKEOVER_TOP_ENDPOINTS), sinceMs: takeoverSinceMs, hostStartedAtMs: HOST_STARTED_AT_MS };
+        return { state: headlineState ?? "none", refusals: total, byEndpoint: perEndpoint.slice(0, TAKEOVER_TOP_ENDPOINTS), sinceMs: takeoverSinceMs, hostStartedAtMs: HOST_STARTED_AT_MS };
     };
     const pushTakeoverStatus = (): void => {
         const o = currentOrigin();
