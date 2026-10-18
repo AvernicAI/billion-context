@@ -967,6 +967,11 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const viewMessages = ctx.compressMessages ?? ctx.messages;
         let viewTokens = 0;
         for (const m of viewMessages) viewTokens += countMessageTokens(m);
+        // #3307: also measure the compressed-view total (ctx.messages = processedMessages).
+        // Logged only, never used — so one capture separates the ~50x view factor (V vs
+        // Vproc) from the residual chars/4-vs-BPE estimator factor without a second trip.
+        let processedViewTokens = 0;
+        for (const m of ctx.messages ?? []) processedViewTokens += countMessageTokens(m);
         const shrinkRatio = viewTokens > 0 ? Math.min(1, r.tokensCompressed / viewTokens) : 0;
         const foldPoint = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0]?.startRef ?? "unknown";
         ctx.session.lastCompress = { at: Date.now(), shrinkRatio, foldPoint, blocks: r.blocksCreated, tokensCompressed: r.tokensCompressed };
@@ -999,7 +1004,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // identity as the inflation source.
         if (newFoldBlocks.length > 0) {
             const xs = newFoldBlocks.map((b) => (b.startRef ? `${b.startRef}=${prefixTokensBeforeRef(ctx.session, b.startRef)}` : `${b.blockId}=none`)).join(" ");
-            ctx.log(`[acp-compress-obs] fold-attribution X(firstFoldStartTokens)=${xs} · V=${viewTokens} Vp=${postCtx} (#3307)`);
+            ctx.log(`[acp-compress-obs] fold-attribution X(firstFoldStartTokens)=${xs} · V=${viewTokens} Vproc=${processedViewTokens} Vp=${postCtx} (#3307)`);
         }
         recordCacheFoldsFromBlocks(ctx.session, newFoldBlocks, { V: viewTokens, Vp: postCtx });
 
