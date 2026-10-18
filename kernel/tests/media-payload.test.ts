@@ -1006,3 +1006,33 @@ test("applyCompression keeps an unrecoverable media tool_result and its paired c
     `pair-withdrawal warning present, got: ${JSON.stringify(result.result.warnings)}`,
   );
 });
+
+test("openai: non-array single-object content never throws (legacy empty-text core)", () => {
+  // #2824 corpus regression: some clients emit a lone content-part object
+  // instead of an array. Pre-#3642 this mapped to stringContent() === ""
+  // with no sidecars; the #3642 per-part rewrite iterated `m.content` and
+  // threw TypeError "m.content is not iterable" — a wire-tolerance break
+  // (buildIncomingImageIndex catches, but every other consumer would not).
+  // Contract: non-array non-string content degrades to the legacy empty-text
+  // core, byte-compatible with the old codec, and coreToOpenai still renders
+  // a round-trippable body.
+  const body = bodyOf([
+    {
+      role: "user",
+      content: {
+        type: "image_url",
+        image_url: { url: DATA_URL },
+      },
+    },
+  ]);
+  const { msgs } = openaiToCore(body);
+  assert.equal(msgs.length, 1, "one core, not a throw");
+  assert.equal(msgs[0]?.contentType, "text");
+  assert.equal(msgs[0]?.text, "", "legacy mapping: stringContent(object) === ''");
+  assert.equal(msgs[0]?.imageBase64, undefined, "no image sidecar from non-array content");
+  const back = coreToOpenai(msgs as Parameters<typeof coreToOpenai>[0]);
+  assert.ok(
+    Array.isArray(back) && back.length >= 1,
+    "round-trip renders",
+  );
+});

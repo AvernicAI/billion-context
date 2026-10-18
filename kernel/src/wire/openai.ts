@@ -92,17 +92,23 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
         // #1205) attach to the preceding text core's plural sidecar so they
         // still round-trip verbatim. A message with only opaque parts keeps
         // the legacy single-core shape (text "" + plural sidecar).
-        if (typeof m.content === "string" || m.content == null) {
+        // Non-array non-string content (a lone part object, or any
+        // degenerate shape some client emits) cannot be iterated — fall
+        // through to the legacy empty-text core instead of throwing (#2824
+        // corpus: wire tolerance). Legacy byte-compat: the pre-#3642 codec
+        // mapped such messages to stringContent(content) === "" with no
+        // sidecars, and ids seeded from "" stay identical.
+        if (typeof m.content === "string" || m.content == null || !Array.isArray(m.content)) {
           const base = deriveCanonicalMessageId(
             "user",
             "text",
-            m.content ?? "",
+            typeof m.content === "string" ? m.content : "",
           );
           msgs.push({
             id: clusters.next(base),
             role: "user",
             contentType: "text",
-            text: m.content ?? "",
+            text: typeof m.content === "string" ? m.content : "",
           });
           break;
         }
