@@ -100,6 +100,7 @@ billion-context/
 │   ├── registry-snapshot.json    # Bundled full models.dev snapshot (offline floor)
 │   ├── session.ts                # Session model + in-memory store (bounded, MAX_SESSIONS)
 │   ├── session-id.ts             # Session identity: client value verbatim + persona fork fingerprint
+│   ├── snapshot-lane.ts          # Proxy-lane snapshot id-pinning: stored ids stamped onto resends, identity-upgrade immunity (#3756)
 │   ├── session-gc.ts             # Session-file GC, opt-in (sessions.gc.* / BILI_SESSION_GC*) (#1082)
 │   ├── persist.ts                # On-disk session persistence (kernel StateStore)
 │   ├── persist-eperm.ts          # EPERM/EACCES write-failure alert layer (#362)

@@ -35,6 +35,7 @@ import { applyImageRescaleItems } from "../image-rescale.js";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions } from "./lane-decisions.js";
+import { pinSnapshotIds } from "../snapshot-lane.js";
 
 export async function prepareResponses(
     parsed: ResponsesRequestBody,
@@ -206,7 +207,9 @@ export async function prepareResponses(
             sysNotes = outcome.notes;
             if (outcome.outbound !== fresh) projection.systemParts = outcome.outbound ? [outcome.outbound] : [];
         }
-        const { msgs } = projection;
+        // #3756: pin historical ids onto the server-side snapshot (proxy lane
+        // only; passthrough byte-identical whenever the lane does not engage).
+        const msgs = pinSnapshotIds({ sessionId, protocol: "responses", pluginMode, msgs: projection.msgs, state: session.state, log });
         originalMessages = msgs;
         if (opts.debug) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);

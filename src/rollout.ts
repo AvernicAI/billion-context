@@ -61,6 +61,15 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // `rollout.features.anthropicThreadsReforge: true` or
     // `BILI_ROLLOUT_ANTHROPIC_THREADS_REFORGE=1`.
     anthropicThreadsReforge: { percent: 0 },
+    // #3756 snapshot lane: proxy-lane outbound history is pinned onto the
+    // server-side unified-store snapshot so historical message ids are never
+    // re-minted by a kernel identity-function change (#3752 R2 root fix).
+    // Default 0% — every session keeps today's derive-on-resend behavior;
+    // unsupported shapes always pass through byte-identical even when on.
+    // Also requires the unified store to be live (shadow or full). Force on
+    // with `rollout.features.proxySnapshotLane: true` or
+    // `BILI_ROLLOUT_PROXY_SNAPSHOT_LANE=1`.
+    proxySnapshotLane: { percent: 0 },
 };
 
 export const BP_MAX = 10_000;

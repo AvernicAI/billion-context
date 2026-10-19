@@ -31,6 +31,7 @@ import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, e
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions } from "./lane-decisions.js";
+import { pinSnapshotIds } from "../snapshot-lane.js";
 
 export async function prepareOpenai(
     parsed: OpenAIRequestBody,
@@ -101,7 +102,10 @@ export async function prepareOpenai(
         // OUT of the fold space: system content is host runtime state and
         // must not feed ids/fingerprints. Capture it and re-inject below —
         // otherwise the proxy would forward payloads without any system.
-        const { msgs, systemText } = openaiToCore(parsed);
+        const { msgs: parsedMsgs, systemText } = openaiToCore(parsed);
+        // #3756: pin historical ids onto the server-side snapshot (proxy lane
+        // only; passthrough byte-identical whenever the lane does not engage).
+        const msgs = pinSnapshotIds({ sessionId, protocol: "openai", pluginMode, msgs: parsedMsgs, state: session.state, log });
         openaiSystemText = systemText;
         warnDroppedOpenaiParts(parsed, sessionId, log);
         // Title-gen side-requests carry their own tiny system — reconciling

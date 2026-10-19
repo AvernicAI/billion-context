@@ -33,6 +33,7 @@ import { countSystemAndToolsTokens, emergencyNudge, emergencyNudgeArmed, project
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectSystem, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions } from "./lane-decisions.js";
+import { pinSnapshotIds } from "../snapshot-lane.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -194,7 +195,10 @@ export async function prepareAnthropic(
     logRawStripCounts(markerCounts, log, sessionId);
 
     try {
-        const { msgs, cacheControls } = anthropicToCore(parsed);
+        const { msgs: parsedMsgs, cacheControls } = anthropicToCore(parsed);
+        // #3756: pin historical ids onto the server-side snapshot before any
+        // downstream metering/mutation (alignment runs on pristine parse bytes).
+        const msgs = pinSnapshotIds({ sessionId, protocol: "anthropic", pluginMode, msgs: parsedMsgs, state: session.state, log });
         originalMessages = msgs;
         // #1320: signature-only thinking blocks bill restored thinking tokens upstream
         // but project as empty text locally — attribute the provider-vs-local residual
