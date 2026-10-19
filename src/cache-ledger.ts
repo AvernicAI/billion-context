@@ -119,7 +119,7 @@ interface LedgerLine {
      *  of host churn). Sparse: omitted unless booked. The seam arm sets `seam`
      *  above instead. Lets the web trajectory chart paint the same bucket
      *  membership the economics card aggregates. */
-    prov?: "ttl" | "side" | "rewind" | "client";
+    prov?: "ttl" | "side" | "rewind" | "client" | "orphan-sweep";
     /** #1535: 1 iff `model` differs from the previous sample's KNOWN model
      *  (unknown sides never flag); marks the re-billed stable prefix on the
      *  first request after a model switch. Sparse: omitted unless set. */
@@ -206,6 +206,13 @@ interface LedgerLine {
 interface CacheLedger {
     v: 1;
     lastBlockId: number;
+    /** #3769: high-water of session.state.sweptOrphanCallIds length — detects a
+     *  proactive failed-compress cleanup between samples so detectSeam can
+     *  attribute a mid-history break to the cleanup instead of "unexplained". */
+    lastSweptCount?: number;
+    /** #3769: orphans swept on the CURRENT sample (0 = none); read by detectSeam's
+     *  orphan-sweep arm, refreshed each recordCacheSample. Transient. */
+    sweepThisSample?: number;
     consumedFoldSeq: number;
     sampleSeq: number;
     foldSeqCounter: number;
@@ -278,6 +285,11 @@ interface CacheLedger {
          *  bili rebuild seam. Charged only when the client arm wins. */
         clientInserts: number;
         clientInsertMissed: number;
+        /** #3769: mid-history breaks attributed to a proactive failed-compress
+         *  cleanup (orphan rotation) landing in-window without a fold claiming
+         *  the break — kept out of the unexplained seam tally. */
+        orphanSweepSeams: number;
+        orphanSweepMissed: number;
         /** #2929: the provider-side arm split by idle gap — samples settled more
          *  than PROVIDER_TTL_GAP_MS after the previous sample are normal TTL
          *  expiry, not an abnormal provider failure. */
@@ -943,6 +955,21 @@ function detectSeam(session: Session, led: CacheLedger): void {
         // Inbound prefix-stable or a clean tail boundary: the outbound
         // mid-list break is bili-side — fall through to the seam bucket.
     }
+    // #3769: a proactive failed-compress cleanup (orphan rotation) landed in this
+    // window. After the fold-gated fix such a cleanup only rides along a committed
+    // fold, which claims its own break above via foldSeq — so reaching here means a
+    // mid-history break coincided with a cleanup WITHOUT any fold/switch/restart/
+    // client arm claiming it. Attribute it to the cleanup rather than leave it
+    // "unexplained". Additive: none of the earlier arms is touched.
+    if ((led.sweepThisSample ?? 0) > 0) {
+        line.prov = "orphan-sweep";
+        agg.orphanSweepSeams += 1;
+        agg.orphanSweepMissed += line.tr;
+        if (agg.orphanSweepSeams === 1) {
+            loggerLog("warn", `[${session.id}] [cache-seam] mid-history break attributed to proactive failed-compress cleanup (${led.sweepThisSample} record(s) rotated out, #3769): hit ${line.hitPct}% (unexplained=${Math.round(line.tr)} tok) — no fold claimed this break`);
+        }
+        return;
+    }
     agg.seamSuspects += 1;
     agg.seamMissed += line.tr;
     line.seam = 1;
@@ -974,7 +1001,7 @@ export function getCacheLedger(session: Session): CacheLedger {
             "restartDropMissed", "attributedMissed", "unknownSamples", "unknownInput",
             "nbSamples", "nbInput",
             "seamSuspects", "seamMissed",
-            "providerSideMisses", "providerSideMissed", "providerTtlMisses", "providerTtlMissed", "rewinds", "rewindMissed", "abortCorrelated", "clientInserts", "clientInsertMissed",
+            "providerSideMisses", "providerSideMissed", "providerTtlMisses", "providerTtlMissed", "rewinds", "rewindMissed", "abortCorrelated", "clientInserts", "clientInsertMissed", "orphanSweepSeams", "orphanSweepMissed",
         ] as const) {
             if (typeof g[key] !== "number") g[key] = 0;
         }
@@ -991,7 +1018,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         foldSeqCounter: 0,
         folds: [],
         lines: [],
-        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, effSwitches: 0, effSwitchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0, clientInserts: 0, clientInsertMissed: 0 },
+        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, effSwitches: 0, effSwitchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0, clientInserts: 0, clientInsertMissed: 0, orphanSweepSeams: 0, orphanSweepMissed: 0 },
     };
     meta[LEDGER_KEY] = led;
     return led;
@@ -1040,6 +1067,22 @@ function detectNewFolds(session: Session, led: CacheLedger): void {
     }
 }
 
+// #3769: sweptOrphanCallIds is monotonic, so its length high-water makes growth
+// exact. detectSeam's orphan-sweep arm reads sweepThisSample set here.
+function detectOrphanSweeps(session: Session, led: CacheLedger): void {
+    const n = session.state?.sweptOrphanCallIds?.length ?? 0;
+    // First observation only baselines: a resumed session's pre-existing sweeps
+    // must not be charged to the current sample.
+    if (led.lastSweptCount === undefined) {
+        led.lastSweptCount = n;
+        led.sweepThisSample = 0;
+        return;
+    }
+    const delta = n - led.lastSweptCount;
+    led.lastSweptCount = n;
+    led.sweepThisSample = delta > 0 ? delta : 0;
+}
+
 /** Record one provider usage report into the session ledger. `input` must be
  *  NORMALIZED (cached included — promptInputTotal semantics). `cached === null`
  *  means the provider reported NO cache-hit tokens (unmeasurable): such samples
@@ -1051,6 +1094,7 @@ export function recordCacheSample(
 ): void {
     const led = getCacheLedger(session);
     detectNewFolds(session, led);
+    detectOrphanSweeps(session, led);
     const prevLine = led.lines[led.lines.length - 1];
     // #1536: unknown-cache samples still need a prev/cur pair so the fold chain
     // stays consistent, but decompose with cached=0 then QUARANTINE every derived
@@ -1702,7 +1746,7 @@ interface BodyStability {
 interface BiliCacheReport extends CacheReport {
     stability: BodyStability;
     /** #2131: line set widened with the per-call body-stability fields. */
-    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; efp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" | "client" }>;
+    lines: Array<CacheReportLine & { bodyDigest?: string; bodyEqual?: 0 | 1; bodyLcp?: number; bodyClass?: "head" | "append" | "mid" | "tail" | "unknown"; keyFp?: string; sysFp?: string; efp?: string; seam?: 1; prov?: "ttl" | "side" | "rewind" | "client" | "orphan-sweep" }>;
     modelSwitches: ModelSwitchStats;
     /** #3803: host generation-parameter switches (reasoning effort / thinking config) — a provider cache-namespace flip that re-bills the whole stable prefix once, distinct from any byte change. */
     effSwitches: ModelSwitchStats;
@@ -1726,7 +1770,7 @@ interface BiliCacheReport extends CacheReport {
      *  is booked as new content, never as a prefix re-pay. */
     initialBills: { samples: number; inputTokens: number };
     invalidation: InvalidationTokenBreakdown;
-    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; providerTtl: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number; client: { count: number; missed: number } };
+    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; providerTtl: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number; client: { count: number; missed: number }; orphanSweep: { count: number; missed: number } };
 }
 
 export function buildSessionCacheReport(session: Session): BiliCacheReport {
@@ -1913,7 +1957,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         initialBills: { samples: a.nbSamples, inputTokens: a.nbInput },
         invalidation,
         stability,
-        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated, client: { count: a.clientInserts, missed: a.clientInsertMissed } },
+        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated, client: { count: a.clientInserts, missed: a.clientInsertMissed }, orphanSweep: { count: a.orphanSweepSeams, missed: a.orphanSweepMissed } },
     };
 }
 
@@ -2086,6 +2130,10 @@ function formatSeam(r: BiliCacheReport): string {
         for (const e of r.seam.events) {
             if (e.client) out.push(`    #${e.seq} ${fmtTime(e.at)} hit ${e.hitPct.toFixed(1)}% · input ${fmtTok(e.input)} · inbound message[${e.client.idx}] ${e.client.role}/${e.client.cls} ${e.client.len}B JSON · outbound ${fmtTok(e.lcpBytes)}B @ message[${e.msgIndex ?? "?"}] of ${e.prevMsgs}→${e.curMsgs}`);
         }
+    }
+    if (r.seam.orphanSweep.count > 0) {
+        out.push("🧹 ORPHAN CLEANUP SEAM (proactive failed-compress rotation — #3769)");
+        out.push(`  ${r.seam.orphanSweep.count} sample(s) · ${fmtTok(r.seam.orphanSweep.missed)} tok re-billed when failed-compress records were rotated out of history without a fold claiming the break — bili's own cleanup, not an upstream or host rewrite`);
     }
     if (r.seam.abortCorrelated > 0) {
         out.push("⏻ ABORT-CORRELATED");
