@@ -57,8 +57,8 @@ function withBlock(s: Session, blockId: string, summary: string, fullText: strin
 }
 
 /** Writes N distinct sessions into dir through the real persistence path
- *  (JSON envelope + unified sidecar double-write under the default shadow
- *  mode) and closes the store, exactly like a finished proxy process would. */
+ *  (JSON envelope + unified sidecar double-write) and closes the store,
+ *  exactly like a finished proxy process would. */
 async function seed(dir: string, ids: Array<{ id: string; ageMs?: number; big?: boolean }>): Promise<void> {
     const store = new SessionStore({ dir, enabled: true, debounceMs: 0 });
     for (const spec of ids) {
@@ -303,6 +303,16 @@ test("sessions rm refuses pinned checkpoints, --force deletes but keeps the pinn
         withBlock(s, "b0-pin", "summary pin", "body pin");
         await store.writeNow(s);
         store.createReplica("pin-target", { label: "pin-a", pinned: true });
+        const preStats = store.unifiedSessionStorageStats("pin-target");
+        assert.ok(preStats);
+        assert.equal(preStats.rows.pinnedCheckpoints, 1);
+        const dbPre = dbHandle(dir);
+        const cpRow = dbPre.prepare("SELECT state_hash FROM checkpoints WHERE session_id = ? AND pinned = 1").get("pin-target") as { state_hash: string };
+        const blobLen = (dbPre.prepare("SELECT byte_len AS b FROM content WHERE hash = ?").get(cpRow.state_hash) as { b: number }).b;
+        // Pinned state blobs survive deletion by design, so they must NOT be
+        // counted as CAS bytes the delete would free (ls --with-sizes attribution).
+        assert.ok(preStats.casExclusiveBytes < blobLen, `exclusive ${preStats.casExclusiveBytes} should exclude the pinned blob (${blobLen})`);
+        dbPre.close();
         store.closeQuietly();
 
         const refused = await runSessionsCommand({ sub: "rm", dir, target: "pin-target", withSizes: false, force: false, vacuum: true, json: false });
@@ -358,6 +368,33 @@ test("legacy mode degrades to JSON-only deletion", async () => {
         assert.doesNotMatch(res.text, /VACUUM/);
         assert.ok(!existsSync(path.join(dir, relPathFor("leg-one", PROTO, ORIGIN))), "expected file absent");
         assert.ok(!existsSync(path.join(dir, "index.db")), "expected file absent");
+    } finally {
+        g.restore();
+        rmrf(dir);
+        rmrf(stateHome);
+    }
+});
+
+test("full mode with jsonWriter=off deletes index-only sessions (rows only)", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-cleanup-full-"));
+    const stateHome = mkdtempSync(path.join(tmpdir(), "bili-cleanup-full-state-"));
+    const g = guardEnv({ BILI_STORAGE_UNIFIED: "full", BILI_STORAGE_JSON_WRITER: "off", XDG_STATE_HOME: stateHome });
+    try {
+        await seed(dir, [{ id: "full-only" }]);
+        assert.ok(!existsSync(path.join(dir, relPathFor("full-only", PROTO, ORIGIN))), "expected envelope absent");
+        assert.ok(!existsSync(path.join(dir, relPathFor("full-only"))), "expected envelope absent");
+        const dbBefore = dbHandle(dir);
+        assert.ok(count(dbBefore, "messages", "session_id = ?", "full-only") >= 1, "expected index rows present");
+        dbBefore.close();
+
+        const res = await runSessionsCommand({ sub: "rm", dir, target: "full-only", withSizes: false, force: false, vacuum: true, json: false });
+        assert.equal(res.code, 0);
+        assert.match(res.text, /deleted session full-only/);
+        const dbAfter = dbHandle(dir);
+        assert.equal(count(dbAfter, "sessions", "session_id = ?", "full-only"), 0);
+        assert.equal(count(dbAfter, "messages", "session_id = ?", "full-only"), 0);
+        assert.equal(count(dbAfter, "blocks", "session_id = ?", "full-only"), 0);
+        dbAfter.close();
     } finally {
         g.restore();
         rmrf(dir);
