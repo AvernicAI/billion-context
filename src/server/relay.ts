@@ -828,7 +828,27 @@ export async function forward(
             // accept it as rescue-grade, everything else usage-gated keeps
             // excluding it. A real usage report on the next successful turn
             // overwrites it.
-            s.stats.lastInputTokens = info.window;
+            //
+            // #3738: the armed value must be ≤ the limit the kernel actually
+            // JUDGES against, or the arm can never trigger the fold it
+            // exists to cause. The kernel compares the payload to
+            // `session.metadata.effectiveContextLimit` — the
+            // output-headroom-RESERVED window (handle.ts:2137
+            // `reserveOutputHeadroom`), e.g. 1,048,576 - 256,000 = 792,576 —
+            // while `info.window` is the RAW stated window (1,048,576). A
+            // live limb hit exactly this: upstream 400 "maximum context
+            // length is 1048576 ... you requested 1097304 (841304 in the
+            // messages, 256000 in the completion)", the arm sat at 1,048,576
+            // which is ABOVE the 792,576 judging limit, so the emergency /
+            // over-limit bands read the arm as "still fits" and the client
+            // re-sent the same oversized history every turn — 400 forever.
+            // Clamping to min(stated, reserved) keeps the arm upstream-truth
+            // when the two agree, and only bites when a reservation exists.
+            const judgingLimit = typeof s.metadata.effectiveContextLimit === "number" && s.metadata.effectiveContextLimit > 0
+                ? s.metadata.effectiveContextLimit
+                : 0;
+            const armedWindow = judgingLimit > 0 && judgingLimit < info.window ? judgingLimit : info.window;
+            s.stats.lastInputTokens = armedWindow;
             s.stats.lastInputTokensSource = "overflow-arm";
             // #2313: the rejection came from THIS upstream — stamp the
             // evidence origin so the #1933 F2 route gate (and the #2313
@@ -837,8 +857,8 @@ export async function forward(
             s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(upstreamUrl);
             // #1110: record the arm SEPARATELY so the side-request guard
             // can read it without ever touching the nudge baseline.
-            s.stats.overflowArmTokens = info.window;
-            log("warn", `[${s.id}] upstream context overflow (model=${reqModel ?? "unknown"}) — window ${info.window} stated upstream; armed emergency shrink, declared window unchanged (#987)`);
+            s.stats.overflowArmTokens = armedWindow;
+            log("warn", `[${s.id}] upstream context overflow (model=${reqModel ?? "unknown"}) — window ${info.window} stated upstream; armed emergency shrink at ${armedWindow}${armedWindow === info.window ? "" : ` (clamped to the output-headroom-reserved judging limit ${judgingLimit})`}, declared window unchanged (#987)`);
         } else {
             // No window number stated — nothing to learn (and #987
             // removed the learner anyway), but the rejection itself is

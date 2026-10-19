@@ -40,7 +40,7 @@ import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from ".
 import { executeThreadsReforge } from "./threads-lane.js";
 import { resetThreadTailTracking } from "./thread-tracking.js";
 import { resolveClaudeTranscriptLineage } from "../claude-transcript-lineage.js";
-import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputMatches, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
+import { consumePluginRegisterFor, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginReportedModel, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, publicForkInputCheck, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "../plugin.js";
 import { scheduleAffinityPersist } from "../affinity-persist.js";
 import { evaluateChain, extractChainCarriers } from "../chain-checkpoint.js";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, isLoopbackAddress, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, type WireProtocol } from "../util.js";
@@ -1329,10 +1329,17 @@ async function handleRequest(
             acquireInFlight(session);
             try {
                 const accepted = await withSessionLock(session, () => {
-                    publicForkPrefix = publicForkInputMatches(session, protocol, parsed);
-                    if (publicForkPrefix || session.stats.requests > 0) return true;
+                    const verdict = publicForkInputCheck(session, protocol, parsed);
+                    if (verdict.ok || session.stats.requests > 0) {
+                        publicForkPrefix = true;
+                        return true;
+                    }
+                    // #3741: the 409 used to be a total blind spot — classify the
+                    // mismatch server-side and echo the detail back so the client
+                    // log alone points at the cause (id drift vs flag drift vs shape).
+                    loggerLog("warn", `[fork-prefix] ${sessionId}: first child request rejected — ${verdict.reason} (protocol=${protocol})`);
                     res.writeHead(409, { "content-type": "application/json" });
-                    res.end(JSON.stringify({ ok: false, code: "FORK_PREFIX_CONFLICT", error: "first child request does not match its inherited ordered prefix" }));
+                    res.end(JSON.stringify({ ok: false, code: "FORK_PREFIX_CONFLICT", error: "first child request does not match its inherited ordered prefix", detail: verdict.reason }));
                     return false;
                 });
                 if (!accepted) return;

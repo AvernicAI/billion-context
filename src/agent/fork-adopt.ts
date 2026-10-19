@@ -21,7 +21,7 @@ import { ACP_NAME_ALT } from "../loop/tag-echo-filter.js";
  *
  * HASH PARITY CONTRACT: forkStableJson/forkIdentityHashOf/forkOrderHashOf
  * below are byte-for-byte replicas of src/plugin.ts stableJson/
- * forkMessageIdentityHash/forkOrderHash. The server's publicForkInputMatches
+ * forkMessageIdentityHash/forkOrderHash. The server's publicForkInputCheck
  * rejects the child's first request (409 FORK_PREFIX_CONFLICT) when the
  * replayed prefix does not hash-match the receipt, so any drift here poisons
  * the child conversation permanently. The parity is pinned by

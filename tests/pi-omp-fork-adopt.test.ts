@@ -612,7 +612,7 @@ test("full chain: responses-wire child adopts an openai-seeded parent (#2469 sta
         // stamped request) needs a mock that speaks the responses SSE wire;
         // it is covered generically by the openai full chain above plus the
         // parity test pinning this body's client/server identity equality —
-        // exactly what publicForkInputMatches compares.
+        // exactly what publicForkInputCheck compares.
     } finally {
         await h.close();
     }

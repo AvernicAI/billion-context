@@ -1015,22 +1015,57 @@ function sameSnapshotView(a: CoreMessage, b: CoreMessage): boolean {
         && forkToolIsError(a) === forkToolIsError(b);
 }
 
-/** Read under the session lock; compare ordered semantics, never just an id set. */
-export function publicForkInputMatches(session: Session, protocol: WireProtocol, parsed: unknown): boolean {
+/** #3741: classified verdict of the first-request inherited-prefix gate.
+ *  `reason` is a stable failure class plus minimal evidence — safe to log and
+ *  echo to the client (truncated ids/hashes only, never message content).
+ *  Each evidence part appears only when ITS OWN check failed — a cell whose ref
+ *  mapping was pruned (id+hash intact) reports ref-broken alone, not drift. */
+type PublicForkPrefixVerdict = { ok: true } | { ok: false; reason: string };
+
+const FORK_PREFIX_ID_PREVIEW = 16;
+const FORK_PREFIX_HASH_PREVIEW = 12;
+
+function forkPrefixPreview(value: string): string {
+    return value.length > 0 ? value.slice(0, FORK_PREFIX_ID_PREVIEW) : "-";
+}
+
+/** Read under the session lock; compare ordered semantics, never just an id set.
+ *  #3741: returns a classified verdict instead of a bare boolean — the 409 path
+ *  was a total diagnostic blind spot. The classes separate the three drift
+ *  shapes that matter for triage: id-drift (re-minted/renormalized history —
+ *  version skew or host body rewrite), hash-drift-under-same-id (adapter-attached
+ *  flags like toolIsError flipped under unchanged bytes), and structural shape
+ *  changes (shorter replay, unmappable body). Any unexpected error stays
+ *  fail-closed exactly as before. */
+export function publicForkInputCheck(session: Session, protocol: WireProtocol, parsed: unknown): PublicForkPrefixVerdict {
     const prefix = session.pluginSnapshot;
-    if (session.metadata.publicForkReceipt === undefined || !prefix) return false;
+    if (session.metadata.publicForkReceipt === undefined) return { ok: false, reason: "receipt-missing" };
+    if (!prefix) return { ok: false, reason: "snapshot-missing" };
     try {
         const incoming = incomingCoreMessages(protocol, parsed);
-        return incoming !== null && incoming.length >= prefix.length && prefix.every((message, index) => {
+        if (incoming === null) return { ok: false, reason: `incoming-unmappable (protocol=${protocol})` };
+        if (incoming.length < prefix.length) return { ok: false, reason: `prefix-longer-than-incoming (expected=${prefix.length} incoming=${incoming.length})` };
+        for (let index = 0; index < prefix.length; index += 1) {
+            const expected = prefix[index]!;
             const candidate = incoming[index]!;
-            const ref = session.state.messageRefs.byRaw[message.id];
+            const ref = session.state.messageRefs.byRaw[expected.id];
             // #2620: protected tool calls/results carry the kernel BLOCKED sentinel (no numeric
             // ref, byRef never holds it) — a legitimate state, not a broken mapping.
-            return ref !== undefined && (ref === BLOCKED_REF || session.state.messageRefs.byRef[ref] === message.id)
-                && candidate.id === message.id && forkMessageIdentityHash(candidate) === forkMessageIdentityHash(message);
-        });
-    } catch {
-        return false;
+            const refOk = ref !== undefined && (ref === BLOCKED_REF || session.state.messageRefs.byRef[ref] === expected.id);
+            const idOk = candidate.id === expected.id;
+            const expectedHash = forkMessageIdentityHash(expected);
+            const candidateHash = forkMessageIdentityHash(candidate);
+            if (!refOk || !idOk || candidateHash !== expectedHash) {
+                const parts = [`cell-mismatch@${index}`];
+                if (!refOk) parts.push(`ref-broken (rawId=${forkPrefixPreview(expected.id)} ref=${ref ?? "MISSING"})`);
+                if (!idOk) parts.push(`id-drift expected=${forkPrefixPreview(expected.id)} got=${forkPrefixPreview(candidate.id)}`);
+                else if (candidateHash !== expectedHash) parts.push(`hash-drift-under-same-id role=${candidate.role} expected-hash=${expectedHash.slice(0, FORK_PREFIX_HASH_PREVIEW)} got-hash=${candidateHash.slice(0, FORK_PREFIX_HASH_PREVIEW)}`);
+                return { ok: false, reason: parts.join(" ") };
+            }
+        }
+        return { ok: true };
+    } catch (err) {
+        return { ok: false, reason: `projection-error (${err instanceof Error ? err.message : String(err)})` };
     }
 }
 
