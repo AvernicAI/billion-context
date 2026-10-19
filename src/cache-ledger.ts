@@ -1014,6 +1014,40 @@ export function recordCacheSample(
         viewBefore: f.V,
         viewAfter: f.Vp,
     }));
+    // #3307 P2-A: f.X (firstFoldStartTokens) is prefixTokensBeforeRef over the
+    // client's UN-SHRUNKEN resent history — for a stateless proxy client that far
+    // exceeds the billed input, so decomposeSample zeroes structuralExcess and the
+    // fold's re-pay falls into the unattributed seam bucket. When a genuine
+    // bili-side mid-history break is present, measure the stable prefix straight
+    // off the wire instead: the byte-LCP between this outbound and the previous
+    // marks where a summary replaced folded content, so (lcpBytes / cur.bytes) *
+    // billed input is a same-space lower bound on the pre-fold prefix. min() with
+    // the snapshot X leaves already-correct folds untouched. Gated to mid-list
+    // breaks only (a tail append lands lcpBytes near the end -> xMeasured ~= input
+    // -> no effect) and never on a client-side inbound rewrite (#3023), whose
+    // earlier divergence would understate the fold and mis-credit it.
+    if (pending.length > 0 && known && s.input > 0) {
+        const rawMissed = s.input - effCached;
+        if (rawMissed > 8192 && rawMissed > 0.3 * s.input) {
+            const curB = session.transient?.sentBody;
+            const prevB = session.transient?.settledBody;
+            if (curB !== undefined && prevB !== undefined && curB.bytes <= SEAM_BODY_CAP && prevB.bytes <= SEAM_BODY_CAP) {
+                const curIn = session.transient?.inBody;
+                const prevIn = session.transient?.settledInBody;
+                const clientBreak = curIn !== undefined && prevIn !== undefined && curIn.msgs <= INBOUND_MSG_CAP && prevIn.msgs <= INBOUND_MSG_CAP && (() => {
+                    const k = firstDivergentInboundMsg(prevIn, curIn);
+                    return k !== null && k < Math.min(prevIn.msgs, curIn.msgs);
+                })();
+                if (!clientBreak) {
+                    const lcp = seamLcp(prevB.head, curB.head);
+                    if (lcp.msgIndex !== null && lcp.prevMsgs > 0 && lcp.msgIndex < lcp.prevMsgs && lcp.lcpBytes > 0 && lcp.lcpBytes < curB.head.byteLength) {
+                        const xMeasured = Math.round(s.input * (lcp.lcpBytes / curB.bytes));
+                        for (const p of pending) p.firstFoldStartTokens = Math.min(p.firstFoldStartTokens ?? Number.POSITIVE_INFINITY, xMeasured);
+                    }
+                }
+            }
+        }
+    }
     const rawDec = decomposeSample(
         prevLine ? { at: prevLine.at, input: prevLine.input, cached: prevLine.cached } : null,
         { at: s.at, input: s.input, cached: effCached },
