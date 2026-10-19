@@ -309,6 +309,29 @@ test("route-root compress-key warning fires once per signature across reloads (#
     assert.equal(warnings.filter((w) => w.includes('"https://cap-reload.example"')).length, 1);
 });
 
+test("route-root externalSummary warns like every other compress-block key (#3876)", (t) => {
+    const warnings = captureWarnings(t);
+    withConfigFile(t, {
+        capSum: { externalSummary: { enabled: true, targets: ["glm/glm-4.9-flash"] } },
+    });
+    const routes = loadRoutes();
+    assert.ok("capSum" in routes);
+    assert.equal(routes["capSum"].compress, undefined, "the inert root field must not leak into a compress block");
+    assert.equal(warnings.length, 1);
+    for (const needle of ['"capSum"', "externalSummary", ".compress"]) {
+        assert.ok(warnings[0].includes(needle), `warning should mention ${needle}: ${warnings[0]}`);
+    }
+});
+
+test("externalSummary under compress (the right place) produces no route-root complaint (#3876)", (t) => {
+    const warnings = captureWarnings(t);
+    withConfigFile(t, {
+        capSumOk: { compress: { externalSummary: { enabled: false } } },
+    });
+    loadRoutes();
+    assert.ok(!warnings.some((w) => w.includes("externalSummary")), `no route-root complaint expected for a correctly placed chain: ${warnings.join(" | ")}`);
+});
+
 test("web config API still rejects legacy, invalid-proxy, and non-object entries", async (t) => {
     captureWarnings(t);
     withConfigFile(t, {});
