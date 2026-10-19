@@ -24,7 +24,7 @@
  */
 
 import type { BootstrapOutcome, CooldownMarker } from "./engine-bootstrap.js";
-import { COOLDOWN_MS, nodeSqliteUpgradeHint, readBootstrapFailureMarker } from "./engine-bootstrap.js";
+import { bootstrapFailureMarkerPath, COOLDOWN_MS, nodeSqliteUpgradeHint, readBootstrapFailureMarker } from "./engine-bootstrap.js";
 import { fileStorageAutoDownload, fileStorageJsonWriter, fileStorageUnified, fileStorageWalJournalSizeLimit, resolveStorageMode } from "../knobs.js";
 import { MAX_CONSECUTIVE_FAILURES, type UnifiedShadow } from "./shadow.js";
 import type { StorageMode } from "./shadow.js";
@@ -33,13 +33,15 @@ interface RuntimeState {
     /** Recorded by the SessionStore constructor; null only before first store build. */
     requested: StorageMode | null;
     encryptionBlocked: boolean;
+    /** #3135 ②/#3818: persistence disabled (BILI_PERSIST=0 / enabled:false) — intentional legacy-only, never warns. */
+    persistDisabled: boolean;
     sidecar: UnifiedShadow | null;
     sidecarOpenError: string | null;
     bootstrap: BootstrapOutcome | null;
 }
 
 function freshState(): RuntimeState {
-    return { requested: null, encryptionBlocked: false, sidecar: null, sidecarOpenError: null, bootstrap: null };
+    return { requested: null, encryptionBlocked: false, persistDisabled: false, sidecar: null, sidecarOpenError: null, bootstrap: null };
 }
 
 let state: RuntimeState = freshState();
@@ -58,9 +60,10 @@ export function recordSidecarInstance(shadow: UnifiedShadow): void {
     state.sidecarOpenError = null;
 }
 
-export function recordRequestedMode(mode: StorageMode, encryptionBlocked: boolean): void {
+export function recordRequestedMode(mode: StorageMode, encryptionBlocked: boolean, persistDisabled = false): void {
     state.requested = mode;
     state.encryptionBlocked = encryptionBlocked;
+    state.persistDisabled = persistDisabled;
 }
 
 export function _resetStorageRuntimeStatusForTest(): void {
@@ -125,7 +128,7 @@ interface StorageRuntimeStatus {
     effective: "legacy" | "shadow" | "full";
     /** Requested a unified mode but the sidecar is not carrying data. */
     degraded: boolean;
-    /** BILI_ENCRYPTION_KEY opt-out — intentional legacy-only, never warns. */
+    /** BILI_ENCRYPTION_KEY opt-out or disabled persistence — intentional legacy-only, never warns. */
     intentionalOptOut: boolean;
     /** Human-readable degrade cause (set iff degraded). */
     reason: string | null;
@@ -136,13 +139,20 @@ interface StorageRuntimeStatus {
     sidecarDisabled: boolean;
     sidecarLastError: string | null;
     indexDbOpenError: string | null;
+    /** #3135 ④/#3818: sampled digest-drift counter (observable, not just logged). */
+    verifyDrift: number;
+    /** #3135 ④/#3818: sessions currently served from the JSON envelope because the index view drifted. */
+    driftedSessions: number;
 }
 
 function getStorageRuntimeStatus(): StorageRuntimeStatus {
     // Fallback before the first SessionStore build: full knob resolution
     // (a running server always has a store, so this path is defensive).
     const requested = state.requested ?? resolveStorageMode(process.env, fileStorageUnified());
-    const intentionalOptOut = state.encryptionBlocked;
+    // #3135 ②/#3818: both "the user turned this off on purpose" flavors —
+    // encryption opt-out and disabled persistence — are intentional and must
+    // never surface as a degrade.
+    const intentionalOptOut = state.encryptionBlocked || state.persistDisabled;
     const sidecar = state.sidecar;
     const disabled = !!sidecar?.stats.disabled;
     // healthy sidecar ⇒ its mode === requested (maybeOpen opens only under
@@ -164,6 +174,12 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
         sidecarDisabled: disabled,
         sidecarLastError: sidecar?.stats.disabled ? sidecar.stats.lastError : null,
         indexDbOpenError: state.sidecarOpenError,
+        // #3135 ④/#3818: the sampled digest-drift counter — once the index is
+        // the default load path (full), drift must be OBSERVABLE, not just a
+        // log line; drifted sessions are served from the JSON envelope
+        // (persist.ts loadSync) while the envelope still exists.
+        verifyDrift: sidecar?.stats.verifyDrift ?? 0,
+        driftedSessions: sidecar?.driftedSessions.size ?? 0,
     };
 }
 
@@ -180,6 +196,9 @@ interface StorageStatusWire {
     bootstrapFailure: { atMs: number; reason: string } | null;
     cooldownRemainingMs: number | null;
     sidecarDisabled: boolean;
+    /** #3135 ④/#3818: drift observability on the wire. */
+    verifyDrift: number;
+    driftedSessions: number;
 }
 
 export function storageStatusWire(): StorageStatusWire {
@@ -195,6 +214,8 @@ export function storageStatusWire(): StorageStatusWire {
         bootstrapFailure: st.bootstrapFailure,
         cooldownRemainingMs: st.cooldownRemainingMs,
         sidecarDisabled: st.sidecarDisabled,
+        verifyDrift: st.verifyDrift,
+        driftedSessions: st.driftedSessions,
     };
 }
 
@@ -216,7 +237,10 @@ export function storageDiagnosticsLines(ctx: { sessions: number; storageLogLines
         ...(st.degraded && st.reason ? [`degrade reason: ${st.reason}`] : []),
         `engine: ${st.engine ? `${st.engine.name}/${st.engine.source}` : "none"}`,
         `engine bootstrap: ${st.bootstrap ?? "not run"}`,
-        ...(st.bootstrapFailure ? [`bootstrap failure marker: at=${new Date(st.bootstrapFailure.atMs).toISOString()} reason="${st.bootstrapFailure.reason}"${st.cooldownRemainingMs ? ` (cooldown ~${Math.round(st.cooldownRemainingMs / 60_000)}m remaining)` : ""}`] : []),
+        ...(st.bootstrapFailure ? [
+            `bootstrap failure marker: at=${new Date(st.bootstrapFailure.atMs).toISOString()} reason="${st.bootstrapFailure.reason}"${st.cooldownRemainingMs ? ` (cooldown ~${Math.round(st.cooldownRemainingMs / 60_000)}m remaining, until ${new Date(st.bootstrapFailure.atMs + COOLDOWN_MS).toISOString()})` : ""}`,
+            `force immediate retry: delete ${bootstrapFailureMarkerPath()} and restart`,
+        ] : []),
         `BILI_STORAGE_UNIFIED: ${env.BILI_STORAGE_UNIFIED ?? "(unset)"}`,
         `storage.unified (config file): ${fileUnified ?? "(unset)"}`,
         `BILI_STORAGE_JSON_WRITER: ${env.BILI_STORAGE_JSON_WRITER ?? "(unset)"}`,

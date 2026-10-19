@@ -305,31 +305,50 @@ withSessionsDir("tokensSaved derives from active blocks when the stat is dead (#
 });
 
 withSessionsDir("session detail surfaces the per-file storage-mode stamp (#2671)", async (dir) => {
-    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
     const saved: Array<string | undefined> = [process.env.BILI_STORAGE_UNIFIED, process.env.BILI_ENCRYPTION_KEY];
     const setEnv = (unified: string | undefined, key: string | undefined) => {
         if (unified === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = unified;
         if (key === undefined) delete process.env.BILI_ENCRYPTION_KEY; else process.env.BILI_ENCRYPTION_KEY = key;
     };
+    // #3818/#3135-3: the stamp reflects what the STORE INSTANCE actually
+    // managed to open (liveStorageStamp), not the knob value at write time —
+    // so each leg builds its own store AFTER pinning the env. The
+    // stamp-plumbing leg pins shadow explicitly (absent everywhere now
+    // defaults to FULL and is asserted in tests/storage-full-flip.test.ts ①).
     try {
-        // no knob → the shadow DEFAULT stamps shadow (#2815 rollout flip)
-        setEnv(undefined, undefined);
-        await store.writeNow(makeSession("sm-default", { protocol: "openai" }));
+        setEnv("shadow", undefined);
+        let leg = new SessionStore({ dir, debounceMs: 0, enabled: true });
+        await leg.writeNow(makeSession("sm-default", { protocol: "openai" }));
+        leg.closeQuietly();
         // full → full stamp
         setEnv("full", undefined);
-        await store.writeNow(makeSession("sm-full", { protocol: "openai" }));
+        leg = new SessionStore({ dir, debounceMs: 0, enabled: true });
+        await leg.writeNow(makeSession("sm-full", { protocol: "openai" }));
+        leg.closeQuietly();
         // full requested but encryption blocks the sidecar → honest legacy stamp
         setEnv("full", "00".repeat(32));
-        await store.writeNow(makeSession("sm-blocked", { protocol: "openai" }));
+        leg = new SessionStore({ dir, debounceMs: 0, enabled: true });
+        await leg.writeNow(makeSession("sm-blocked", { protocol: "openai" }));
+        leg.closeQuietly();
     } finally {
         setEnv(saved[0], saved[1]);
     }
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     _resetDiskCacheForTest();
-    assert.equal((await buildSessionDetail("sm-default"))?.storageMode, "shadow", "absent everywhere now defaults to shadow");
+    assert.equal((await buildSessionDetail("sm-default"))?.storageMode, "shadow", "explicit shadow stamps shadow");
     assert.equal((await buildSessionDetail("sm-full"))?.storageMode, "full");
-    assert.equal((await buildSessionDetail("sm-blocked"))?.storageMode, "legacy", "blocked-by-encryption writes no db copy → stamps legacy");
+    // #3818: per-leg stores mean the blocked leg's file is genuinely
+    // ENCRYPTED (full + key at write time) — read it back with the key.
+    // Reset the disk cache: the keyless reads above may have cached the
+    // unreadable encrypted file as a miss.
+    process.env.BILI_ENCRYPTION_KEY = "00".repeat(32);
+    try {
+        _resetDiskCacheForTest();
+        assert.equal((await buildSessionDetail("sm-blocked"))?.storageMode, "legacy", "blocked-by-encryption writes no db copy → stamps legacy");
+    } finally {
+        if (saved[1] === undefined) delete process.env.BILI_ENCRYPTION_KEY; else process.env.BILI_ENCRYPTION_KEY = saved[1]!;
+    }
 });
 
 withSessionsDir("#3093: live (never-persisted) sessions carry the provenance stamps", async (_dir) => {

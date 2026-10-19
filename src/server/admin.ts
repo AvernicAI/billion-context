@@ -27,7 +27,7 @@ import { isLoopbackAddress } from "../util.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts } from "../upstream-alerts.js";
 import { pckAblations } from "../pck-probe.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, recordUpstreamConnection, resetProxyCache, resolveProxyDecision } from "../upstream-proxy.js";
-import { detectStaleInstall } from "../update.js";
+import { detectStaleInstall, getLastInstall } from "../update.js";
 import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
 import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI } from "../web/index.js";
@@ -935,8 +935,13 @@ function updateReadyPayload(): { kind: "available" | "ready"; version: string; s
 async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
     let diskVersion: string | undefined;
     let stale = false;
+    let lastInstall: Awaited<ReturnType<typeof getLastInstall>>;
     try {
         ({ diskVersion, stale } = await detectStaleInstall(PACKAGE_NAME, VERSION));
+        // #3754: which channel put the on-disk version there — fresh read per
+        // call so installs done by other processes are visible too. Fail-open
+        // inside getLastInstall (absent/corrupt → undefined).
+        lastInstall = await getLastInstall();
     } catch {
         // fs hiccup: report running state only, never fail the status endpoint
     }
@@ -948,7 +953,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), attribution: attributionStatusWire() }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, commit: BUILD_COMMIT, diskVersion, stale, lastInstall, updateReady: updateReadyPayload(), autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), updatePolicy: updatePolicyPayload(), pluginAdvisories: detectCostAdvisories(process.env), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), storage: storageStatusWire(), attribution: attributionStatusWire() }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:
@@ -975,8 +980,11 @@ function sendResignStatus(res: http.ServerResponse): void {
 async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
     let diskVersion: string | undefined;
     let stale = false;
+    let lastInstall: Awaited<ReturnType<typeof getLastInstall>>;
     try {
         ({ diskVersion, stale } = await detectStaleInstall(PACKAGE_NAME, VERSION));
+        // #3754: same single-source read as sendStatus (#2152 parity).
+        lastInstall = await getLastInstall();
     } catch {
         // fs hiccup: report running state only, never fail the overview endpoint
     }
@@ -996,6 +1004,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         commit: BUILD_COMMIT,
         diskVersion,
         stale,
+        lastInstall,
         updateReady: updateReadyPayload(),
         autoRestartOnUpdate: opts.autoRestartOnUpdate,
         advisory: currentAdvisoryPayload(),

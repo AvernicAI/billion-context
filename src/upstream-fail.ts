@@ -86,6 +86,58 @@ export function classifyUpstreamFailure(error: unknown, ctx: UpstreamFailCtx = {
     return "unknown";
 }
 
+// #3776: certificate-TRUST codes — the failure means "this CA chain is not
+// trusted HERE", i.e. the upstream was re-signed by an intermediate Node.js
+// does not know (security-software HTTPS scanning / corporate MITM), NOT "the
+// upstream is broken". Single source of truth shared by preflight's summary-
+// call note so the two channels never drift apart (preflight previously kept
+// its own copy of this set).
+export const TLS_TRUST_CODES = new Set([
+    "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "DEPTH_ZERO_UNTRUSTED_ROOT",
+    "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+]);
+
+export function isTlsTrustCode(code: unknown): boolean {
+    return typeof code === "string" && TLS_TRUST_CODES.has(code);
+}
+
+/** #3776: the remediation text for a certificate-TRUST failure. Names the common
+ *  producer (security-software HTTPS/encrypted-connection scanning, corporate
+ *  MITM) and both fixes. Consumed verbatim by the log line, the 502 body, the
+ *  circuit/alert banner and the preflight summary note so they stay word-for-
+ *  word identical — the generic `UPSTREAM_FAIL_HINTS.tls` one-liner was what left
+ *  a Kaspersky-scanned user digging through logs for a day (#3773/#3776). */
+export function tlsTrustRemediation(): string {
+    return "the presented certificate chain is not trusted by this Node.js process — usually security software doing HTTPS/encrypted-connection scanning (Kaspersky, enterprise DLP) or a corporate MITM proxy re-signing the upstream. Fix: export that scanner/vendor root CA to a PEM file and point NODE_EXTRA_CA_CERTS=/path/to/ca.pem at it (or set bili config \"network.caFile\"), or exclude node.exe from the software's HTTPS inspection";
+}
+
+// #3776 sub-defect 3: machine-readable slice of an upstream failure. Attached
+// NON-enumerably to the thrown error so the egress 502 body can expose
+// kind/code/hint verbatim instead of making the client parse free text — while
+// the error still stringifies EXACTLY as before (the existing `detail` field is
+// byte-identical; this only ADDS a structured sibling). A Symbol key keeps it
+// off any accidental JSON.stringify of the error elsewhere.
+export interface UpstreamFailureDetail {
+    kind?: UpstreamFailureKind;
+    code?: string;
+    hint?: string;
+}
+
+const UPSTREAM_FAILURE = Symbol("upstreamFailure");
+
+export function withUpstreamFailure(err: Error, detail: UpstreamFailureDetail): Error {
+    Object.defineProperty(err, UPSTREAM_FAILURE, { value: detail, enumerable: false });
+    return err;
+}
+
+export function upstreamFailureOf(err: unknown): UpstreamFailureDetail | undefined {
+    if (err !== null && typeof err === "object") {
+        const value = (err as Record<symbol, unknown>)[UPSTREAM_FAILURE];
+        if (value !== null && typeof value === "object") return value as UpstreamFailureDetail;
+    }
+    return undefined;
+}
+
 /** Fail-fast kinds: the attempt died BEFORE any response byte existed, so a
  *  replay cannot double-deliver anything. Per-attempt cost stays bounded —
  *  milliseconds for resets/refusals/DNS, at most one connect timeout for

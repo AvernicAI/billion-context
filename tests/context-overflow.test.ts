@@ -117,6 +117,29 @@ test("Codex client phrasing 'ran out of room in the model's context window' → 
     assert.equal(info.window, undefined);
 });
 
+test("agnes/cch relay: 'context_limit' type + CJK message → overflow, window undefined (#3787)", () => {
+    // Captured shape from a real agnes/cch relay rejection (dsh proxy mode,
+    // bili 0.1.201). No window number anywhere in the body — self-heal must
+    // arm at the rejected payload's own size; the session id must never be
+    // mistaken for a token count.
+    const body = JSON.stringify({
+        type: "error",
+        error: { type: "context_limit", message: "上下文长度超过模型限制，请减少对话历史或输入内容 (cch_session_id: sess_abc123)" },
+    });
+    const info = inspectContextOverflow(400, body);
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, undefined);
+});
+
+test("CJK overflow phrasings in both word orders → overflow (#3787)", () => {
+    assert.equal(inspectContextOverflow(400, '{"error":{"message":"上下文窗口超限，请精简对话历史"}}').isOverflow, true);
+    assert.equal(inspectContextOverflow(400, '{"error":{"message":"输入 token 数超出最大上下文限制"}}').isOverflow, true);
+});
+
+test("CJK text mentioning 上下文 without an overflow verb is NOT an overflow", () => {
+    assert.equal(inspectContextOverflow(400, '{"error":{"message":"无效的请求体：messages 字段格式错误（上下文历史解析失败）"}}').isOverflow, false);
+});
+
 test("auth error (400, no context marker) is NOT an overflow", () => {
     const info = inspectContextOverflow(400, '{"error":{"message":"Invalid API key","type":"authentication_error"}}');
     assert.equal(info.isOverflow, false);

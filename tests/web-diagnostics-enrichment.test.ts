@@ -9,7 +9,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import * as path from "node:path";
-import { buildDiagnostics } from "../src/web/diagnostics.js";
+import { buildDiagnostics, _candidateLogReadsForTest, _resetCandidateLogReadsForTest } from "../src/web/diagnostics.js";
+import { isMaskHostsEnabled, setMaskHostsEnabled } from "../src/log-mask.js";
 
 const ENV_KEYS = ["BILI_CONFIG_FILE", "DSH_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"] as const;
 
@@ -62,6 +63,9 @@ function makeFixture(): { root: string; dshHome: string; stateHome: string; conf
         "[ses_abc123][fold-reconcile] compression substrate appears destroyed: 120 covered id(s) missing with NO anchor match for 3 consecutive passes",
         "[ses_def456] native compaction boundary: archived 3 pre-compaction block(s); pruned ref maps to 68 live raw id(s)",
         "upstream 401 body: authorization: bearer sk-live-abcdefgh123456789 rejected — dsh native compaction call identified on retry",
+        // #3811: a matched conflict line whose URL carries a private relay host —
+        // must be host-masked in the published tail even though it is a log copy.
+        "[ses_ghi789] dsh native compaction call identified: checkpoint framing read from https://tail-relay.internal/v1/model failed",
     ].join("\n") + "\n");
     return { root, dshHome, stateHome, configPath };
 }
@@ -84,6 +88,11 @@ test("#3611 conflict-banner report carries versions, masked config, and evidence
     assert.ok(!blob.includes("sk-supersecret123456"), "raw api key must not survive");
     assert.ok(!blob.includes("tok_abcdef123456"), "raw token must not survive");
     assert.ok(!blob.includes("MyPassw0rd123"), "URL userinfo password must not survive");
+    // #3811: a bare endpoint HOST (no secret-named key) must be masked too — the
+    // original hole leaked internal.example.com verbatim into the public blob.
+    assert.ok(!blob.includes("internal.example.com"), "private relay host in a config URL value must be masked (#3811)");
+    assert.ok(!blob.includes("api.example.com"), "provider-table URL used as an object KEY must also be host-masked (#3811)");
+    assert.ok(blob.includes("<private-host>"), "masked-host placeholder present in the config section (#3811)");
     assert.ok(blob.includes('"apiKeys":["***"]'), "array under a secret-named key is masked element-wise");
     assert.ok(blob.includes('"nudgeGrowthTokens":50000'), "non-secret values stay verbatim");
     assert.ok(blob.includes('"allowDshCompaction":false'), "dsh block visible");
@@ -97,6 +106,9 @@ test("#3611 conflict-banner report carries versions, masked config, and evidence
     assert.ok(!blob.includes("[acp-usage] round 1"), "unrelated log lines excluded");
     assert.ok(!blob.includes("sk-live-abcdefgh123456789"), "credential in a matched log line is redacted");
     assert.ok(blob.includes("<masked"), "redaction marker visible");
+    // #3811: a URL host inside a matched conflict-log line must be masked too —
+    // the tail copies on-disk lines, which under BILI_LOG_MASK_HOSTS=0 keep real hosts.
+    assert.ok(!blob.includes("tail-relay.internal"), "private relay host in a conflict log line must be masked (#3811)");
 
     // publish discipline: no absolute path of the fixture tree may leak.
     assert.ok(!blob.includes(fx.root), "no absolute fixture path in blob");
@@ -106,6 +118,30 @@ test("#3611 conflict-banner report carries versions, masked config, and evidence
     const u = new URL(rep.url);
     assert.equal(u.origin + u.pathname, "https://github.com/ranxianglei/billion-context/issues/new");
     assert.equal(decodeURIComponent(u.searchParams.get("body") ?? ""), blob);
+});
+
+test("#3811 config host masking is unconditional — publish boundary ignores BILI_LOG_MASK_HOSTS", (t) => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "bili-diag-hostmask-"));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const configPath = path.join(root, "billion-context.json");
+    writeJson(configPath, {
+        providers: { "https://open.bigmodel.cn": { upstream: "https://relay.internal.corp/v1" } },
+        proxy: "https://proxy-corp.example.org:8443",
+    });
+    // An operator who opts out of LOCAL log host-masking must still get a
+    // host-safe PUBLISHED blob — the local preference must not weaken it.
+    const prev = isMaskHostsEnabled();
+    try {
+        setMaskHostsEnabled(false);
+        const blob = withEnv({ DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: root, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root, BILI_CONFIG_FILE: configPath },
+            () => buildDiagnostics()).blob;
+        assert.ok(!blob.includes("open.bigmodel.cn"), "provider-table KEY host masked even with local host-masking OFF");
+        assert.ok(!blob.includes("relay.internal.corp"), "upstream VALUE host masked even with local host-masking OFF");
+        assert.ok(!blob.includes("proxy-corp.example.org"), "proxy host masked even with local host-masking OFF");
+        assert.ok(blob.includes("<private-host>"), "masked-host placeholder present under switch-OFF");
+    } finally {
+        setMaskHostsEnabled(prev);
+    }
 });
 
 test("#3611 no dsh profiles → explicit note instead of an empty section", (t) => {
@@ -129,6 +165,33 @@ test("#3611 oversized config is capped with a truncation note", (t) => {
     assert.ok(blob.includes("… (truncated,"), "truncation note present");
     const cfgSection = blob.slice(blob.indexOf("--- bili config (secrets masked) ---"));
     assert.ok(cfgSection.length < 2200, `config section bounded, got ${cfgSection.length} chars`);
+});
+
+// #3813: buildDiagnostics used to read the rotated log pair ONCE PER TAIL, so a
+// conflict-banner request (which sets both the storage tail and the conflict
+// tail) did two full synchronous reads. The fix pre-fetches the candidate lines
+// once and hands the SAME array to both tails — output must stay identical while
+// each tail still selects ONLY its own pattern (no cross-leak between the two).
+test("#3813 single-read: storage tail and conflict tail share one candidate set without cross-leak", (t) => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "bili-diag-oneread-"));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const stateHome = path.join(root, "state");
+    mkdirSync(path.join(stateHome, "billion-context"), { recursive: true });
+    const storageMarker = "[storage] index.db healthy (sqlite unified)";
+    const conflictMarker = "[ses_x] compression substrate appears destroyed: 5 covered id(s) missing";
+    writeFileSync(path.join(stateHome, "billion-context", "bili.log"), `${storageMarker}\n${conflictMarker}\n`);
+    const env = { DSH_HOME: path.join(root, "none"), XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: root, XDG_DATA_HOME: root, XDG_CACHE_HOME: root };
+    _resetCandidateLogReadsForTest();
+    const conflictBlob = withEnv(env, () => buildDiagnostics("conflict-banner")).blob;
+    assert.equal(_candidateLogReadsForTest(), 1, "conflict-banner reads the rotated pair exactly once (pre-fix: twice)");
+    const storageBlob = withEnv(env, () => buildDiagnostics("storage-legacy-only")).blob;
+    assert.equal(_candidateLogReadsForTest(), 2, "each report costs exactly one full-pair read");
+    assert.ok(conflictBlob.includes(conflictMarker), "conflict tail captures its signature line from the shared read");
+    assert.ok(!conflictBlob.includes(storageMarker), "conflict tail must not leak [storage] lines");
+    assert.ok(storageBlob.includes(storageMarker), "storage tail captures its [storage] line from the shared read");
+    assert.ok(!storageBlob.includes("compression substrate appears destroyed"), "storage tail must not leak conflict signatures");
+    withEnv(env, () => buildDiagnostics("totally-unknown-topic"));
+    assert.equal(_candidateLogReadsForTest(), 2, "unknown topics must not touch the log at all");
 });
 
 test("#3611 enrichment is generic: storage topic and unknown topics carry it too", (t) => {

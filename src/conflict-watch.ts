@@ -69,11 +69,35 @@ export function recordConflict(session: Session, kind: ConflictKind, detail: str
 // must NOT rebase onto a guessed view (rebase stays gated on the framed detector).
 // Returns the refusal count when the inference holds, else undefined (caller keeps
 // the existing unannounced-rewrite classification).
-export function dshNativeCompactionWitness(session: Session): number | undefined {
+//
+// #3814 (via #3806): the refusal counter alone is NOT enough — it persists for the
+// session's life (often accumulated days ago under an older bili), and a dsh
+// RESTART re-keys ~all resent message ids, which trips the same #1001 rewrite
+// detector without anything having been compacted. The discriminator is the
+// compaction fingerprint: a landed client compaction folds the replayed region
+// into one summary, so the first replay after it carries only the recent tail —
+// #2709's real landings measured 320/771 (41%) and 427/875 (49%) incoming/known;
+// #3806's restart re-keys measured 2793/2814 (99%) and 395/389 (101%, it GREW).
+// Callers that have the rewrite evidence MUST pass it: a flat-or-larger resend
+// (incoming >= 75% of known) is a re-key, not a landing, and must keep the quiet
+// unannounced-rewrite tier even with a non-zero stale refusal counter.
+const DSH_COMPACTION_LANDING_MAX_INCOMING_RATIO = 0.75;
+
+interface RewriteFingerprint {
+    incomingTotal: number;
+    knownBefore: number;
+}
+
+export function dshNativeCompactionWitness(session: Session, fingerprint?: RewriteFingerprint): number | undefined {
     const md = session.metadata;
     if (!md || md.pluginAgent !== "dsh") return undefined;
     const n = md["dshCompactionRefusals"];
-    return typeof n === "number" && n > 0 ? n : undefined;
+    if (typeof n !== "number" || n <= 0) return undefined;
+    if (fingerprint && fingerprint.knownBefore > 0
+        && fingerprint.incomingTotal >= fingerprint.knownBefore * DSH_COMPACTION_LANDING_MAX_INCOMING_RATIO) {
+        return undefined;
+    }
+    return n;
 }
 
 // #2219: resolve which CLIENT a conflicting session belongs to, so the conflict

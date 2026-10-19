@@ -14,7 +14,7 @@ import { defaultConfig } from "acp-kernel";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
-import { pckAblations, pckKeyAbated, recordPckAblation, _resetPckProbeForTest } from "../src/pck-probe.ts";
+import { pckAblations, pckKeyAbated, recordPckAblation, _resetPckProbeForTest, _pckProbeSessionCountForTest } from "../src/pck-probe.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import type { Server } from "node:http";
 
@@ -270,4 +270,37 @@ test("#2645 probe: memory resets between processes (no persistence)", () => {
     _resetPckProbeForTest();
     assert.equal(pckKeyAbated(`${origin}/chat/completions`, origin, "m1"), false);
     assert.equal(pckAblations().length, 0);
+});
+
+// #3813: the registry must stay bounded even when an untrusted tunnel client
+// drives egress facts without limit — both growth axes (distinct pairs AND
+// per-pair session ids) are capped. These are pure unit tests (no server): the
+// caps live entirely in recordPckAblation's bookkeeping.
+test("#3813 bound: a flood of distinct (origin,model) pairs cannot grow the registry without limit", () => {
+    _resetPckProbeForTest();
+    const N = 200; // well past the pair-table ceiling
+    for (let i = 0; i < N; i++) {
+        recordPckAblation({ origin: `http://host-${i}.example.com/v1`, model: "m-flood", sessionId: `s-${i}`, statusWithKey: 400, errSnippet: "x" });
+    }
+    const abled = pckAblations();
+    // Bounded, not pinned to the exact ceiling: an unbounded regression would return N.
+    assert.ok(abled.length <= 128, `registry grew to ${abled.length} after ${N} pairs — expected a bounded cap`);
+    // LRU discipline: the most-recently-confirmed destination survives the flood…
+    assert.ok(abled.some((e) => e.origin === "http://host-199.example.com"), "newest-confirmed pair was evicted");
+    // …and the oldest one is gone (it had no reconfirmation to protect it).
+    assert.ok(!abled.some((e) => e.origin === "http://host-0.example.com"), "oldest un-reconfirmed pair should have been evicted");
+});
+
+test("#3813 bound: unlimited distinct session ids on ONE pair cannot grow its session map", () => {
+    _resetPckProbeForTest();
+    const origin = "http://cap.example.com/v1";
+    for (let i = 0; i < 200; i++) {
+        recordPckAblation({ origin, model: "m-cap", sessionId: `sess-${i}`, statusWithKey: 400, errSnippet: "x" });
+    }
+    // The underlying per-pair map is capped (the display array alone can't show this).
+    assert.ok(_pckProbeSessionCountForTest(origin, undefined, "m-cap") <= 32, "per-pair session map exceeded its cap");
+    // …while the public display width is unchanged (top-N only).
+    const abled = pckAblations();
+    assert.equal(abled.length, 1);
+    assert.ok(abled[0].sessions.length > 0 && abled[0].sessions.length <= 8, "display array must list at most 8 sessions");
 });

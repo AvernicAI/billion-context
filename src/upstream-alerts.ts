@@ -177,6 +177,15 @@ export function upstreamCircuitBlockReason(url: string, now: number = Date.now()
     return undefined;
 }
 
+/** #3776 sub-defect 3: the kind of the last failure that opened a host's
+ *  circuit, so the egress can surface WHY requests are failing fast (the same
+ *  kind the user must fix). undefined when no open circuit / no recorded failure. */
+export function upstreamCircuitLastFailureKind(url: string): string | undefined {
+    const entry = circuits.get(hostOf(url));
+    if (!entry || entry.state.openedAt === null) return undefined;
+    return entry.state.lastFailure?.kind;
+}
+
 /** Record one FINAL pre-response transport failure (the error escaped the
  *  in-request retry ladder). Same discipline as ALERT_KINDS: client aborts,
  *  post-connect timeouts and HTTP verdicts never COUNT toward opening — only

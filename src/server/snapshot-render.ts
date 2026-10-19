@@ -48,6 +48,17 @@ import type { Session } from "../session.js";
  *  beyond this the lane degrades rather than scanning unbounded tails. */
 const MAX_CHAIN_WALK = 8192;
 
+/** #3812: a seam is only accepted after at least this many CONSECUTIVE chain
+ *  matches. The identity signature has no id component, so a single sig hit
+ *  proves nothing — "继续"/yes/1 repeated later in the conversation would
+ *  otherwise chain against the old copy and silently truncate everything
+ *  between them. Two consecutive matches is the minimum evidence that a real
+ *  seam (not a same-text collision) was found — the same discipline as
+ *  MIN_RESYNC_RUN in fold-reconcile (there 3, because reconcile matches on
+ *  position alone; here the second consecutive match must ALSO line up with
+ *  the view, which a stray duplicate cannot provide). */
+const MIN_SEAM_RUN = 2;
+
 /** #3658 canonical identity signature minus the hash: the tuple the kernel
  *  derives message ids from. Equal signature ⇒ same logical message even
  *  when the id bytes were re-minted by an upgrade. Image cores share the
@@ -66,6 +77,11 @@ interface ViewRow {
 
 interface SnapshotRenderDeps {
     sessionId: string;
+    /** #3812: plugin lanes are client-authoritative by design (the plugin
+     *  contract carries the host's own history management — divert paths,
+     *  incremental turns). They bypass this engine entirely: no render, no
+     *  degrade marker, nothing observed. */
+    pluginMode?: boolean;
     log?: (level: string, msg: string) => void;
 }
 
@@ -104,6 +120,7 @@ function parseRow(content: string, seq: number): BiliMessage | null {
  */
 export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], deps: SnapshotRenderDeps): BiliMessage[] {
     if (!featureEnabled("snapshotRender")) return clientMsgs;
+    if (deps.pluginMode) return clientMsgs; // plugin lane: client-authoritative by design, not a degradation
     const activeBlocks = session.state.blocks.filter((b) => b.active);
     if (activeBlocks.length === 0) return clientMsgs;
     const store = getStore();
@@ -146,6 +163,8 @@ export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], d
         }
         let cursor = rows.length; // exclusive upper bound: matched rows must sit below this
         let started = false;
+        let run = 0; // #3812: consecutive matched messages since the chain started
+        let gapped = false; // #3812: one tolerated unmatched message (the reply lag)
         for (let k = clientMsgs.length - 1; k >= 0 && clientMsgs.length - 1 - k < MAX_CHAIN_WALK; k--) {
             const m = clientMsgs[k];
             const sig = identitySig(m);
@@ -167,18 +186,35 @@ export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], d
                 // Before the chain starts, unmatched messages are the live
                 // tail (this turn's fresh user message, last turn's reply
                 // not yet re-observed) — skip them. Once the chain has
-                // started, an unmatched message ENDS it (contiguity).
-                if (started) break;
+                // started, ONE unmatched message is tolerated — the reply
+                // lag: the client's second-to-last message is regularly the
+                // previous turn's reply, which has no row yet (rows come
+                // from what the client RE-SENT, and a retry/resent turn
+                // carries it below an already-observed question). A second
+                // consecutive unmatched message ends the chain (contiguity).
+                if (started) {
+                    if (gapped) break;
+                    gapped = true;
+                    continue;
+                }
                 continue;
             }
+            gapped = false;
             if (!started) {
                 started = true;
                 clientJoin = k + 1; // tail = everything above the topmost matched message
                 joinRow = hit; // the join point: the prefix renders every row up to and including it
             }
+            run++;
             cursor = hit;
         }
         if (!started) return legacyFor(session, deps, clientMsgs, "chain-not-started"); // nothing chains: epoch-like rewrite, legacy
+        // #3812: a lone match — however it matched — is not a seam. The classic
+        // shape: the client's new "继续" chains by signature against an old
+        // "继续" row while the true history sits above the old row's position;
+        // accepting it renders only the ancient prefix + the one tail message
+        // and silently drops everything between. Degrade instead: never guess.
+        if (run < MIN_SEAM_RUN) return legacyFor(session, deps, clientMsgs, "seam-too-short");
     }
     const d = joinRow + 1; // prefix = rows[0..d) — everything up to the join; rows beyond (rewound-away tails) never render
 
@@ -194,20 +230,25 @@ export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], d
     const coveredSeqUnion = new Set<number>();
     for (const block of activeBlocks) {
         const blockSeqs = new Set<number>();
-        const blockSigs = new Set<string>();
         for (const id of block.effectiveMessageIds) {
             for (let i = 0; i < rows.length; i++) {
-                if (rows[i].msg.id === id) {
-                    blockSeqs.add(rows[i].seq);
-                    blockSigs.add(identitySig(rows[i].msg));
-                }
+                if (rows[i].msg.id === id) blockSeqs.add(rows[i].seq);
             }
         }
-        if (blockSeqs.size > 0) {
-            for (let i = 0; i < rows.length; i++) {
-                if (!blockSeqs.has(rows[i].seq) && blockSigs.has(identitySig(rows[i].msg))) blockSeqs.add(rows[i].seq);
-            }
-        }
+        // #3812: no fold-time id resolves against the view — the block cannot
+        // be positioned (and its covered region cannot be bounded). Anchoring
+        // it at the top (the old behavior) renders the summary above raw
+        // history the engine can no longer suppress. Degrade to the legacy
+        // path, which renders the client view untouched.
+        if (blockSeqs.size === 0) return legacyFor(session, deps, clientMsgs, "block-unanchored");
+        // NOTE: upgrade twins (ids re-minted, same content) are anchored by
+        // reconcile's re-key of effectiveMessageIds, NOT by signature
+        // propagation here: the old sig sweep could not distinguish an
+        // upgrade twin from a genuine later duplicate of the same text, so it
+        // silently swallowed real messages (#3812). A partially re-keyed
+        // block may leave a few twin rows rendering alongside the summary
+        // (bounded duplicate content, visible, never loss); that residual is
+        // the price of never guessing.
         for (const seq of blockSeqs) coveredSeqUnion.add(seq);
         let maxCover = -1;
         for (const seq of blockSeqs) maxCover = Math.max(maxCover, seq);

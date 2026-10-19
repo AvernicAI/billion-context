@@ -4700,7 +4700,7 @@ export async function ensureProxyRunning(
         // discovery+attach decision as the one-shot probe above, re-run on a
         // short budget so a listener whose identity record published during
         // our spawn attempt is still attachable instead of mistaken for air.
-        // #3654: re-run the identity criteria the child's findSameLaneTwin
+        // #3654: re-run the identity criteria the child's classifySameLanePeer
         // applied at bind time against the CURRENT registry, verify the holder
         // still answers TCP (pid reuse), then ride it through the normal attach
         // path (watcher + heartbeat included).

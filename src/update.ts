@@ -357,6 +357,63 @@ export function _installBackoffStateForTest(): Record<string, { count: number; n
     return out;
 }
 
+// #3754: persistent install attribution. Install-success logs are per-process
+// ephemeral — after a restart nothing on the machine says WHICH channel put
+// the current version on disk (auto-update loop, manual `bili update`, or an
+// advisory force-install). A tiny cross-process ledger closes the gap: every
+// successful in-place install records {from, version, source, at}, written
+// under the same cross-process lock that serialized the install itself, so
+// the file always reflects the most recent successful install. Reads fail
+// open: absent/unreadable/corrupt → undefined (the status field simply goes
+// missing instead of failing the endpoint).
+const LAST_INSTALL_FILE = path.join(cacheDir(), ".last-install.json");
+
+export interface LastInstallRecord {
+    from?: string;
+    version: string;
+    source: "auto-update" | "manual" | `advisory:${string}`;
+    at: number;
+}
+
+function parseLastInstallDoc(raw: string): LastInstallRecord | undefined {
+    const doc = JSON.parse(raw) as { v?: unknown; record?: unknown };
+    if (!doc || typeof doc !== "object" || doc.v !== 1) return undefined;
+    const r = doc.record as Record<string, unknown> | null;
+    if (!r || typeof r !== "object") return undefined;
+    if (typeof r.version !== "string" || typeof r.source !== "string" || typeof r.at !== "number") return undefined;
+    if (!Number.isFinite(r.at)) return undefined;
+    if (r.from !== undefined && typeof r.from !== "string") return undefined;
+    return { from: r.from as string | undefined, version: r.version, source: r.source as LastInstallRecord["source"], at: r.at };
+}
+
+/** #3754: live read of the most recent successful in-place install. Fresh per
+ *  call (deliberately uncached) so the status surface reflects installs done
+ *  by OTHER processes since this one started. Absent/corrupt → undefined. */
+export async function getLastInstall(): Promise<LastInstallRecord | undefined> {
+    try {
+        return parseLastInstallDoc(await readFile(LAST_INSTALL_FILE, "utf-8"));
+    } catch {
+        return undefined;
+    }
+}
+
+/** Best-effort atomic write (tmp+rename); never rejects — an unwritable cache
+ *  dir degrades to log-only attribution (same bias as the backoff state). */
+async function persistLastInstall(from: string | undefined, version: string, source: LastInstallRecord["source"]): Promise<void> {
+    try {
+        await mkdir(path.dirname(LAST_INSTALL_FILE), { recursive: true });
+        const tmp = `${LAST_INSTALL_FILE}.${process.pid}.tmp`;
+        await writeFile(tmp, JSON.stringify({ v: 1, record: { ...(from ? { from } : {}), version, source, at: Date.now() } }), "utf-8");
+        await rename(tmp, LAST_INSTALL_FILE);
+    } catch {
+        // best-effort: attribution must never fail the install
+    }
+}
+
+export async function _resetLastInstallForTest(): Promise<void> {
+    await rm(LAST_INSTALL_FILE, { force: true });
+}
+
 function backoffKey(installDir: string | undefined, version: string): string {
     return `${installDir ?? "<unknown-install-dir>"}\u0000${version}`;
 }
@@ -1603,6 +1660,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             const result = await installViaTarball(target, tarballUrl, installDir, integrity, shasum, egressDispatcher(opts, tarballUrl));
             if (result.ok) {
                 await clearInstallBackoff(bkey);
+                await persistLastInstall(currentVersion, target, force ? "manual" : "auto-update");
                 loggerLog("info", `[update] installed ${currentVersion} \u2192 ${target}. Restart to finish.`);
                 // #966: dsh profile copies load their own plugin+proxy from the
                 // profile's node_modules — without this they would keep running
@@ -2124,6 +2182,7 @@ export async function forceInstallVersion(
         if (diskUnderLock === targetVersion) return { ok: true };
         const result = await installViaTarball(targetVersion, doc.tarball, installDir, doc.integrity, doc.shasum, egressDispatcher(opts, doc.tarball));
         if (result.ok) {
+            await persistLastInstall(diskUnderLock ?? opts.currentVersion, targetVersion, `advisory:${advisoryId}`);
             loggerLog("info", `[update] advisory ${advisoryId}: installed ${diskUnderLock ?? opts.currentVersion} → ${targetVersion}. Restart to finish.`);
             await runProfileBundlesRefresh(targetVersion, loggerLog);
             await refreshDshDesktopCopy(targetVersion, loggerLog, process.env, opts.resolveProxy);

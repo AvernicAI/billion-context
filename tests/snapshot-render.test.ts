@@ -383,16 +383,22 @@ test("D on: client drops/checkpoints the covered region — server-authoritative
         // the uncovered head renders from the transcript rows it replaced.
         assert.ok(!joined2.includes("client checkpoint"), "client-side checkpoint of the head is ignored (server-authoritative)");
         assert.equal(anchorCount(joined2), 1, "exactly one anchor copy");
-        // next turn: the transcript view has adopted the client's checkpoint
-        // shape (one-turn adoption lag, documented in the engine header);
-        // the anchor still renders from block state, covered rows stay gone.
+        // next turn: the transcript view has ADOPTED the client's checkpoint
+        // shape — the block's fold-time ids no longer resolve against the
+        // view (the client dropped the covered region for good). #3812
+        // doctrine: an unanchorable block must not park its summary at the
+        // top of a raw-history render — the lane degrades to legacy, where
+        // the checkpoint-aware reconcile path owns rebasing the block.
+        const turnsAfterR2 = h.sessionOf("s-drop")!.metadata["snapshotRenderTurns"] as number;
         const r3 = await turn(h, h.openaiUrl, "s-drop", [...dropped, { role: "user", content: "And one more. " + "KEEP_B_".repeat(80) }], null);
         assert.equal(r3.status, 200, r3.body);
+        const s3 = h.sessionOf("s-drop")!;
+        assert.equal(s3.metadata["snapshotRenderDegradeReason"], "block-unanchored", "adoption turn degrades: fold-time ids left the view");
+        assert.equal(s3.metadata["snapshotRenderTurns"], turnsAfterR2, "degraded turn does not count as a D render");
         const out3 = sent(h.bodies, r3.idx);
         const joined3 = out3.map(textOf).join("\n");
-        assert.ok(joined3.includes(SUMMARY), "anchor still rendered after checkpoint adoption");
-        assert.ok(!joined3.includes("WORK_1_content_"), "covered rows stay suppressed after adoption");
-        // steady after the edit: the next turn is byte-stable on the prefix
+        assert.ok(!joined3.includes("WORK_1_content_"), "covered rows never render raw (client dropped them; server never resurrects)");
+        // steady after the degrade: the next turn is byte-stable on the prefix
         const r4 = await turn(h, h.openaiUrl, "s-drop", [...dropped, { role: "user", content: "And one more. " + "KEEP_B_".repeat(80) }, { role: "user", content: "Final follow. " + "KEEP_C_".repeat(80) }], null);
         assert.equal(r4.status, 200, r4.body);
         const out4 = sent(h.bodies, r4.idx);
@@ -613,3 +619,59 @@ test("D off (default) · google: the seed-upgrade scenario churns — documents 
         assert.equal(h.sessionOf("g-legacy")!.metadata["snapshotRenderTurns"], undefined, "no D latch");
     }, true);
 });
+
+// ---------------------------------------------------------------------------
+// #3812 stakes: the identity signature has no id component, so repeated short
+// texts ("继续"/yes/1) let a single sig hit masquerade as a seam and silently
+// truncate history; the per-block sig propagation swept uncovered same-text
+// rows into coverage (losing real messages); an unanchored block (fold-time
+// ids absent from the view) parked the summary anchor at the very top.
+// ---------------------------------------------------------------------------
+
+test("#3812 D on: repeated short user text must not silently truncate history", async () => {
+    process.env.BILI_ROLLOUT_SNAPSHOT_RENDER = "100";
+    await withHarness(async (h) => {
+        const history = conversation();
+        history[2] = { role: "user", content: "继续" }; // a covered-region duplicate of the turn-3 tail
+        const r1 = await turn(h, h.openaiUrl, "s-dup", history, history);
+        assert.equal(r1.status, 200, r1.body);
+        assert.ok(h.sessionOf("s-dup")!.state.blocks.some((b) => b.active), "block armed");
+        const tailA = [{ role: "user", content: "NEXT_REQUEST_A. " + "TAIL_A_".repeat(80) }];
+        const r2 = await turn(h, h.openaiUrl, "s-dup", [...history, ...tailA], history);
+        assert.equal(r2.status, 200, r2.body);
+        assertDActive(h, "s-dup", 1, "dup-text pre-state");
+        const turnsBefore = h.sessionOf("s-dup")!.metadata["snapshotRenderTurns"] as number;
+        // turn 3: the live tail repeats a COVERED message's exact text
+        const r3 = await turn(h, h.openaiUrl, "s-dup", [...history, { role: "user", content: "继续" }], null);
+        assert.equal(r3.status, 200, r3.body);
+        const out3 = sent(h.bodies, r3.idx);
+        const joined = out3.map((m) => textOf(m)).join("\n");
+        // the recent replies and deep history must ALL survive the seam
+        assert.ok(joined.includes("ok 3"), "#3812: turn-2 reply silently truncated by short-text seam");
+        assert.ok(joined.includes("WORK_10_content_"), "#3812: mid-history message silently truncated by short-text seam");
+        const s3 = h.sessionOf("s-dup")!;
+        assert.equal(s3.metadata["snapshotRenderDegradeReason"], "seam-too-short", "ambiguous seam degrades to legacy, never guesses");
+        assert.equal(s3.metadata["snapshotRenderTurns"], turnsBefore, "degraded turn must not count as a D render");
+    }, true);
+});
+
+test("#3812 D on: an uncovered same-text sibling in the prefix must render", async () => {
+    process.env.BILI_ROLLOUT_SNAPSHOT_RENDER = "100";
+    await withHarness(async (h) => {
+        const history = conversation();
+        const dupText = "DUP_PAYLOAD_MARKER_ " + "SHARED_TEXT_".repeat(60);
+        history[2] = { role: "user", content: dupText }; // covered (inside m00001..m00008)
+        history[10] = { role: "user", content: dupText }; // uncovered (protection zone)
+        const r1 = await turn(h, h.openaiUrl, "s-sib", history, history);
+        assert.equal(r1.status, 200, r1.body);
+        assert.ok(h.sessionOf("s-sib")!.state.blocks.some((b) => b.active), "block armed");
+        const r2 = await turn(h, h.openaiUrl, "s-sib", [...history, { role: "user", content: "SIB_NEXT. " + "TAIL_B_".repeat(80) }], null);
+        assert.equal(r2.status, 200, r2.body);
+        assertDActive(h, "s-sib", 1, "sibling render");
+        const out2 = sent(h.bodies, r2.idx);
+        const copies = out2.filter((m) => textOf(m).includes("SHARED_TEXT_")).length;
+        assert.equal(copies, 1, "#3812: uncovered duplicate sibling was swept into coverage (real message lost)");
+    }, true);
+});
+
+

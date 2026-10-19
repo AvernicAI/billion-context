@@ -5,7 +5,7 @@ import { fetchWithTimeout, isTransientUpstreamError, sleep } from "./fetch-util.
 import { extractSummaryFromSse, extractSummaryText, summaryPayload, type PreflightProtocol } from "./preflight.js";
 import { log as loggerLog } from "./logger.js";
 import { maskUrlForLog, maskUrlsInText } from "./log-mask.js";
-import { normalizeSseLineEndings } from "./sse-util.js";
+import { finalizeSseLineEndings } from "./sse-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 
@@ -169,7 +169,7 @@ function parseSummary(protocol: PreflightProtocol, text: string): string {
         if (!completed(protocol, events, false)) throw new Error("External summary response did not complete");
         summary = extractSummaryText(protocol, json as Record<string, unknown>);
     } else {
-        const normalized = normalizeSseLineEndings(text);
+        const normalized = finalizeSseLineEndings(text);
         const events: unknown[] = [];
         for (const line of normalized.split("\n")) {
             if (!line.startsWith("data:")) continue;

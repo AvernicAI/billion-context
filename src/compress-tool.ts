@@ -480,8 +480,46 @@ export function normalizeCompressInput(input: unknown): unknown {
     return input;
 }
 
+// #3780: the documented line-form string can arrive DOUBLE-ESCAPED — a model
+// that serializes its args as text escapes the header/summary separator twice,
+// so `content` carries a LITERAL backslash+n instead of a real line break. The
+// kernel's parseLineEntry then finds no newline, yields an empty summary, and
+// rejects with kind=content-not-array while hiding the real missing-summary
+// reason. Decode the newline escapes ONCE and return the corrected value — but
+// only when the string has NO real newline at all (a payload that already
+// carried a real break is left untouched, so nothing that parses today can be
+// mangled). Returns undefined when there is nothing to decode.
+function decodeDoubleEscapedContent(input: unknown): Record<string, unknown> | undefined {
+    if (!isPlainObject(input)) return undefined;
+    const c = input["content"];
+    if (typeof c !== "string") return undefined;
+    if (c.includes("\n")) return undefined;
+    if (!c.includes("\\n")) return undefined;
+    const decoded = c.replace(/\\r\\n/g, "\r\n").replace(/\\n/g, "\n");
+    if (decoded === c) return undefined;
+    return { ...input, content: decoded };
+}
+
 export function parseCompressInput(input: unknown, callId?: string) {
-    const parsed = parseCompressArgs(normalizeCompressInput(input), { callId });
+    const normalized = normalizeCompressInput(input);
+    let parsed = parseCompressArgs(normalized, { callId });
+    // #3780: retry the double-escaped line form once. Adopt the result only if
+    // it parses strictly MORE ranges than the undecoded attempt — a no-real-
+    // newline string always yields zero ranges undecoded, so this can never
+    // degrade a working parse. #1494 precedent: host-side pre-normalization of
+    // compress-arg drift before the kernel. The ultimate shared home for this
+    // decode is the kernel's parseLineEntry (kernel/src/parse-compress-input.ts);
+    // it stays there pending a kernel change — this salvage covers every lane now.
+    if (!parsed.diagnostics.ok && parsed.diagnostics.kind !== "ok") {
+        const decoded = decodeDoubleEscapedContent(normalized);
+        if (decoded !== undefined) {
+            const retry = parseCompressArgs(decoded, { callId });
+            if (retry.ranges.length > parsed.ranges.length) {
+                loggerLog("warn", `[acp-compress-input] double-escape salvage: recovered ${retry.ranges.length} range(s) after decoding literal backslash-n separators once (kind was ${parsed.diagnostics.kind}) (#3780)`);
+                parsed = retry;
+            }
+        }
+    }
     if (parsed.diagnostics.quoteSalvage === true) {
         loggerLog("warn", `[acp-compress-input] quote-salvage: recovered ${parsed.ranges.length} range(s) after single->double quote normalization (kind=${parsed.diagnostics.kind})`);
     }

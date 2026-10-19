@@ -87,6 +87,25 @@ for (const protocol of ["responses", "anthropic", "openai", "google"] as const) 
     }
 }
 
+for (const protocol of ["responses", "anthropic", "openai", "google"] as const) {
+    for (const [label, ending] of [["LF", "\n"], ["CRLF", "\r\n"], ["CR", "\r"]] as const) {
+        for (const complete of [true, false]) {
+            test(`external summary HTTP: ${protocol} ${complete ? "accepts complete" : "rejects unterminated"} ${label} SSE`, async () => {
+                const stream = streamCompletion(protocol);
+                const body = (complete ? stream : stream.slice(0, -1)).replace(/\n/g, ending);
+                await upstream((_req, res) => {
+                    res.setHeader("content-type", "text/event-stream");
+                    res.end(body);
+                }, async (url) => {
+                    const candidate = createSummaryHttpCandidate(target(url, protocol, true), 4096);
+                    if (complete) assert.equal(await candidate.summarize(work, AbortSignal.timeout(4000)), summary);
+                    else await assert.rejects(candidate.summarize(work, AbortSignal.timeout(4000)), { message: "External summary response did not complete" });
+                });
+            });
+        }
+    }
+}
+
 for (const status of [400, 401, 403]) {
     test(`external summary HTTP: ${status} fails fast to the backup without leaking errors`, async () => {
         const paths: string[] = [];

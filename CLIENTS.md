@@ -235,10 +235,14 @@ pure-stdlib Python module shipped inside the npm package:
   `__init__.py` into `~/.hermes/plugins/billion-context/`, writes a
   machine-owned `bili.json` sidecar pointing at the global bili install
   (`dist/index.js` + node path), and enables the plugin through hermes' own
-  channel (`hermes plugins enable billion-context` — if the CLI isn't on PATH
-  the same command is printed instead). Start a new hermes session to
-  activate. Remove with `bili plugin remove hermes`; refresh with
-  `bili plugin update hermes` after a global update.
+   channel (`hermes plugins enable billion-context` — if the CLI isn't on PATH
+   the same command is printed instead). Start a new hermes session to
+   activate. Remove with `bili plugin remove hermes`; refresh with
+   `bili plugin update hermes` after a global update. An installed or
+   refreshed plugin only takes effect in a **new** hermes session — the
+   injected code lives in the host process, so a running session keeps its old
+   copy until restarted (a still-running older proxy shows up as the usual
+   stale banner, see README Self-update).
 - **Lifecycle:** at load the plugin attaches to a healthy running proxy —
   lane-aware since #2905: its own hermes-lane instance first, another
   declared lane's instance NEVER (list it in `native.attachLanePriority` to
@@ -263,8 +267,19 @@ pure-stdlib Python module shipped inside the npm package:
   ONLY after the ACP tools are registered against the live proxy manifest;
   round 1 rides wire mode. A `pre_api_request` hook captures the effective
   `max_tokens` and pushes runtime-info (model + max output + context window)
-  to the proxy. `compress` / `decompress` / `acp_status` are registered as
-  real hermes tools served by the proxy's existing plugin endpoints.
+   to the proxy. `compress` / `decompress` / `acp_status` are registered as
+   real hermes tools served by the proxy's existing plugin endpoints.
+- **In-session commands (#3697):** the plugin registers `/acp` and
+  `/acp-cache` through hermes' `PluginContext.register_command`, so they show
+  up in slash-command help/completion like any built-in. `/acp` renders this
+  session's ACP status panel straight from the proxy (version + build in the
+  header); when the host can't name the current session it falls back to the
+  most recently active one and says so on the first line. `/acp-cache` prints
+  the same cache report as the `acp_cache` tool. This is NOT hermes' own
+  `hermes acp` CLI subcommand (an ACP client entry point) — different surface,
+  unrelated feature. Command registration needs `register_command` on the host
+  (present in the 2026.9.x builds); older builds skip just the two commands
+  while the tools keep working.
 - **Known limitations:** requests going out hermes' Codex-wire transport may
   drop the per-request header surface, so such setups stay in wire mode until
   that transport exposes headers. Inert when `BILLION_CONTEXT_PROXY` is set

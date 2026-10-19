@@ -224,7 +224,7 @@ for k in ("BILLION_CONTEXT_ATTACH", "BILLION_CONTEXT_PROXY", "BILI_NATIVE_HERMES
           "ALL_PROXY", "all_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE"):
     os.environ.pop(k, None)
 
-RECORDED = {"tool": [], "runtime_info": [], "watcher": [], "health": []}
+RECORDED = {"tool": [], "runtime_info": [], "watcher": [], "health": [], "status": []}
 
 # --- hermetic YAML backend stubs for the MITM-domain discovery tests (#2838) ---
 # A minimal parser for the restricted config shape under test; lets each scenario pin exactly
@@ -297,6 +297,14 @@ class Handler(BaseHTTPRequestHandler):
                 {"name": "compress", "description": "compress a range", "input_schema": {"type": "object"}},
                 {"name": "decompress", "description": "decompress a block", "input_schema": {"type": "object"}},
                 {"name": "acp_status", "description": "context status", "input_schema": {"type": "object"}}]}})
+        elif self.path.startswith("/__bili/plugin/status"):
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            RECORDED["status"].append({"conversationId": (q.get("conversationId") or [""])[0],
+                                       "fallback": (q.get("fallback") or [""])[0]})
+            canned = os.environ.get("BC_CMD_STATUS")
+            self._send(json.loads(canned) if canned else
+                       {"ok": True, "conversationId": "sess-real", "panel": "PANEL-TEXT"})
         else:
             self._send({"error": "not found"}, 404)
 
@@ -305,7 +313,8 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(n) or b"{}")
         if self.path == "/__bili/plugin/tool":
             RECORDED["tool"].append(body)
-            self._send({"ok": True, "result": "compressed 3 blocks"})
+            canned = os.environ.get("BC_CMD_TOOL_RESULT")
+            self._send(json.loads(canned) if canned else {"ok": True, "result": "compressed 3 blocks"})
         elif self.path == "/__bili/plugin/runtime-info":
             RECORDED["runtime_info"].append(body)
             self._send({"ok": True})
@@ -370,6 +379,7 @@ class FakeCtx:
         self.tools = {}
         self.middlewares = {}
         self.hooks = {}
+        self.commands = {}
 
     def register_tool(self, name=None, toolset=None, schema=None, handler=None, description="", **kw):
         self.tools[name] = {"toolset": toolset, "schema": schema, "handler": handler, "description": description}
@@ -379,6 +389,10 @@ class FakeCtx:
 
     def register_hook(self, name, cb):
         self.hooks[name] = cb
+
+    def register_command(self, name=None, handler=None, description="", args_hint="", argument_mode=None):
+        self.commands[name] = {"handler": handler, "description": description}
+        return object()
 
 mod = load_module()
 mod._reset_for_test()
@@ -532,6 +546,16 @@ elif SCENARIO.startswith("attach"):
             "no_session_result": no_session_result,
             "transcribed_result": transcribed_result,
         })
+elif SCENARIO.startswith("cmd-acp"):
+    # no-proxy leg: no sidecar installed -> register() stays inert, origin unset
+    if SCENARIO != "cmd-acp-no-proxy":
+        install_sidecar(False)
+        os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+        mod.register(ctx)
+    out.update({
+        "cmd_acp": mod.acp_command(""),
+        "cmd_acp_cache": mod.acp_cache_command(""),
+    })
 elif SCENARIO.startswith("mitm-"):
     kind = SCENARIO[len("mitm-"):]
     libdir = os.path.join(BASE, "lib-" + kind)
@@ -585,6 +609,8 @@ out.update({
     "health_probes": len(RECORDED["health"]),
     "refused": sorted(mod._state.get("refused") or []),
     "instance_id": mod._state.get("instance_id"),
+    "commands": {k: v["description"] for k, v in ctx.commands.items()},
+    "status_calls": RECORDED["status"],
 })
 server.shutdown()
 print(json.dumps(out))
@@ -624,6 +650,10 @@ interface DriverOut {
     mitm_kind?: string;
     mitm_domains?: string[];
     mitm_warnings?: string[];
+    commands?: Record<string, string>;
+    status_calls?: Array<Record<string, string>>;
+    cmd_acp?: string | null;
+    cmd_acp_cache?: string | null;
 }
 
 function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string } {
@@ -656,6 +686,10 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.toolsets, ["billion-context"]);
         assert.deepEqual(out!.middlewares, ["llm_request"]);
         assert.deepEqual(out!.hooks, ["pre_api_request"]);
+        assert.deepEqual(out!.commands, {
+            acp: "Show bili context-compression status for this session",
+            "acp-cache": "Prompt-cache reconciliation (same report as the acp_cache tool)",
+        });
         assert.equal(out!.round1_none, true);
         assert.equal(out!.req_unmutated, true);
         assert.equal(out!.env_https_proxy, out!.origin);
@@ -944,6 +978,74 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tools_registered, []);
         assert.equal(out!.env_https_proxy, null);
         assert.equal(out!.marker_left, false);
+    });
+});
+
+// #3697: in-session slash commands. The stub proxy serves /__bili/plugin/status; the driver
+// host has no hermes_cli package, so _current_session_key() falls back to '' and the plugin
+// requests conversationId=hermes&fallback=latest — the canned response decides whether the
+// latest-fallback banner appears.
+describe("in-session slash commands (#3697)", () => {
+    test("cmd-acp: panel shown with latest-fallback banner; /acp-cache forwards acp_cache", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("cmd-acp");
+        assert.ok(out, err);
+        assert.equal(
+            out!.cmd_acp,
+            "(showing most recently active session sess-real)\nPANEL-TEXT",
+        );
+        assert.deepEqual(out!.status_calls, [
+            { conversationId: "hermes", fallback: "latest" },
+            { conversationId: "hermes", fallback: "latest" },
+        ]);
+        assert.deepEqual(out!.tool_calls, [{ conversationId: "sess-real", tool: "acp_cache", args: {} }]);
+        assert.equal(out!.cmd_acp_cache, "compressed 3 blocks");
+    });
+
+    test("cmd-acp-same: resolved session matches the request -> no banner", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("cmd-acp-same", {
+            BC_CMD_STATUS: '{"ok":true,"conversationId":"hermes","panel":"PANEL-SAME"}',
+        });
+        assert.ok(out, err);
+        assert.equal(out!.cmd_acp, "PANEL-SAME");
+    });
+
+    test("cmd-acp-idle: armed-but-idle notice from the manifest; cache reports no ACP session", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("cmd-acp-idle", {
+            BC_CMD_STATUS: '{"ok":true,"conversationId":"hermes","phase":"pre-first-request","panel":null}',
+            BC_CMD_TOOL_RESULT: '{"ok":false,"error":"no model request has arrived for this conversation"}',
+        });
+        assert.ok(out, err);
+        assert.match(out!.cmd_acp!, /^billion-context@test-1/);
+        assert.match(out!.cmd_acp!, /proxy connected, compression armed\. No model request yet; send one, then run \/acp again\./);
+        assert.equal(
+            out!.cmd_acp_cache,
+            "bili: no ACP session yet for this conversation (send a model request first, then run /acp-cache)",
+        );
+    });
+
+    test("cmd-acp-no-proxy: error text without any HTTP traffic", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("cmd-acp-no-proxy");
+        assert.ok(out, err);
+        assert.match(out!.cmd_acp!, /^bili: no proxy detected/);
+        assert.match(out!.cmd_acp_cache!, /^bili: no proxy detected/);
+        assert.deepEqual(out!.status_calls, []);
+        assert.deepEqual(out!.tool_calls, []);
     });
 });
 

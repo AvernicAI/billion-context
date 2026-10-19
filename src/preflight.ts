@@ -17,6 +17,7 @@ import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
 import { dumpSummaryRejection } from "./error-dump.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
+import { isTlsTrustCode, tlsTrustRemediation, TLS_TRUST_CODES } from "./upstream-fail.js";
 import { lastCompressSuffix, type Session } from "./session.js";
 import { epochConfirmPending } from "./fold-reconcile.js";
 import { peekRegistryOutputLimit } from "./registry.js";
@@ -1210,15 +1211,7 @@ const TRANSIENT_SUMMARY_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", 
 const SUMMARY_DIAGNOSTIC_CODES = new Set([
     ...TRANSIENT_SUMMARY_CODES, "ETIMEDOUT", "UND_ERR_ABORTED",
     "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "Z_DATA_ERROR", "Z_BUF_ERROR", "Z_MEM_ERROR",
-    "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "DEPTH_ZERO_UNTRUSTED_ROOT",
-    "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
-]);
-// Certificate-TRUST codes: the failure is "this CA chain is not trusted here"
-// (corporate interception / MITM), not "the upstream is broken" — the
-// client-facing error must say so and name the remedy (#1987).
-const TLS_TRUST_HINT_CODES = new Set([
-    "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "DEPTH_ZERO_UNTRUSTED_ROOT",
-    "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+    ...TLS_TRUST_CODES, // #3776: single source of truth lives in upstream-fail.js
 ]);
 
 class SummaryTransportError extends Error {
@@ -2624,9 +2617,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                             // the client regardless of which code surfaced (a cert problem is not more
                             // terminal than a gzip corruption). Only an abort (client gone / idle budget)
                             // is not worth retrying; keep that case's field omitted as before.
-                            const caNote = err.code !== undefined && TLS_TRUST_HINT_CODES.has(err.code)
-                                ? " This looks like TLS certificate interception (corporate proxy/MITM): install the corporate root CA for Node.js via NODE_EXTRA_CA_CERTS=/path/to/ca.pem, or run node with --use-system-ca."
-                                : "";
+                            const caNote = isTlsTrustCode(err.code) ? ` — ${tlsTrustRemediation()}` : "";
                             failure = { kind: "upstream", detail: `the summarization call failed: ${err.message}${caNote}`, ...(err.aborted ? {} : { retryable: true }) };
                             deps.log("warn", `[preflight] summarization failed: ${err.message}`);
                         } else {

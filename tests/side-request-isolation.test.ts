@@ -132,12 +132,17 @@ test("restoreOutputBudget: configured-output-limit floor for poisoned or missing
     const starved = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
     restoreOutputBudget(starved, s, noopLog, 384000);
     assert.equal(starved.max_tokens, 384000, "death-rattle water mark floored by the configured output limit");
-    // A healthy water mark above the floor keeps winning (client intent beats declaration).
+    // #3833: a healthy water mark ABOVE the declared ceiling is clamped DOWN to the
+    // ceiling (never restored verbatim) — the ceiling is the hard upstream bound
+    // (strict providers 400 above it), so a water above it is either a stale
+    // cross-model artifact or an over-conservative declaration. The over-bound
+    // water is corrected in place so later turns stop replaying it.
     const s2 = metaSession("healthy");
     restoreOutputBudget({ max_tokens: 500000 }, s2, noopLog);
     const starved2 = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };
     restoreOutputBudget(starved2, s2, noopLog, 384000);
-    assert.equal(starved2.max_tokens, 500000, "water mark above the floor untouched");
+    assert.equal(starved2.max_tokens, 384000, "water mark above the ceiling clamped down to it (#3833)");
+    assert.equal(s2.metadata.outputBudgetHighWater, 384000, "the over-bound high-water is corrected in place (#3833)");
     // Born-dead session: the first request bili ever sees is already starved.
     const s3 = metaSession("borndead");
     const bornDead = { max_tokens: 1, tools: [{ name: "t" }] } as { max_tokens: number };

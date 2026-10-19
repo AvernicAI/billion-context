@@ -109,11 +109,28 @@ export function parseConfigDraft(text: string): unknown {
     return JSON.parse(stripJsoncTrailingCommas(stripJsoncComments(text)));
 }
 
+// #3816: does this config draft carry an ENABLED admin relay? Strict on the
+// value (=== true): "true", 1 and other truthy typos do not count. Malformed
+// drafts report false — the parse-error banner owns that state, not this one.
+export function adminRelayActiveInDraft(text: string): boolean {
+    let draft: unknown;
+    try {
+        draft = parseConfigDraft(text);
+    } catch {
+        return false;
+    }
+    if (draft === null || typeof draft !== "object" || Array.isArray(draft)) return false;
+    const sec = (draft as Record<string, unknown>).security;
+    if (sec === null || sec === undefined || typeof sec !== "object" || Array.isArray(sec)) return false;
+    return (sec as Record<string, unknown>).adminRelay === true;
+}
+
 export const WEB_CLIENT = `(function () {
     "use strict";
     const stripJsoncComments = ${stripJsoncComments.toString()};
     const stripJsoncTrailingCommas = ${stripJsoncTrailingCommas.toString()};
     const parseConfigDraft = ${parseConfigDraft.toString()};
+    const adminRelayActiveInDraft = ${adminRelayActiveInDraft.toString()};
     const MESSAGES=${JSON.stringify(MESSAGES)};
     let locale = "zh-CN";
     try {
@@ -515,6 +532,24 @@ export const WEB_CLIENT = `(function () {
         const dirty = Boolean(el && cfgSavedSnap !== null && canonCfgText(el.value) !== canonCfgText(cfgSavedSnap));
         ["card-quick", "card-file", "summary-settings"].forEach((id) => { const c = $(id); if (c) c.style.borderColor = dirty ? "#bf8700" : ""; });
         document.querySelectorAll(".cfg-dirty-note").forEach((n) => { n.hidden = !dirty; });
+        refreshRelayWarn();
+    }
+    // #3816: the admin-relay warning rides every editor change and the initial
+    // load, so it shows WHILE the user is setting security.adminRelay — before
+    // the save lands — not only afterwards.
+    function refreshRelayWarn() {
+        const el = $("cfg-relay-warn");
+        const fe = $("cfg-file-edit");
+        if (!el || !fe) return;
+        if (adminRelayActiveInDraft(fe.value)) {
+            el.hidden = false;
+            el.classList.add("show");
+            el.textContent = t("cfg.relay_warn");
+        } else {
+            el.hidden = true;
+            el.classList.remove("show");
+            el.textContent = "";
+        }
     }
 
     function sessionTitleCell(s) {
@@ -873,7 +908,7 @@ export const WEB_CLIENT = `(function () {
                 kb.classList.add("show");
                 const items = pcks.slice(0, 3).map((p) => [
                     (p.model ? '<span class="mono">' + escapeHtml(p.model) + "</span>: " : "") + '<span class="mono">' + escapeHtml(p.origin) + "</span>",
-                    p.sessions && p.sessions.length > 0 ? t("pck.sessions", { ids: p.sessions.join(", ") }) : null,
+                    p.sessions && p.sessions.length > 0 ? t("pck.sessions", { ids: escapeHtml(p.sessions.join(", ")) }) : null,
                 ].filter(Boolean).join(" ")).join(" · ");
                 kb.innerHTML = "<strong>" + t("pck.on") + '</strong> <span class="mono">' + items + "</span> " + t("pck.hint");
             } else {

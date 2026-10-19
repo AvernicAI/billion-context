@@ -1155,6 +1155,46 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
     }
 });
 
+test("#3806 apply(): a degraded web profile alarms loudly instead of the silent fail-safe note", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cd-gap-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cd-gap-state-"));
+    const logFile = path.join(stateHome, "billion-context", "bili.log");
+    const clientLines = (): string[] => fs.existsSync(logFile)
+        ? fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("[dsh-client]"))
+        : [];
+    _setSpawnForTest(async () => undefined);
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWebProfileWarningForTest();
+            const bare: Parameters<typeof apply>[0] = {
+                tools: { register: () => undefined },
+                commands: { register: () => undefined },
+                agents: {},
+                profileContext: { startedBundles: ["@deepseek-ai/dsh-web-app"] },
+            };
+            apply(bare);
+            const lines = clientLines();
+            assert.equal(lines.length, 1);
+            assert.match(lines[0], /@deepseek-ai\/dsh-web-app/);
+            assert.match(lines[0], /could not latch/i);
+            assert.match(lines[0], /no-config-hook/);
+            assert.match(lines[0], /#2474/);
+            assert.match(lines[0], /ARMED/i);
+            assert.doesNotMatch(lines[0], /deshark42\/dsh-compaction-basic-disable/);
+            await _stateToolsReadyForTest();
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        proxy.close();
+        rmrf(home);
+        rmrf(stateHome);
+        _resetRegisterForTest(undefined);
+        _resetWebProfileWarningForTest();
+    }
+});
+
 test("#3354 apply(): registers the load-time compaction-disable overlay and publishes its gate", async () => {
     const proxy = await startMockProxy([]);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cd-"));

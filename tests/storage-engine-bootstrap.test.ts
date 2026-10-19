@@ -59,7 +59,8 @@ import { resolveSqliteAutoDownload } from "../src/knobs.ts";
 // machine's real config/cache/env must not leak into these tests.
 const HERMETIC_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "bili-boot-hermetic-"));
 process.env.BILI_CONFIG_FILE = path.join(HERMETIC_ROOT, "no-config.json");
-// Absent everywhere now resolves to the shadow DEFAULT (#2815 rollout flip);
+// Absent everywhere now resolves to the full DEFAULT (#3818 flip; before that the
+// #2815 rollout flip made shadow the default);
 // this suite needs the explicit legacy baseline (per-test legs override it).
 process.env.BILI_STORAGE_UNIFIED = "legacy";
 delete process.env.BILI_SQLITE_AUTO_DOWNLOAD;
@@ -368,6 +369,45 @@ test("bootstrap: happy path downloads, verifies sha, extracts, registers loader;
     }
 });
 
+test("#3818 unloadable cached copy is removed and a pinned download is retried (#3135-5)", async () => {
+    let reg: MockRegistry | undefined;
+    const cachePrev = process.env.XDG_CACHE_HOME;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-boot-cache-"));
+    process.env.XDG_CACHE_HOME = dir;
+    try {
+        resetAllSeams();
+        const tgz = fakePackageTgz();
+        setEngineBootstrapSpecForTests({ version: "13.0.3", sha512Base64: sha512B64(tgz) });
+        setSqliteProbeOverridesForTests({ builtin: false, host: false });
+        reg = await startMockRegistry(tgz);
+        await withRegistry(reg.base, async () => {
+            const target = platformTargetKey();
+            // A cache that PASSES cacheUsable() (files exist) but cannot load:
+            // lib/index.js is present but syntactically broken — exactly the
+            // "cached copy unloadable" state after e.g. a truncated copy or a
+            // platform change.
+            const cached = path.join(dir, "billion-context", "sqlite", "better-sqlite3-13.0.3");
+            fs.mkdirSync(path.join(cached, "lib"), { recursive: true });
+            fs.mkdirSync(path.join(cached, "prebuilds"), { recursive: true });
+            fs.writeFileSync(path.join(cached, "package.json"), JSON.stringify({ name: "better-sqlite3", version: "13.0.3" }));
+            fs.writeFileSync(path.join(cached, "lib", "index.js"), "this is { not valid javascript !!!");
+            fs.writeFileSync(path.join(cached, "prebuilds", `${target}.node`), Buffer.from("FAKE-NODE-BINARY"));
+
+            const out = await ensureSqliteEngine({ env: { ...UNIFIED_ENV } });
+            assert.equal(out.status, "downloaded", `unloadable cache must be replaced by a pinned re-download, got ${JSON.stringify(out)}`);
+            assert.ok(reg!.requests() >= 1, "the pinned mirror was consulted for the retry");
+            const o = openSqliteDatabase(":memory:");
+            assert.equal(o.engine, "better-sqlite3");
+            o.db.close();
+        });
+    } finally {
+        await reg?.close();
+        resetAllSeams();
+        restoreCache(cachePrev);
+        rmrf(dir);
+    }
+});
+
 test("bootstrap: sha512 mismatch quarantines the download and arms the cooldown", async () => {
     const cachePrev = isolateCache();
     let reg: MockRegistry | null = null;
@@ -562,7 +602,7 @@ test("bootstrap: legacy mode short-circuits before any probe or fetch", async ()
         setSqliteProbeOverridesForTests({ builtin: false, host: false });
         reg = await startMockRegistry(tgz);
         await withRegistry(reg.base, async () => {
-            // Absent-everywhere now resolves to the shadow DEFAULT (#2815 rollout
+            // Absent-everywhere now resolves to the full DEFAULT (#3818 flip; #2815 rollout
             // flip), so the short-circuit needs an EXPLICIT legacy opt-out.
             const out = await ensureSqliteEngine({ env: { BILI_STORAGE_UNIFIED: "legacy" } });
             assert.equal(out.status, "not-needed");

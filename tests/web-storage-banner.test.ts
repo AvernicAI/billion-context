@@ -156,7 +156,7 @@ test("#3040 forced none-engine: status+overview report degraded; diagnostics blo
         try {
             const s = await fetchJson<{ storage: StorageWire }>(port, "/__bili/status");
             const o = await fetchJson<{ storage: StorageWire }>(port, "/__bili/overview");
-            assert.equal(o.storage.requested, "shadow", "default requested mode is shadow");
+            assert.equal(o.storage.requested, "full", "default requested mode is full (#3818 flip)");
             assert.equal(o.storage.effective, "legacy");
             assert.equal(o.storage.degraded, true);
             assert.equal(o.storage.intentionalOptOut, false);
@@ -171,7 +171,7 @@ test("#3040 forced none-engine: status+overview report degraded; diagnostics blo
             assert.ok(d.blob.includes(`node: ${process.version}`), "blob carries the node version");
             assert.ok(d.blob.includes(`platform: ${process.platform} ${process.arch}`), "blob carries platform/arch");
             assert.ok(d.blob.includes("os: "), "blob carries the OS line");
-            assert.ok(d.blob.includes("requested mode: shadow"));
+            assert.ok(d.blob.includes("requested mode: full"));
             assert.ok(d.blob.includes("effective mode: legacy"));
             assert.ok(d.blob.includes("degrade reason:"), "blob carries the degrade reason");
             assert.ok(d.blob.includes("engine bootstrap: failed"), "blob carries the ladder outcome");
@@ -233,11 +233,11 @@ test("#3040 healthy sidecar and explicit legacy: no degraded flag (banner stays 
         await once(proxy, "listening");
         const port = (proxy.address() as { port: number }).port;
         try {
-            // healthy default shadow: sidecar opened, nothing to warn about
+            // healthy default full (#3818 flip): sidecar opened, nothing to warn about
             let o = await fetchJson<{ storage: StorageWire }>(port, "/__bili/overview");
-            assert.equal(o.storage.requested, "shadow");
-            assert.equal(o.storage.effective, "shadow");
-            assert.equal(o.storage.degraded, false, "healthy shadow does not warn");
+            assert.equal(o.storage.requested, "full");
+            assert.equal(o.storage.effective, "full");
+            assert.equal(o.storage.degraded, false, "healthy full does not warn");
             assert.equal(o.storage.intentionalOptOut, false);
             assert.equal(o.storage.reason, null);
             assert.ok(o.storage.engine && o.storage.engine.name.length > 0 && o.storage.engine.source.length > 0, "engine reported when the sidecar is live");
@@ -318,7 +318,7 @@ test("#3040 corrupt index.db (guard #2771): degraded with the open-failure reaso
         const port = (proxy.address() as { port: number }).port;
         try {
             const o = await fetchJson<{ storage: StorageWire }>(port, "/__bili/overview");
-            assert.equal(o.storage.requested, "shadow");
+            assert.equal(o.storage.requested, "full");
             assert.equal(o.storage.effective, "legacy");
             assert.equal(o.storage.degraded, true, "corrupt index.db trips the warning");
             assert.equal(o.storage.intentionalOptOut, false);

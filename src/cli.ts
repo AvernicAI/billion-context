@@ -612,7 +612,7 @@ export async function main(): Promise<void> {
     // than a bare error. No-op if it already exists.
     ensureConfigTemplate();
     const opts = loadOptions();
-    // #2833: SQLite engine self-bootstrap — bounded (~10s) and fail-safe; only
+    // #2833: SQLite engine self-bootstrap — bounded (60s budget, #3338) and fail-safe; only
     // fetches when unified storage is requested AND no builtin/host engine
     // exists, so the common case costs nothing. Must complete before the first
     // session store opens (the store resolves its engine at construction).
@@ -621,6 +621,12 @@ export async function main(): Promise<void> {
     });
     recordEngineBootstrap(bootstrapOutcome);
     const server = await startServer(opts);
+
+    // #3754: config-file edits don't hot-reload — this process holds whatever
+    // loadOptions() resolved at startup until restart. Log the effective
+    // update-lane values once so an operator can verify what actually took
+    // effect (the #3752 "I set autoUpdate:false and nothing changed" trap).
+    loggerLog("info", `[update] effective settings (this process, until restart): autoUpdate=${opts.autoUpdate} advisoryCheck=${opts.advisoryCheck} releaseNotesCheck=${opts.releaseNotesCheck} autoRestartOnUpdate=${opts.autoRestartOnUpdate ?? false}`);
 
     // Start background auto-update after the server is listening so a slow
     // registry check never delays startup or races the listen socket.

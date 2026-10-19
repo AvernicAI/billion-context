@@ -1254,3 +1254,192 @@ test("#3100: embed pre-flight — a stale proxy build gets the restart notice in
         m.runCleanups();
     }
 });
+
+test("#3816: remote page + loopback origin (relay off) shows the adminRelay guidance instead of spinning; gate negatives stay unchanged", async () => {
+    // Positive: the page is reached through a non-loopback host while the
+    // bound origin is the server's loopback — unreachable by construction.
+    // The face must explain the fix instead of spinning on "connecting…".
+    {
+        const opened: string[] = [];
+        const m = await mountClient({
+            location: { hostname: "vps.example.com" },
+            URL,
+            open: (url: string) => { opened.push(String(url)); },
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) throw new Error("connection refused");
+                return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        const joined = texts.join(" ");
+        assert.ok(joined.includes("adminRelay"), "the guidance names the adminRelay knob");
+        assert.ok(joined.includes("~/.config/billion-context/billion-context.json"), "the guidance names the config file");
+        assert.ok(!joined.includes("正在连接"), "the endless connecting state is replaced by actionable guidance");
+        assert.equal(findTag(tree, "iframe"), undefined, "no frame while the origin is unreachable by construction");
+        // #3816 owner follow-up: the hint offers a jump straight to the panel's
+        // config page — the ONLY button in this state (the footer backup entry
+        // stays hidden: it would open the same dead loopback address).
+        const btns = collectButtons(tree);
+        assert.equal(btns.length, 1, "exactly one action: the config-page jump");
+        const btn = btns[0];
+        assert.equal(btn.props?.title, "http://127.0.0.1:18787/__bili/#/config", "the jump targets the panel's config page");
+        const label: string[] = [];
+        collectText(btn.children, label);
+        assert.equal(label.join(""), "打开配置页", "the jump button carries its localized label");
+        (btn.props!.onClick as () => void)();
+        assert.deepEqual(opened, ["http://127.0.0.1:18787/__bili/#/config"], "clicking opens the config page in a fresh tab");
+        m.runCleanups();
+    }
+    // Negative 1: a resolved "ok" verdict outranks the mismatch — same-machine
+    // access through a LAN IP still reaches the loopback; never shadow a working frame.
+    {
+        const m = await mountClient({
+            location: { hostname: "192.168.1.50" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
+                return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        assert.ok(!texts.join(" ").includes("adminRelay"), "no guidance when the panel actually resolves");
+        assert.ok(findTag(tree, "iframe") !== undefined, "the working frame stays");
+        m.runCleanups();
+    }
+    // Negative 2: local page (loopback host) + loopback origin — the classic
+    // desktop posture keeps the plain connecting state.
+    {
+        const m = await mountClient({
+            location: { hostname: "127.0.0.1" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) throw new Error("connection refused");
+                return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        assert.ok(!texts.join(" ").includes("adminRelay"), "local access gets no remote guidance");
+        assert.ok(texts.join(" ").includes("正在连接"), "local posture keeps the connecting state");
+        m.runCleanups();
+    }
+    // Negative 3: remote page + NON-loopback origin — a directly exposed proxy
+    // is plausibly reachable; the adminRelay guidance would mislead.
+    {
+        const m = await mountClient({
+            location: { hostname: "vps.example.com" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) throw new Error("connection refused");
+                return { ok: true, json: async () => ({ origin: "http://203.0.113.5:18787" }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        assert.ok(!texts.join(" ").includes("adminRelay"), "non-loopback origins get no adminRelay guidance");
+        assert.ok(texts.join(" ").includes("正在连接"), "falls back to the plain connecting state");
+        m.runCleanups();
+    }
+    // Negative 4: relay mode under a remote page — same-origin paths are
+    // reachable by construction; the #3373 flow must not gain a hint.
+    {
+        const m = await mountClient({
+            __BILI__: { origin: null, relay: true },
+            location: { hostname: "vps.example.com" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) return htmlOk();
+                return { ok: true, json: async () => ({ origin: null, relay: true }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        assert.ok(!texts.join(" ").includes("adminRelay"), "relay mode never shows the opt-in guidance");
+        assert.ok(findTag(tree, "iframe") !== undefined, "the relayed frame renders");
+        m.runCleanups();
+    }
+    // Negative 5: remote page + loopback origin + RESOLVED stale verdict —
+    // the probe answered, so THIS browser reached the loopback (same machine
+    // through a LAN IP): the #3100 restart notice keeps its place and the
+    // backup button stays (its loopback link is alive here).
+    {
+        const m = await mountClient({
+            location: { hostname: "192.168.1.50" },
+            URL,
+            open: (_url: string) => {},
+            fetch: async (url: string) => {
+                if (String(url).endsWith("/__bili/?embed=1")) {
+                    return {
+                        ok: false,
+                        status: 404,
+                        headers: { get: (_k: string) => "application/json; charset=utf-8" },
+                        json: async () => ({ error: { type: "not_found", message: "no such management endpoint" } }),
+                    };
+                }
+                return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+            },
+            setTimeout,
+            clearTimeout,
+        });
+        m.resetHooks();
+        m.component();
+        await tick();
+        m.component();
+        await tick();
+        const tree = m.component() as ElementNode;
+        const texts: string[] = [];
+        collectText(tree, texts);
+        assert.ok(!texts.join(" ").includes("adminRelay"), "a reachable-but-stale proxy keeps its own notice, not the relay guidance");
+        assert.ok(texts.join(" ").includes("重新启动 dsh"), "the #3100 stale notice survives the remote-page state");
+        const btns = collectButtons(tree);
+        assert.equal(btns.length, 1, "the backup button stays — on this machine the loopback link is alive");
+        assert.equal(btns[0].props?.title, "http://127.0.0.1:18787", "the backup button names the live origin");
+        m.runCleanups();
+    }
+});

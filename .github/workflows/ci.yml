@@ -46,7 +46,9 @@ on:
 # cancelled master runs shipped red). Approved by owner 2026-10-10 after
 # the release-v0.1.191 CI queue piled up behind same-ref reruns.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  # #3772: a non-ci:full `labeled` run is skip-scoped by its plan job below —
+  # keep it in its own group so it can never cancel the in-flight real run.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name != 'ci:full') && '-skip' || '' }}
   # #3331: cancel-in-progress applies WITHIN the group too — a 30-min cron whose
   # run outlives the interval would kill its predecessor mid-suite (tokens spent,
   # no green recorded, gate can never skip). Cancel only same-ref superseded
@@ -513,6 +515,14 @@ jobs:
       - run: npm install --package-lock-only --ignore-scripts --no-fund --no-audit
       - name: Fail on lockfile version drift
         run: git diff --exit-code -- package-lock.json
+      # #3782: kernel/ keeps its OWN package-lock.json (standalone acp-kernel
+      # identity, #2092) which the root regen above never touches — the bump
+      # chain 0.0.134→0.0.136 left it at 0.0.133 for three releases. Same
+      # idempotency check, same enforcement surface (master pushes included).
+      - name: Fail on kernel lockfile version drift
+        run: |
+          (cd kernel && npm install --package-lock-only --ignore-scripts --no-fund --no-audit)
+          git diff --exit-code -- kernel/package-lock.json
 
   # Scheduled full-matrix red signal (#3295 follow-up, owner-approved
   # 2026-10-16): a red scheduled run auto-opens a tracking issue; a later

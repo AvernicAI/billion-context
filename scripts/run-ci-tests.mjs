@@ -31,8 +31,20 @@
 // transient). Concrete assertion failures (subtests ran and reported a real
 // message) are NOT the swallowed shape → they fail hard immediately, no retry,
 // so a real regression is never masked.
+//
+// #3665: a SECOND recoverable shape rides the same bounded-retry guarantee: TAP
+// tail `fail 0` with `cancelled > 0` — every loss is an event-loop-drain
+// cancellation ("Promise resolution is still pending but the event loop has
+// already resolved"), i.e. ZERO assertion failures. Observed 5+ times across 4
+// branches / 2 windows lanes / 2 files, always alongside contaminated-runner
+// signals (a leaked process holding a zone port, ENOSPC at job start); the same
+// lane ran green on master concurrently. Shape classification lives in
+// ci-failure-shapes.mjs (unit-tested there); the action mirrors #3029 minus the
+// isolated re-runs: retry the whole shard once, exit 0 only if that retry is
+// green. A deterministic hang reproduces on the retry and still fails.
 import { execFileSync, spawn } from "node:child_process";
 import { LIVE_FILES } from "./live-files.mjs";
+import { classifyPhaseFailure, describeRetryOutcome } from "./ci-failure-shapes.mjs";
 import { readdirSync, readFileSync } from "node:fs";
 import { freemem, loadavg, totalmem } from "node:os";
 import { join } from "node:path";
@@ -199,26 +211,6 @@ function resourceSnapshot() {
     );
 }
 
-// A top-level `not ok N - <path ending .test.ts>` can only come from a file
-// whose child DIED: successful files promote their inner tests to top level by
-// test name and never emit a file-level entry. Pairing that with the YAML
-// `error: 'test failed'` marker isolates the swallowed/silent-death shape from
-// real assertion failures (named by test name, carrying a real message).
-function extractSwallowedFiles(output) {
-    const lines = output.split(/\r?\n/);
-    const found = new Set();
-    for (let i = 0; i < lines.length; i++) {
-        const m = lines[i].match(/^not ok \d+ - (.+?)\s*$/);
-        if (!m) continue;
-        const window = lines.slice(i, i + 20).join("\n");
-        if (!/error:\s*'test failed'/.test(window)) continue;
-        const base = m[1].trim().split(/[\\/]/).pop();
-        const rel = baseToFile.get(base);
-        if (rel) found.add(rel);
-    }
-    return [...found];
-}
-
 function runIsolated(fileRel) {
     const t0 = Date.now();
     console.log(`[ci-tests] DIAGNOSTIC isolated re-run (serial): ${fileRel} — full output below`);
@@ -253,38 +245,63 @@ function runIsolated(fileRel) {
             "[ci-tests] child wrote nothing to stderr (node --test reports test failures on the TAP stdout above; nothing extra to surface here)",
         );
     }
-    const swallowed = extractSwallowedFiles(first.out);
-    if (swallowed.length === 0) {
+    const verdict = classifyPhaseFailure(first.out, baseToFile);
+    if (verdict.kind === "concrete") {
         console.error(
-            "[ci-tests] failure carries concrete sub-test assertions (not the swallowed 'test failed' shape) " +
-                "-> failing WITHOUT auto-retry so a real regression is never masked.",
+            "[ci-tests] failure carries concrete sub-test assertions (not the #3029 swallowed 'test failed' shape, " +
+                "not the #3665 fail-0/cancelled>0 drain shape) -> failing WITHOUT auto-retry so a real regression " +
+                "is never masked.",
         );
         process.exit(first.code ?? 1);
     }
-    console.error(
-        `[ci-tests] swallowed file-level failure(s) — zero subtests, payload only 'test failed': ` +
-            `${swallowed.join(", ")} (#3029)`,
-    );
-    for (const rel of swallowed) {
-        const r = await runIsolated(rel);
+    if (verdict.kind === "swallowed") {
         console.error(
-            `[ci-tests] isolated re-run ${rel}: exit=${r.code} signal=${r.signal} (${(r.ms / 1000).toFixed(1)}s) -> ` +
-                (r.code === 0
-                    ? "PASSED in isolation (transient / concurrency flake likely)"
-                    : "REPRODUCED in isolation (deterministic break)"),
+            `[ci-tests] swallowed file-level failure(s) — zero subtests, payload only 'test failed': ` +
+                `${verdict.files.join(", ")} (#3029)`,
+        );
+        for (const rel of verdict.files) {
+            const r = await runIsolated(rel);
+            console.error(
+                `[ci-tests] isolated re-run ${rel}: exit=${r.code} signal=${r.signal} (${(r.ms / 1000).toFixed(1)}s) -> ` +
+                    (r.code === 0
+                        ? "PASSED in isolation (transient / concurrency flake likely)"
+                        : "REPRODUCED in isolation (deterministic break)"),
+            );
+        }
+    } else {
+        const c = verdict.counts;
+        console.error(
+            `[ci-tests] TAP tail pass=${c.pass} fail=${c.fail} cancelled=${c.cancelled}: zero assertion failures — ` +
+                `every loss is an event-loop-drain cancellation ('Promise resolution is still pending but the event ` +
+                `loop has already resolved'). Infrastructure-level drain (runner contamination or deterministic ` +
+                `in-process hang), not an assertion regression (#3665).`,
         );
     }
-    console.error("[ci-tests] retrying full phase once to confirm flake (#3029)");
+    console.error(
+        `[ci-tests] retrying full phase once to confirm flake (${verdict.kind === "swallowed" ? "#3029" : "#3665"})`,
+    );
     const retry = await runNodeTest(selectedFiles, 4, "all (retry)");
     if (retry.code === 0) {
         console.log(
-            `[ci-tests] FLAKE CONFIRMED: first run failed on ${swallowed.join(", ")}, full retry green in ` +
-                `${(retry.ms / 1000).toFixed(1)}s -> treating as transient (#3029). If it recurs, check ` +
-                `node${process.version.replace(/^v/, "").split(".")[0]}-${process.platform} + tsx load + concurrency=4 (see snapshot above).`,
+            `[ci-tests] FLAKE CONFIRMED: first run ${
+                verdict.kind === "swallowed"
+                    ? `failed on ${verdict.files.join(", ")}`
+                    : `lost ${verdict.counts.cancelled} tests to event-loop drain`
+            }, full retry green in ${(retry.ms / 1000).toFixed(1)}s -> treating as transient (#3029/#3665). If it ` +
+                `recurs, check node${process.version.replace(/^v/, "").split(".")[0]}-${process.platform} + tsx load ` +
+                `+ concurrency=4 (see snapshot above).`,
         );
         process.exit(0);
     }
-    console.error(`[ci-tests] full retry also FAILED (exit=${retry.code} signal=${retry.signal}) -> genuine failure, not a flake`);
+    // The retry ran on the SAME runner: its failure shape decides the verdict.
+    // A reproduced drain signature is a persistent infrastructure condition, NOT
+    // a code regression — the old fixed "genuine failure" line mislabelled it
+    // (#3665 round-2 log). Reclassify before printing the conclusion.
+    const retryVerdict = classifyPhaseFailure(retry.out, baseToFile);
+    console.error(
+        `[ci-tests] full retry also FAILED (exit=${retry.code} signal=${retry.signal}) -> ` +
+            describeRetryOutcome(retryVerdict),
+    );
     process.exit(retry.code ?? 1);
 })().catch((e) => {
     console.error(`[ci-tests] runner crashed: ${e && e.stack ? e.stack : e}`);

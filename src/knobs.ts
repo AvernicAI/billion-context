@@ -83,6 +83,19 @@ export function upstreamTimeoutMs(): number {
     return Number.isInteger(v) && v > 0 ? v : UPSTREAM_TIMEOUT_MS;
 }
 
+/** BILI_CA_FILE > network.caFile > unset. Path to a PEM bundle of extra root CAs
+ *  trusted by bili's OWN outbound upstream fetch — for security software doing
+ *  HTTPS/encrypted-connection scanning (Kaspersky, enterprise DLP) or a corporate
+ *  MITM proxy whose re-signed upstream cert Node's default trust (built-ins +
+ *  NODE_EXTRA_CA_CERTS) rejects with SELF_SIGNED_CERT_IN_CHAIN (#3776). The PEM is
+ *  MERGED with Node's built-in roots, never replacing them (#3776). */
+export function upstreamCaFile(): string | undefined {
+    const envRaw = process.env["BILI_CA_FILE"];
+    if (envRaw !== undefined && envRaw !== "") return envRaw;
+    const fileValue = fileNetwork().caFile;
+    return typeof fileValue === "string" && fileValue !== "" ? fileValue : undefined;
+}
+
 /** BILI_REPLAY_RETRY_MAX > network.replayRetryMax > 3. */
 export function replayMaxAttempts(): number {
     const v = tNum("BILI_REPLAY_RETRY_MAX", fileNetwork().replayRetryMax);
@@ -487,6 +500,20 @@ export function codexCompactMode(): CodexCompactMode {
     return loadConfigFile().codexCompact === "pass" ? "pass" : "intercept";
 }
 
+/** BILI_DSH_AUTHORED_COMPACTION — #3733 bili-authored dsh client compaction.
+ *  Default OFF ("0"/unset): the #1729 guard keeps refusing dsh's native
+ *  compaction summarize calls, exactly as before. "1": when the session
+ *  holds active fold blocks, the guard site answers the call LOCALLY with
+ *  our folded snapshot (zero egress) instead of refusing — dsh records our
+ *  checkpoint and its file shrinks (#3733/#3723). Read per-request so a
+ *  running proxy flips without a restart. Env-only for the rollout window;
+ *  the #2028-style file/web toggle follows once adopted. */
+export function dshAuthoredCompactionEnabled(): boolean {
+    const envRaw = process.env.BILI_DSH_AUTHORED_COMPACTION;
+    if (envRaw !== undefined) return envRaw.trim() !== "0";
+    return false;
+}
+
 /** BILI_DECOMPRESS_TMP_CAP > decompressTmpCap > 50. */
 export function decompressTmpCap(): number {
     const v = tIntLoose("BILI_DECOMPRESS_TMP_CAP", loadConfigFile().decompressTmpCap);
@@ -694,13 +721,15 @@ export function fileStorageWalJournalSizeLimit(): number | undefined {
  *  per the env-var discipline — env tier BILI_STORAGE_UNIFIED (1/true = shadow,
  *  full/unified = full, 0/false/legacy/garbage = legacy) wins over the
  *  config-file `storage.unified` value (strict spellings); absent everywhere =
- *  shadow (the dry-run sidecar is the default — JSON stays the sole source of
- *  truth, the index is digest-reconciled telemetry; set "legacy" to opt out). */
+ *  full (#3818 flip — the shadow dry-run ran as the default since #2815 and
+ *  the digest reconciliation held, so the index is now the load path by
+ *  default; JSON envelopes keep being written, and "legacy" remains the
+ *  one-line escape hatch). */
 export type StorageMode = "legacy" | "shadow" | "full";
 
 /** Resolve the unified-storage level. Pure: env + file tier value in, mode out
  *  (total function — never throws; an explicit legacy or a garbage spelling
- *  degrades to legacy, only full absence lands on the shadow default). */
+ *  degrades to legacy, only full absence lands on the default). */
 export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUnified?: string): StorageMode {
     const raw = env.BILI_STORAGE_UNIFIED?.trim().toLowerCase();
     if (raw) {
@@ -712,7 +741,7 @@ export function resolveStorageMode(env: NodeJS.ProcessEnv = process.env, fileUni
     if (file === "full") return "full";
     if (file === "shadow") return "shadow";
     if (file) return "legacy";
-    return "shadow";
+    return "full";
 }
 
 /** Phase 3 JSON-envelope switch (#2960): when the unified store runs in

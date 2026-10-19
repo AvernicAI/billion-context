@@ -1021,6 +1021,14 @@ const RECIPES = {
       const p = lastP > 0 ? lastP : 28000;
       return Math.min(32768, Math.max(16384, Math.ceil((p * 0.88) / 1024) * 1024));
     },
+    // Small-window preflight compression on claude runs a multi-stage
+    // distillation marathon (observed 297s of local preflight work for a
+    // 170KiB history — the #3452 first-sight marathon shape); the shared
+    // 300s turn budget SIGTERMs the CLI mid-preflight (t3/t4 exit 143,
+    // turn artifacts empty, 'summarization aborted: client disconnected').
+    // 600s keeps the lane asserting the fold path itself instead of racing
+    // the summarizer.
+    turnTimeoutMs: () => 600_000,
   },
 };
 

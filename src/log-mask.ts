@@ -111,6 +111,32 @@ export function maskUrlsInText(text: string): string {
     return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => maskUrlForLog(m));
 }
 
+/** #3811: publish-path URL masking for artifacts that land in a PUBLIC GitHub
+ *  issue body (the diagnostics blob). Unlike maskUrlForLog — which honors the
+ *  BILI_LOG_MASK_HOSTS opt-out so operators can see real hosts in their LOCAL
+ *  log — this ALWAYS masks non-public hosts: the local host-visibility
+ *  preference must not weaken the publish boundary (same stance as
+ *  redactSecretsInText, which is never gated by the switch). Userinfo, query
+ *  and hash are dropped exactly as in maskUrlForLog; the path is kept. */
+export function maskUrlForPublish(url: string): string {
+    let u: URL;
+    try {
+        u = new URL(url);
+    } catch {
+        return "<unparseable-url>";
+    }
+    const host = isPublicApiHost(u.hostname) ? u.host : `${PRIVATE_HOST}${u.port ? `:${u.port}` : ""}`;
+    return `${u.protocol}//${host}${u.pathname}`;
+}
+
+/** #3811: mask the host of every http(s) URL embedded in an arbitrary string,
+ *  unconditionally (see maskUrlForPublish). Catches URLs wherever they appear
+ *  in serialized text — object values AND object keys (the providers table
+ *  uses upstream URLs as keys). */
+export function maskUrlsForPublish(text: string): string {
+    return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => maskUrlForPublish(m));
+}
+
 /** Mask the host of a `host:port` target (e.g. an HTTP CONNECT request
  *  line) for logging. */
 export function maskHostPortForLog(target: string): string {

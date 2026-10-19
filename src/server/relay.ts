@@ -8,7 +8,7 @@ import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens
 import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
-import { credentialFingerprint, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleUsageReport } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
@@ -48,8 +48,9 @@ import { rewriteResponsesJsonResponseAsync } from "../stream-responses.js";
 import { observeResponsesTerminalState } from "../stream-terminal.js";
 import { rewriteJsonResponseAsync, type RewriteCtx } from "../stream.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
-import { clearUpstreamAlertsForHost, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason } from "../upstream-alerts.js";
-import { formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
+import { clearUpstreamAlertsForHost, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind } from "../upstream-alerts.js";
+import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
+import { withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { recordPckAblation } from "../pck-probe.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
@@ -658,7 +659,10 @@ export async function forward(
         // #2131: exact message count for seam forensics (sentParsed is the one
         // shared parse above — Responses carries "input", Google native "contents").
         const sentArr = sentParsed !== null ? (sentParsed.messages ?? sentParsed.input ?? sentParsed.contents) : null;
-        noteForwardedBody(prepared.session, sentBody, Array.isArray(sentArr) ? (sentArr as unknown[]).length : null, credentialFingerprint(headers));
+        // #3803: the generation-parameter fingerprint rides the SAME full parse as the message count —
+        // it is extracted from sentParsed (the complete object), never from the capped body head, so a
+        // trailing-field flip is seen even when the body exceeds SEAM_BODY_CAP.
+        noteForwardedBody(prepared.session, sentBody, Array.isArray(sentArr) ? (sentArr as unknown[]).length : null, credentialFingerprint(headers), generationParamFp(sentParsed));
         // #3023: the client's own resent view — the protocol conversion of the
         // inbound bytes BEFORE processTurn folded/replaced anything, captured
         // with the exact same pairing semantics so detectSeam can attribute a
@@ -676,7 +680,11 @@ export async function forward(
         log("warn", `[${prepared?.session.id ?? "passthrough"}] [acp-proxy] upstream circuit open — failing fast without contacting ${upstreamUrl}: ${circuitBlock}`);
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "upstream circuit open", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream circuit open");
-        throw new Error(`upstream circuit open: ${circuitBlock}`);
+        const lastKind = upstreamCircuitLastFailureKind(upstreamUrl);
+        throw withUpstreamFailure(new Error(`upstream circuit open: ${circuitBlock}`), {
+            ...(lastKind !== undefined ? { kind: lastKind as UpstreamFailureKind } : {}),
+            hint: "upstream circuit open — the endpoint is unreachable and bili is failing fast instead of resending full context until a probe succeeds",
+        });
     }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     // #3701: the catch below replaces upstreamResult on a shrunken resend; capture the
@@ -704,15 +712,15 @@ export async function forward(
         if (oversize === undefined) {
             recordUpstreamConnection(upstreamUrl, proxyUrl, error, skippedProxy);
             recordUpstreamAlert(upstreamUrl, error, proxyUrl !== undefined, skippedProxy);
-            const failureDetail = formatUpstreamError(error, upstreamUrl, proxyUrl, skippedProxy);
-            recordUpstreamCircuitFailure(upstreamUrl, error, proxyUrl !== undefined, failureDetail);
+            const failure = describeUpstreamFailure(error, upstreamUrl, proxyUrl, skippedProxy);
+            recordUpstreamCircuitFailure(upstreamUrl, error, proxyUrl !== undefined, failure.message);
             // #604: a network-level failure (socket reset, timeout abort) also never
             // reports usage — arm the emergency shrink like the 5xx branch below.
             if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
             // [#1343] no response means the attached full text never reached the model —
             // drop-and-log it (a corrective note surfaces on the next qualifying request).
             if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
-            throw new Error(`upstream request failed: ${failureDetail}`, { cause: error });
+            throw withUpstreamFailure(new Error(`upstream request failed: ${failure.message}`, { cause: error }), failure.detail);
         }
         // #3701: close 1009 with ZERO events received is a verdict on our frame SIZE, not
         // on endpoint health — the same gateway answers smaller frames fine. Deliberately
@@ -721,6 +729,7 @@ export async function forward(
         // token-space shrink for visibility, then try ONE bounded byte-shrink resend that
         // must be strictly smaller than what was just rejected.
         recordUpstreamConnection(upstreamUrl, proxyUrl, error, skippedProxy);
+
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
         const sentBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : 0;

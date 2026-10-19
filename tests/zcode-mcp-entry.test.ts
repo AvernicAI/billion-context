@@ -24,6 +24,7 @@ interface TickFixture {
     setHealthy: (h: boolean) => void;
     setEnsureOrigin: (o: string) => void;
     failRoute: (f: boolean) => void;
+    setEnsureThrows: (f: boolean) => void;
 }
 
 function tickFixture(origin: string): TickFixture {
@@ -35,9 +36,10 @@ function tickFixture(origin: string): TickFixture {
     let healthy = false;
     let ensureOrigin = origin;
     let routeFails = false;
+    let ensureThrows = false;
     const deps: ZcodeWatchdogDeps = {
         probe: async () => healthy,
-        ensure: async (opts) => { ensureCalls.push(opts); return { origin: ensureOrigin }; },
+        ensure: async (opts) => { ensureCalls.push(opts); if (ensureThrows) throw new Error("spawn failed"); return { origin: ensureOrigin }; },
         route: async ({ origin: o }) => { if (routeFails) return undefined; routeOrigins.push(o); return appliedFor(o); },
         activate: async () => {},
         repair: async (selfOrigin) => { repairCalls.push(selfOrigin); },
@@ -48,6 +50,7 @@ function tickFixture(origin: string): TickFixture {
         setHealthy: (h: boolean) => { healthy = h; },
         setEnsureOrigin: (o: string) => { ensureOrigin = o; },
         failRoute: (f: boolean) => { routeFails = f; },
+        setEnsureThrows: (f: boolean) => { ensureThrows = f; },
     };
 }
 
@@ -130,6 +133,18 @@ test("a failed config rewrite throws so the watchdog error surfaces", async () =
     fx.setEnsureOrigin(DRIFTED);
     fx.failRoute(true);
     await assert.rejects(runTicks(fx, false, 3), /config rewrite failed/);
+});
+
+test("#3813: a throwing ensure leaves the counter hot — the next tick retries immediately", async () => {
+    const fx = tickFixture(ORIGIN);
+    fx.setEnsureThrows(true);
+    // Ticks 1-2 accumulate below the limit; tick 3 reaches it and the failing
+    // bring-up must NOT cool the counter (pre-fix code reset before ensure,
+    // costing ~90s of re-accumulation before retrying).
+    await assert.rejects(runTicks(fx, false, 3), /spawn failed/);
+    assert.equal(fx.state.failures, 2, "counter stays hot (limit-1) when the bring-up throws, not reset to 0");
+    await assert.rejects(zcodeWatchdogTick(fx.state, false, fx.deps, (m) => fx.logs.push(m)), /spawn failed/);
+    assert.equal(fx.ensureCalls.length, 2, "immediate retry on the next tick");
 });
 
 test("externally-owned attach posture never respawns — it waits (#1821)", async () => {

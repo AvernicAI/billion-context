@@ -42,6 +42,52 @@ export function dshProfileDirs(env: NodeJS.ProcessEnv = process.env): string[] {
     return entries.filter((e) => e.isDirectory() && e.name !== "node_modules").map((e) => path.join(profiles, e.name));
 }
 
+// — cordis.patch.yml entry parsing (#3838) ————————————————————————————————
+
+interface DshPatchEntry {
+    /** Loader id as written in the `- id:` line (surrounding quotes stripped). */
+    id: string;
+    /** True when the entry's own block carries an indented `disabled: true` line. */
+    disabled: boolean;
+}
+
+/** Parse top-level `- id:` entries out of cordis.patch.yml content. Line-based
+ *  and forgiving — a malformed line simply yields no entry. A new `- id:` line
+ *  or ANY other top-level list item closes the previous entry, so a stray
+ *  `disabled:` line cannot leak into the wrong block; only an INDENTED
+ *  `disabled: true` inside the entry's own block counts as disabling it
+ *  (#3838: the #2462 cost-advisory scan ignored the flag entirely and fired
+ *  for explicitly disabled plugins). Duplicate ids are kept per occurrence —
+ *  callers decide how duplicates combine. The single source of truth for
+ *  patch-layer enablement semantics: both the #2462 cost advisory and the
+ *  #2861 host-plugin notice scan through this so they can never drift apart. */
+export function parseDshPatchEntries(text: string): DshPatchEntry[] {
+    const itemRe = /^\s*-\s*id\s*:\s*(\S+)/;
+    const listItemRe = /^\s*-\s/;
+    const disabledRe = /^\s+disabled\s*:\s*true\b/;
+    const out: DshPatchEntry[] = [];
+    let current: DshPatchEntry | undefined;
+    for (const line of text.split(/\r?\n/)) {
+        const m = line.match(itemRe);
+        if (m) {
+            if (current) out.push(current);
+            let v = m[1];
+            if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+            v = v.trim();
+            current = v.length > 0 ? { id: v, disabled: false } : undefined;
+            continue;
+        }
+        if (listItemRe.test(line)) {
+            if (current) out.push(current);
+            current = undefined;
+            continue;
+        }
+        if (current && disabledRe.test(line)) current.disabled = true;
+    }
+    if (current) out.push(current);
+    return out;
+}
+
 // — legacy managed-block migration (#966) ————————————————————————————————————
 
 // Pre-unification installs wrote this block into every profile's

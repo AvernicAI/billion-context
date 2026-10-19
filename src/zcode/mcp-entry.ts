@@ -68,12 +68,15 @@ async function defaultEnsure(opts: Parameters<typeof ensureProxyRunning>[0]): Pr
     return { origin: handle.origin };
 }
 
-/** #1821: one watchdog tick. Healthy → counter reset. Unhealthy × limit:
- *  an externally-owned attach posture (explicit user pin) only waits — that
- *  proxy is not ours to respawn. Every other case (self-spawned OR attached
- *  to a lane-owned instance at bootstrap) runs the same ensureProxyRunning
- *  recovery the spawn path used, so a dead lane proxy heals mid-session
- *  instead of stranding the session until the next session boot. */
+/** #1821: one watchdog tick. Healthy OR recovery-completed → counter reset.
+ *  Unhealthy × limit: an externally-owned attach posture (explicit user pin)
+ *  only waits — that proxy is not ours to respawn. Every other case
+ *  (self-spawned OR attached to a lane-owned instance at bootstrap) runs the
+ *  same ensureProxyRunning recovery the spawn path used, so a dead lane proxy
+ *  heals mid-session instead of stranding the session until the next session
+ *  boot. #3813: the counter cools ONLY after a completed recovery — a throwing
+ *  ensure (transient spawn/EADDRINUSE) leaves it hot so the next tick retries
+ *  immediately rather than re-accumulating to the limit (~90s). */
 export async function zcodeWatchdogTick(state: MutableZcodeWatchdogState, externallyOwned: boolean, deps: ZcodeWatchdogDeps, log: (msg: string) => void): Promise<void> {
     const probe = deps.probe ?? probeProxyHealth;
     const repair = deps.repair ?? ((selfOrigin: string) => repairSharedStoreDrift({ selfOrigin, log }));
@@ -82,9 +85,9 @@ export async function zcodeWatchdogTick(state: MutableZcodeWatchdogState, extern
     } else if (state.failures + 1 < (deps.failureLimit ?? WATCHDOG_FAILURE_LIMIT)) {
         state.failures += 1;
     } else {
-        state.failures = 0;
         if (externallyOwned) {
             log(`attached proxy ${state.origin} unhealthy — user-owned attach posture, waiting for it to recover`);
+            state.failures = 0;
         } else {
             const ensure = deps.ensure ?? defaultEnsure;
             const { origin } = await ensure(buildEnsureOpts());
@@ -100,6 +103,7 @@ export async function zcodeWatchdogTick(state: MutableZcodeWatchdogState, extern
             } else {
                 log(`proxy ${origin} recovered without a re-route`);
             }
+            state.failures = 0;
         }
     }
     await repair(state.origin);

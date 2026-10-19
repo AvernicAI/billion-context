@@ -17,7 +17,7 @@ import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOut
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
 import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
-import type { SkippedProxyInfo } from "./upstream-fail.js";
+import { upstreamFailureOf, type SkippedProxyInfo } from "./upstream-fail.js";
 import { getUpstreamAlerts } from "./upstream-alerts.js";
 import { hostIdForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs + the historical-image strip primitive live in the kernel now
@@ -98,7 +98,7 @@ import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isFileLoggingActive, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, entryScriptFingerprint, findSameLanePredecessor, findSameLaneTwin, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type ProxyInstanceFile, type RegistryEntry } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type ProxyInstanceFile, type SameLanePeer } from "./instance.js";
 import { mayClobberPointer, probeOwnerInfo, resolvePortClaim } from "./port-owner.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
@@ -643,8 +643,17 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             else log("error", msg);
             if (!res.headersSent) {
                 const status = msg.includes("exceeds") ? 413 : 502;
+                // #3776 sub-defect 3: surface the machine-readable failure slice
+                // (kind/code/hint) alongside the free-text detail so clients can
+                // self-diagnose without reading bili's log. Additive — when no
+                // upstream failure is attached the body is byte-identical to before.
+                const uf = upstreamFailureOf(err);
+                const diag: Record<string, unknown> = {};
+                if (uf?.kind !== undefined) diag.kind = uf.kind;
+                if (uf?.code !== undefined) diag.code = uf.code;
+                if (uf?.hint !== undefined) diag.hint = uf.hint;
                 res.writeHead(status, { "content-type": "application/json" });
-                res.end(JSON.stringify({ error: "acp-proxy failure", detail: msg }));
+                res.end(JSON.stringify({ error: "acp-proxy failure", detail: msg, ...(Object.keys(diag).length > 0 ? { upstreamFailure: diag } : {}) }));
             } else {
                 res.end();
             }
@@ -1022,6 +1031,16 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // a rebuild; different clients cross-wrote one shared proxy).
     const launcherLane = process.env.BILI_LAUNCHER_LANE?.trim() || undefined;
     const ownFingerprint = entryScriptFingerprint(process.argv[1]);
+    // #3801: our config shape EXACTLY as the registration below will record
+    // it — the byte-stable pair for judging whether a contended-port holder
+    // is a true duplicate or a config-drifted predecessor.
+    const ownShape: InstanceShape = {
+        host: opts.host,
+        passthrough: opts.passthrough,
+        mitmDomains: opts.mitm.enabled ? [...opts.mitm.domains] : [],
+        modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
+        modelMaxOutputs: { ...LAUNCHER_MODEL_MAX_OUTPUTS },
+    };
     const MAX_LISTEN_ATTEMPTS = 17;
     let listenAttempts = 0;
     let lastTriedPort = opts.port;
@@ -1278,12 +1297,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // flush sessions, and exit cleanly (exit code 1 so callers/scripts notice).
     server.on("error", (err: NodeJS.ErrnoException) => {
         let busyReason: FailFastReason | undefined;
-        let twin: RegistryEntry | undefined;
+        let peer: SameLanePeer | undefined;
         if (err.code === "EADDRINUSE") {
-            twin = findSameLaneTwin(listInstances(), lastTriedPort, launcherLane, ownFingerprint);
+            peer = classifySameLanePeer(listInstances(), lastTriedPort, launcherLane, ownFingerprint, (e) => sameInstanceShape(entryShape(e), ownShape));
             const action = decideEaddrinuse({
                 upgradeReplacement,
-                twinHolds: twin !== undefined,
+                twinHolds: peer?.kind === "twin",
                 launchToken: launchToken !== undefined,
                 strictPort,
                 attempts: listenAttempts,
@@ -1299,7 +1318,14 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             }
             if (action.kind === "ladder") {
                 listenAttempts += 1;
-                log("warn", `port ${lastTriedPort} busy — ${action.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${action.nextPort}`}`);
+                // #3801: laddering OFF a same-build same-lane holder means it
+                // drifted (a true twin would have failed fast above) — name
+                // the coexistence so the dual-instance state in the logs is
+                // explainable: both run, each serves its own sessions.
+                const driftNote = peer?.kind === "drifted"
+                    ? ` — held by a same-lane bili instance (pid ${peer.entry.pid}) whose config drifted since it spawned; it keeps serving its own sessions while this one takes the next free port`
+                    : "";
+                log("warn", `port ${lastTriedPort} busy — ${action.nextPort === 0 ? "retrying on an ephemeral port" : `retrying on port ${action.nextPort}`}${driftNote} (#3801)`);
                 attemptListen(action.nextPort);
                 return;
             }
@@ -1308,7 +1334,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         const hint =
             err.code === "EADDRINUSE"
                 ? busyReason === "twin-collision"
-                  ? ` — port ${lastTriedPort} is already served by a same-build bili instance (pid ${twin?.pid}, lane ${launcherLane}) — exiting instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`
+                  ? ` — port ${lastTriedPort} is already served by a same-build bili instance (pid ${peer?.entry.pid}, lane ${launcherLane}) — exiting instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`
                   : busyReason === "upgrade-replacement"
                     ? ` — this process is an upgrade-restart replacement (#3044): it must own port ${lastTriedPort} exactly, but the prior instance still holds it. Exiting instead of hopping to ${lastTriedPort + 1} — a drifted replacement serves no client and leaks while the prior instance keeps serving; the upgrade retries on the next cooldown cycle.`
                     : busyReason === "strict-port"

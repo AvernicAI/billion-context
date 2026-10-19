@@ -350,8 +350,9 @@ line in `CACHE INVALIDATION`, and a 🔑 badge in the web sessions column.
 HTTP: `GET /__bili/cache-report`; the raw per-request `[acp-usage]` lines still
 land in the log file for deep dives.
 
-**What does `/acp` show?** In clients with the native plugin (opencode, dsh),
-`/acp` renders the ACP status panel of the current conversation straight from
+**What does `/acp` show?** In clients with the native plugin (opencode, dsh,
+hermes), `/acp` renders the ACP status panel of the current conversation
+straight from
 the proxy (session, blocks, compressible ranges, usage); before the first model
 request it shows an idle notice instead. `/acp-cache [full]` prints the cache
 report above.

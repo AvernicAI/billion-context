@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { BILI_COMPACTION_DISABLE_SERVICE, compactionDisablePatchRows, disableBasicCompaction, registerCompactionDisable } from "../src/agent/dsh-compaction-disable.ts";
+import { BILI_COMPACTION_DISABLE_SERVICE, compactionDisablePatchRows, detectCompactionOverlayGap, disableBasicCompaction, registerCompactionDisable } from "../src/agent/dsh-compaction-disable.ts";
 import { writeDshAcpPatch } from "../src/launcher.ts";
 
 // #3354: the vendored dsh basic-compaction disable overlay (deshark42/
@@ -80,6 +80,19 @@ test("#3354 registerCompactionDisable: degrades per layer without throwing", () 
     let seen: unknown[] = [];
     registerCompactionDisable({ on: (_event, listener) => { seen.push(listener); } });
     assert.equal(seen.length, 1);
+});
+
+test("#3806 detectCompactionOverlayGap: latched when both capabilities are present", () => {
+    assert.equal(detectCompactionOverlayGap({ on: () => {}, reflect: { provide: () => {} } }), null);
+});
+
+test("#3806 detectCompactionOverlayGap: missing internal/config hook -> no-config-hook", () => {
+    assert.equal(detectCompactionOverlayGap({ reflect: { provide: () => {} } }), "no-config-hook");
+    assert.equal(detectCompactionOverlayGap({}), "no-config-hook");
+});
+
+test("#3806 detectCompactionOverlayGap: missing service provide -> no-service-provide", () => {
+    assert.equal(detectCompactionOverlayGap({ on: () => {} }), "no-service-provide");
 });
 
 test("#3354 registerCompactionDisable: transform honors the entry predicate and preserves siblings", () => {

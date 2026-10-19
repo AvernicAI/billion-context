@@ -1890,6 +1890,12 @@ type FileConfig = {
         outboundBodyBytes?: number;
         /** Soft egress byte budget for the WebSocket lane (#3701; default 10 MiB, 0 disables). Above it, older non-protected images are shed from the outbound copy before sending. Env BILI_WS_OUTBOUND_BYTES wins. */
         wsOutboundBytes?: number;
+        /** Extra root-CA PEM bundle trusted by bili's OWN outbound upstream fetch (#3776): for security
+         *  software doing HTTPS/encrypted-connection scanning (Kaspersky, enterprise DLP) or a corporate
+         *  MITM proxy whose re-signed upstream cert Node's default trust rejects with
+         *  SELF_SIGNED_CERT_IN_CHAIN. MERGED with Node's built-in roots, never replacing them.
+         *  Env BILI_CA_FILE wins. */
+        caFile?: string;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
     persist?: {

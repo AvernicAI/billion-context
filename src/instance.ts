@@ -181,24 +181,75 @@ export function findSameLanePredecessor(
     return undefined;
 }
 
-/** #3044 follow-up: a live holder on the same lane running OUR build — a
- *  twin, not a predecessor. Nothing is draining (it is healthy and serving),
- *  so waiting cannot help; laddering +1 strands the newcomer as an orphan
- *  nobody routes to while the twin keeps serving (the second trigger path of
- *  #3044: a host respawn racing a live instance). The newcomer must exit
- *  loudly instead — the duplicate loses, the serving instance wins. Missing
- *  fingerprints never match: an unknown build is not our twin. */
-export function findSameLaneTwin(
+/** #3801: the config-shape cells of a registered instance, normalized the
+ *  way every consumer already normalizes them (discoverLiveInstances):
+ *  absent fields ARE the empty value — a marker written before a cell
+ *  existed records nothing, which means "none". */
+export interface InstanceShape {
+    host: string;
+    passthrough: boolean;
+    mitmDomains: string[];
+    modelWindows: Record<string, number>;
+    modelMaxOutputs: Record<string, number>;
+}
+
+export function entryShape(e: Pick<RegistryEntry, "host" | "passthrough" | "mitmDomains" | "modelWindows" | "modelMaxOutputs">): InstanceShape {
+    return {
+        host: e.host ?? "",
+        passthrough: Boolean(e.passthrough),
+        mitmDomains: e.mitmDomains ?? [],
+        modelWindows: e.modelWindows ?? {},
+        modelMaxOutputs: e.modelMaxOutputs ?? {},
+    };
+}
+
+/** #3801: order-sensitive domain comparison (the launcher's want-side
+ *  projection compares positionally too) plus exact map equality on the two
+ *  per-model tables — the same cells instanceShapeMismatch judges on attach. */
+export function sameInstanceShape(a: InstanceShape, b: InstanceShape): boolean {
+    if (a.host !== b.host || a.passthrough !== b.passthrough) return false;
+    if (a.mitmDomains.length !== b.mitmDomains.length || !a.mitmDomains.every((d, i) => d === b.mitmDomains[i])) return false;
+    const wa = Object.keys(a.modelWindows);
+    const wb = Object.keys(b.modelWindows);
+    if (wa.length !== wb.length || !wa.every((k) => a.modelWindows[k] === b.modelWindows[k])) return false;
+    const ma = Object.keys(a.modelMaxOutputs);
+    const mb = Object.keys(b.modelMaxOutputs);
+    if (ma.length !== mb.length || !ma.every((k) => a.modelMaxOutputs[k] === b.modelMaxOutputs[k])) return false;
+    return true;
+}
+
+/** #3801: classify the LIVE same-lane holder of a contended port against OUR
+ *  build. "twin" = identical code AND identical config shape — a true
+ *  duplicate: this launch could have attached to it, nothing is draining, so
+ *  laddering +1 would strand the newcomer as an orphan nobody routes to
+ *  (#3044). The duplicate must exit loudly; the serving instance wins.
+ *  "drifted" = identical code, DIFFERENT config shape (the client's model
+ *  config was edited after the holder spawned — #3801). It is NOT attachable
+ *  and therefore NOT a duplicate: the newcomer ladders off to a free port and
+ *  serves there while the holder keeps serving its own sessions untouched —
+ *  dying here instead wedges the lane behind the stale instance forever
+ *  (attach rejects it, rotation never applies to a same-version drift, and
+ *  the sticky port keeps pointing at it). Wrong port/lane, dead pid, or a
+ *  different/missing fingerprint never classify (those are predecessors or
+ *  foreign squatters, handled by their own paths). */
+export interface SameLanePeer {
+    kind: "twin" | "drifted";
+    entry: RegistryEntry;
+}
+
+export function classifySameLanePeer(
     entries: RegistryEntry[],
     port: number,
     lane: string | undefined,
     ownFingerprint: string | undefined,
-): RegistryEntry | undefined {
+    sameShape: (e: RegistryEntry) => boolean,
+): SameLanePeer | undefined {
     if (!lane || !ownFingerprint) return undefined;
     for (const e of entries) {
         if (e.port !== port || e.lane !== lane) continue;
         if (!isPidAlive(e.pid)) continue;
-        if (e.codeFingerprint === ownFingerprint) return e;
+        if (e.codeFingerprint !== ownFingerprint) continue;
+        return { kind: sameShape(e) ? "twin" : "drifted", entry: e };
     }
     return undefined;
 }

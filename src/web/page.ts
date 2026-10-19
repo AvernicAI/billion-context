@@ -87,6 +87,7 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <p class="dim small" style="margin:0 0 8px" data-i18n="cfg.file_desc">${zh("cfg.file_desc")}</p>
 <dl class="kv"><div class="k" data-i18n="dt.config_file">${zh("dt.config_file")}</div><div class="v" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span id="cfg-path" class="mono dim small"></span><button id="copy-cfg-file" class="btn sm copy-btn" data-copy=""><span data-i18n="common.copy">${zh("common.copy")}</span></button></div></dl>
 <textarea id="cfg-file-edit" class="editor mono codebox" spellcheck="false"></textarea>
+<div id="cfg-relay-warn" class="banner warn" style="margin-top:10px" hidden></div>
 <div class="cfg-dirty-note small" style="margin-top:10px;color:#9a6700" hidden><span data-i18n="cfg.unsaved">${zh("cfg.unsaved")}</span></div>
 <div style="margin-top:10px"><button id="save-file" class="btn"><span data-i18n="cfg.save">${zh("cfg.save")}</span></button></div>
 </div></div>

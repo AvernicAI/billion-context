@@ -385,8 +385,9 @@ function clearNoCeilingDegraded(session: { metadata: Record<string, unknown> }, 
  *  runtime-info / launcher / registry sources) so a broken client cannot pin
  *  the session at a few hundred tokens forever. The #453 clamp downstream
  *  still bounds the result by real window headroom. A ceiling at/below the
- *  side-request threshold is not usable; a healthy water mark above the
- *  ceiling keeps winning (it is a capability floor, not an instruction cap).
+ *  side-request threshold is not usable; a water mark ABOVE the ceiling no
+ *  longer wins (#3833): it is a stale cross-model artifact — the restore is
+ *  clamped down to the ceiling and the over-bound water corrected in place.
  *  #3071/#3406: when NO source knows a ceiling, a starved request is floored
  *  at OUTPUT_RESTORE_ABSOLUTE_FLOOR unless the session's recorded high-water is
  *  a functional budget (>= OUTPUT_HIGH_WATER_TRUST_MIN) — a fresh/forked
@@ -427,9 +428,23 @@ export function restoreOutputBudget(
     const highWaterRaw = session.metadata.outputBudgetHighWater;
     const highWater = typeof highWaterRaw === "number" && highWaterRaw > SIDE_REQUEST_MAX_TOKENS ? highWaterRaw : undefined;
     let target = highWater;
-    if (ceiling !== undefined && (target === undefined || ceiling > target)) {
+    if (ceiling !== undefined) {
+        // #3833: the ceiling is a HARD upstream bound on this model's output
+        // (glm-5.3 rejects max_tokens above 131072 with 400 code 1210). A
+        // cross-model high-water learned from a previous model whose declared
+        // ceiling was higher must NOT be restored verbatim into this model's
+        // request — clamp the restore target down to the ceiling and correct the
+        // over-bound water IN PLACE so every subsequent turn stops replaying it
+        // instead of re-poisoning each turn (#3833 root cause 3: the water is a
+        // session-level scalar with no model dimension). A water at/below the
+        // ceiling keeps the pre-existing raise-to-ceiling rescue (#1665/#1840);
+        // with no water the ceiling floors the restore (unchanged).
+        if (highWater !== undefined && highWater > ceiling) {
+            session.metadata.outputBudgetHighWater = ceiling;
+            log("warn", `[${session.id}] output budget high-water ${highWater} exceeds ${modelName}'s declared output ceiling ${ceiling} — corrected the session high-water to the ceiling in place so subsequent turns stop replaying the over-bound value (#3833: a cross-model high-water must not outlive its origin model)`);
+        }
         target = ceiling;
-    } else if (ceiling === undefined) {
+    } else if (target === undefined || target < OUTPUT_HIGH_WATER_TRUST_MIN) {
         // #3071 path 1 + path 2b: a starved budget with NO usable bound of its
         // own must never leave the proxy verbatim — a fresh fork child inherits
         // the parent's rattle with no high-water, and a death-rattle high-water
@@ -442,17 +457,19 @@ export function restoreOutputBudget(
         // maxOutputTokens below this floor rejects the raised value outright
         // (400), trading a degraded-but-working session for a failing one
         // (availability over ideology, #3128).
-        if (target === undefined || target < OUTPUT_HIGH_WATER_TRUST_MIN) target = OUTPUT_RESTORE_ABSOLUTE_FLOOR;
+        target = OUTPUT_RESTORE_ABSOLUTE_FLOOR;
     }
     if (typeof target === "number") {
         writeOutputBudget(p, field, target);
-        const note = ceiling !== undefined && target === ceiling
-            ? (highWater === undefined ? "; no healthy high-water yet — using known output ceiling (#1665/#1840)" : `; high-water ${highWater} below known output ceiling — floored (#1665/#1840)`)
-            : (ceiling === undefined
-                ? (target === highWater
-                    ? "; no known output ceiling — restored to the session's own recorded budget, never raised above it (#3406)"
-                    : "; no known output ceiling — floored to the absolute capability minimum (#3071)")
-                : "");
+        const note = ceiling !== undefined
+            ? (highWater === undefined
+                ? "; no healthy high-water yet — using known output ceiling (#1665/#1840)"
+                : (highWater > ceiling
+                    ? `; high-water ${highWater} exceeded the ceiling — clamped to it and the water corrected in place (#3833)`
+                    : `; high-water ${highWater} below known output ceiling — floored (#1665/#1840)`))
+            : (target === highWater
+                ? "; no known output ceiling — restored to the session's own recorded budget, never raised above it (#3406)"
+                : "; no known output ceiling — floored to the absolute capability minimum (#3071)");
         log("info", `[${session.id}] output budget restored ${value} -> ${target} (#546: client shrank it from its raw-history estimate${note})`);
     }
     // #2904: persist the no-ceiling degraded state for the user-visible surfaces.

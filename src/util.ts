@@ -266,6 +266,14 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     // Gemini (generativelanguage.googleapis.com) 400 INVALID_ARGUMENT:
     // "The input token count (N) exceeds the maximum number of tokens allowed (W)."
     /exceeds the maximum number of tokens/i,
+    // #3787: agnes/cch-family relay gateways reject over-window requests with
+    // {"type":"error","error":{"type":"context_limit","message":"上下文长度超过模型限制，请减少对话历史或输入内容 (…)"} } —
+    // no window number anywhere in the body; the emergency shrink then arms at
+    // the rejected payload's own token estimate (#987). The CJK patterns cover
+    // both word orders ("上下文…超出" and "超出…上下文").
+    /context_limit/i,
+    /上下文.{0,8}(?:超出|超过|超限)/,
+    /(?:超出|超过|超限).{0,8}上下文/,
 ];
 
 function toTokenNumber(s: string): number | undefined {

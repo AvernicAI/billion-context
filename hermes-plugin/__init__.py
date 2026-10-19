@@ -33,6 +33,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections import OrderedDict
@@ -49,6 +50,7 @@ ATTACH_EXTERNAL_ENV = "BILI_NATIVE_ATTACH_EXTERNAL"
 MANIFEST_TIMEOUT_S = 5.0
 TOOL_TIMEOUT_S = 60.0
 RUNTIME_INFO_TIMEOUT_S = 5.0
+STATUS_TIMEOUT_S = 5.0
 HEALTH_PROBE_TIMEOUT_S = 2.0
 SPAWN_WAIT_S = 10.0
 SPAWN_POLL_S = 0.1
@@ -1135,6 +1137,119 @@ def on_pre_api_request(*, session_id: str = "", model: str = "", max_tokens: Any
         pass
 
 
+# — in-session slash commands (/acp, /acp-cache; #3697) --------------------------
+
+def _command_origin() -> Optional[str]:
+    """Proxy origin for command queries: our own attach/spawn target first, then an
+    explicit BILLION_CONTEXT_PROXY (a launcher-owned proxy we stood down from routing)."""
+    origin = _state.get("origin")
+    if isinstance(origin, str) and origin.strip():
+        return origin.strip().rstrip("/")
+    raw = (os.environ.get("BILLION_CONTEXT_PROXY") or "").strip()
+    if raw.startswith(("http://", "https://")):
+        return raw.rstrip("/")
+    return None
+
+
+def _current_session_key() -> str:
+    """Route key of the session whose turn is running in THIS context ('' outside one).
+    Best-effort host API: older builds lack hermes_cli.plugin_session, and a command typed
+    between turns may carry no context at all — callers then fall back to latest."""
+    try:
+        from hermes_cli.plugin_session import session_key  # type: ignore
+        key = session_key()
+        return key.strip() if isinstance(key, str) else ""
+    except Exception:
+        return ""
+
+
+def _fetch_status(origin: str, conversation_id: str) -> Optional[Dict[str, Any]]:
+    url = (origin + "/__bili/plugin/status?conversationId="
+           + urllib.parse.quote(conversation_id, safe="") + "&fallback=latest")
+    data = http_get_json(url, STATUS_TIMEOUT_S)
+    return data if isinstance(data, dict) else None
+
+
+def _fetch_version(origin: str) -> Optional[str]:
+    manifest = http_get_json(origin + "/__bili/plugin/manifest", STATUS_TIMEOUT_S)
+    if not isinstance(manifest, dict):
+        return None
+    version = manifest.get("version")
+    if not isinstance(version, str) or not version:
+        return None
+    commit = manifest.get("commit")
+    return f"{version} ({commit})" if isinstance(commit, str) and commit else version
+
+
+def _session_banner(status: Dict[str, Any], requested: str) -> List[str]:
+    """#656 twin: when fallback=latest resolved a DIFFERENT conversation than requested
+    (or none was requested), name which session is shown."""
+    resolved = status.get("conversationId")
+    if isinstance(resolved, str) and resolved and resolved != requested:
+        return [f"(showing most recently active session {resolved})"]
+    return []
+
+
+def acp_command(raw_args: str = "") -> Optional[str]:
+    """`/acp`: this session's context-compression status panel (the panel header carries
+    version + build). Mirrors the dsh/pi /acp lanes — every displayed byte comes from the
+    proxy's HTTP endpoints."""
+    try:
+        origin = _command_origin()
+        if not origin:
+            return ("bili: no proxy detected — install the plugin (`bili plugin install hermes`) "
+                    "and start a new hermes session so /acp can read context status.")
+        conversation = _current_session_key() or AGENT_NAME
+        status = _fetch_status(origin, conversation)
+        panel = status.get("panel") if isinstance(status, dict) else None
+        if isinstance(panel, str) and panel.strip():
+            return "\n".join(_session_banner(status, conversation) + [panel.strip()])
+        version = _fetch_version(origin)
+        if version:
+            return (f"billion-context@{version} — proxy connected, compression armed. "
+                    "No model request yet; send one, then run /acp again.")
+        return f"bili: proxy not reachable at {origin} — is the bili proxy still running?"
+    except Exception as exc:
+        logger.warning("billion-context: /acp failed (%s)", exc)
+        return f"bili: /acp failed ({type(exc).__name__}: {exc})"
+
+
+def acp_cache_command(raw_args: str = "") -> Optional[str]:
+    """`/acp-cache`: prompt-cache reconciliation report — same report as the acp_cache tool
+    (#1146), forwarded through the proxy's plugin tool endpoint. The host's command API
+    passes no arguments, so this always shows the default (summary-ledger) report."""
+    try:
+        origin = _command_origin()
+        if not origin:
+            return ("bili: no proxy detected — install the plugin (`bili plugin install hermes`) "
+                    "and start a new hermes session so /acp-cache can read the cache report.")
+        status = _fetch_status(origin, _current_session_key() or AGENT_NAME)
+        cid = status.get("conversationId") if isinstance(status, dict) else None
+        if not isinstance(cid, str) or not cid:
+            version = _fetch_version(origin)
+            if version:
+                return (f"billion-context@{version} — proxy connected, compression armed. "
+                        "No model request yet; send one, then run /acp-cache again.")
+            return f"bili: proxy not reachable at {origin} — is the bili proxy still running?"
+        code, payload = http_post_json(
+            origin + "/__bili/plugin/tool",
+            {"conversationId": cid, "tool": "acp_cache", "args": {}},
+            TOOL_TIMEOUT_S,
+        )
+        if code == 200 and isinstance(payload, dict) and payload.get("ok"):
+            result = payload.get("result")
+            return result if isinstance(result, str) else json.dumps(result)
+        detail = payload.get("error") if isinstance(payload, dict) else None
+        msg = str(detail or f"http {code}")
+        if "no model request has arrived" in msg:
+            return ("bili: no ACP session yet for this conversation "
+                    "(send a model request first, then run /acp-cache)")
+        return f"bili: cache report failed: {msg}"
+    except Exception as exc:
+        logger.warning("billion-context: /acp-cache failed (%s)", exc)
+        return f"bili: /acp-cache failed ({type(exc).__name__}: {exc})"
+
+
 # — entry point -----------------------------------------------------------------
 
 def register(ctx: Any) -> None:
@@ -1173,6 +1288,17 @@ def register(ctx: Any) -> None:
             names.append(str(tool["name"]))
         ctx.register_middleware("llm_request", on_llm_request)
         ctx.register_hook("pre_api_request", on_pre_api_request)
+        # In-session slash commands; hosts without PluginContext.register_command
+        # (older builds) skip them — tools keep working, only the command entries are absent.
+        if hasattr(ctx, "register_command"):
+            ctx.register_command(
+                "acp", acp_command,
+                description="Show bili context-compression status for this session",
+            )
+            ctx.register_command(
+                "acp-cache", acp_cache_command,
+                description="Prompt-cache reconciliation (same report as the acp_cache tool)",
+            )
         _state["tools_ready"] = True
         logger.info("billion-context: hermes native mode active (%s, tools: %s)",
                     _state.get("mode"), ", ".join(names))

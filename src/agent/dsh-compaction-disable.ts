@@ -90,3 +90,18 @@ export function registerCompactionDisable(ctx: CompactionDisableHost): void {
     // Publish only after the middleware is registered; the host owns both lifetimes.
     ctx.reflect?.provide?.(BILI_COMPACTION_DISABLE_SERVICE, Object.freeze({ owner: "billion-context", issue: "#3354" }));
 }
+
+type CompactionOverlayGap = "no-config-hook" | "no-service-provide";
+
+/** Why the #3354 load-time overlay cannot latch on this host (null = latched).
+ *  Mirrors registerCompactionDisable's own capability checks: without `on` the
+ *  internal/config transform never installs, and without reflect.provide the
+ *  preset inject latch never opens — either way dsh native basic compaction
+ *  stays ARMED. Exposed so the caller can turn the SILENT fail-safe degradation
+ *  into a loud boot-time alarm (#3806) instead of letting the user discover an
+ *  armed compactor days later through a destroyed fold base. */
+export function detectCompactionOverlayGap(ctx: CompactionDisableHost): CompactionOverlayGap | null {
+    if (typeof ctx.on !== "function") return "no-config-hook";
+    if (typeof ctx.reflect?.provide !== "function") return "no-service-provide";
+    return null;
+}

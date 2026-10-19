@@ -54,11 +54,38 @@ interface ShadowStats {
     imports: number;
     disabled: boolean;
     lastError: string | null;
+    /** #3818: records skipped from the mirror because they carry orphan
+     * blockContents (ids with no state.blocks entry) — hand-built archives
+     * and web seeds; the JSON envelope remains the serving copy. */
+    orphanSkips: number;
+}
+
+/**
+ * #3818: true when blockContents carries ids that no state.blocks entry
+ * claims. The unified ingest only materializes block rows for
+ * state.blocks entries, so such records cannot round-trip through viewFor
+ * without losing the orphans — they must keep serving from their JSON
+ * envelope. Real kernel sessions never trip this (state.blocks retains
+ * consumed blocks); hand-built archives and web seeds can.
+ */
+export function orphanContents(legacy: LegacySessionLike): boolean {
+    if (legacy.blockContents.size === 0) return false;
+    const known = new Set<string>();
+    for (const block of legacy.state.blocks) known.add(block.blockId);
+    for (const id of legacy.blockContents.keys()) {
+        if (!known.has(id)) return true;
+    }
+    return false;
 }
 
 export class UnifiedShadow {
     readonly mode: StorageMode;
-    readonly stats: ShadowStats = { ingests: 0, deltaIngests: 0, verifySamples: 0, verifyOk: 0, verifyDrift: 0, imports: 0, disabled: false, lastError: null };
+    readonly stats: ShadowStats = { ingests: 0, deltaIngests: 0, verifySamples: 0, verifyOk: 0, verifyDrift: 0, imports: 0, disabled: false, lastError: null, orphanSkips: 0 };
+    /** #3135 ④/#3818: sessions whose last sampled verify drifted. Members are
+     *  served from the JSON envelope by persist.loadSync (while it exists)
+     *  until a save verifies clean again; surfaced on /__bili/status wire as
+     *  driftedSessions so drift is observable, not just logged. */
+    readonly driftedSessions = new Set<string>();
     private readonly store: UnifiedStore;
     private readonly legacyLoad: (record: unknown) => LegacySessionLike | null;
     private consecutiveFailures = 0;
@@ -142,6 +169,18 @@ export class UnifiedShadow {
         try {
             const loaded = this.legacyLoad(record);
             if (!loaded) return;
+            // #3818/#3135: a record carrying blockContents ids with no
+            // matching state.blocks entry (hand-built archives, web seeds)
+            // is a shape the unified ingest cannot represent — block rows
+            // land only for state.blocks entries, so a viewFor rebuild
+            // would silently drop those contents. Real kernel sessions
+            // never have orphans (state.blocks keeps consumed blocks), so
+            // skipping the mirror here is free; the JSON envelope stays
+            // the superset on disk.
+            if (orphanContents(loaded)) {
+                this.stats.orphanSkips++;
+                return;
+            }
             let legacy = loaded;
             let hasRawTail = false;
             if (rawTail && rawTail.lastMessages.length > 0) {
@@ -192,6 +231,7 @@ export class UnifiedShadow {
                 const got = shadowDigest({ ...loaded, blockContents: orderedBlockContents(loaded.blockContents) });
                 if (got !== expect) {
                     this.stats.verifyDrift++;
+                    this.driftedSessions.add(legacy.id);
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
                     this.stats.lastError = `digest drift for ${legacy.id}: unified replay != legacy load view`;
@@ -207,6 +247,10 @@ export class UnifiedShadow {
                     loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — dropped the ingest watermark, the next save re-ingests the full tail`);
                 } else {
                     this.stats.verifyOk++;
+                    // #3135 ④/#3818: a clean sample re-admits the session to
+                    // index-first reads (the watermark re-verify path above
+                    // proved the views converged again).
+                    this.driftedSessions.delete(legacy.id);
                 }
             }
             this.consecutiveFailures = 0;
@@ -280,6 +324,13 @@ export class UnifiedShadow {
         try {
             const legacy = this.legacyLoad(record);
             if (!legacy) return null;
+            // #3818: same orphan-contents guard as record() — a record the
+            // index cannot represent faithfully must not be served from a
+            // viewFor rebuild; callers fall back to the envelope itself.
+            if (orphanContents(legacy)) {
+                this.stats.orphanSkips++;
+                return null;
+            }
             this.store.ingestSession(planIngest(legacy));
             this.stats.imports++;
             loggerLog("info", `[storage] unified import on first open: ${legacy.id}`);

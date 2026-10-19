@@ -144,6 +144,13 @@ export interface CooldownMarker {
     reason: string;
 }
 
+/** Absolute path of the failure marker (#3788): surfaced in the storage
+ *  diagnostics blob so a user can delete it to force an immediate retry
+ *  instead of waiting out the whole cooldown window. */
+export function bootstrapFailureMarkerPath(): string {
+    return cooldownFile();
+}
+
 /** Sync read of the failure marker for status surfaces (#3040): same file and
  *  shape validation as readCooldown, but synchronous so the web endpoints can
  *  report remaining cooldown without awaiting. */
@@ -219,12 +226,20 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
     const target = platformOverride ?? platformTargetKey();
     if (cacheUsable(finalDir(spec.version), target)) {
         if (!tryRegisterFromCache(finalDir(spec.version))) {
-            // Bytes were sha-verified when cached, so an unloadable copy means
-            // an environment change (e.g. major Node upgrade) — keep warning,
-            // never re-loop the download, never brick startup.
-            loggerLog("warn", `[storage] sqlite engine self-bootstrap: cached copy present but unloadable — continuing without it`);
+            // #3135 ⑤/#3818: the copy's bytes were sha-verified when cached,
+            // so "unloadable" means the environment changed under it (major
+            // Node upgrade, truncated cache write, platform drift). A cache
+            // that cannot load is worthless in place — remove it and fall
+            // through to ONE pinned re-download (sha512 keeps the retry
+            // safe); the old keep-warn-never-retry stance left a #2833
+            // user permanently stuck on legacy with only a log line.
+            loggerLog("warn", `[storage] sqlite engine self-bootstrap: cached copy present but unloadable — removed, retrying one pinned download`);
+            await fsp.rm(finalDir(spec.version), { recursive: true, force: true }).catch(() => {
+                // best-effort cleanup; the pinned download re-verifies anyway
+            });
+        } else {
+            return { status: "cache-hit", detail: target };
         }
-        return { status: "cache-hit", detail: target };
     }
     if (!SUPPORTED_TARGETS.includes(target)) {
         return { status: "unsupported-platform", detail: target };
@@ -241,7 +256,16 @@ async function runBootstrap(opts: EnsureSqliteEngineOptions): Promise<BootstrapO
     try {
         await downloadAndInstall(spec, target, opts.resolveProxy);
         if (!tryRegisterFromCache(finalDir(spec.version))) {
-            loggerLog("warn", `[storage] sqlite engine self-bootstrap: cached copy present but unloadable — continuing without it`);
+            // #3819 review: the bytes landed but the engine still won't load
+            // (AV quarantine, truncated extract, platform drift). Same
+            // semantics as a failed attempt below: arm the cooldown so a
+            // persistently broken environment stops re-downloading ~11 MB
+            // per boot, and report "failed" — "downloaded" would claim an
+            // engine that never registered.
+            const reason = "post-download registration failed";
+            await writeCooldown(reason);
+            loggerLog("warn", `[storage] sqlite engine self-bootstrap: download ok but engine still unloadable (${reason}) — continuing without it; retrying after ${COOLDOWN_MS / 3_600_000}h`);
+            return { status: "failed", detail: reason };
         }
         await clearCooldown();
         await pruneSiblingVersions(finalDir(spec.version));

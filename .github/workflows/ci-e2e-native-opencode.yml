@@ -15,7 +15,9 @@ on:
 concurrency:
   # #2637 plan #3: schedule-safe group — master pushes must not cancel the
   # day's nightly run; same-ref pushes still supersede each other.
-  group: e2e-native-opencode-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
+  # #3772: a non-ci:full `labeled` run is skip-scoped by its gate job below —
+  # keep it in its own group so it can never cancel the in-flight real run.
+  group: e2e-native-opencode-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name != 'ci:full') && '-skip' || '' }}
   # #3331: cancel-in-progress applies WITHIN the group too — a 30-min cron whose
   # run outlives the interval would kill its predecessor mid-suite (tokens spent,
   # no green recorded, gate can never skip). Cancel only same-ref superseded

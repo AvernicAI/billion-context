@@ -20,7 +20,10 @@
  * PUBLISH DISCIPLINE: the blob lands in a PUBLIC GitHub issue body. Secret
  * values are replaced before serialization and redactSecretsInText is applied
  * as a sink-level net; only profile NAMES are included, never absolute paths
- * (they would leak usernames).
+ * (they would leak usernames). #3811: non-public endpoint hosts are masked too —
+ * config URLs and conflict-log lines run through maskUrlsForPublish, which masks
+ * unconditionally so the blob stays host-safe even when BILI_LOG_MASK_HOSTS=0
+ * (the local host-visibility preference must not weaken the publish boundary).
  *
  * Contract: NEVER throws — every fs/listSessions access is guarded so a
  * broken log file or an unbuilt store degrades the blob, not the endpoint.
@@ -33,7 +36,7 @@ import { summarizeConflicts } from "../conflict-watch.js";
 import { dshProfileDirs } from "../dsh-channel.js";
 import { resolveDshHome } from "../client-config.js";
 import { safeReadJson } from "../config.js";
-import { redactSecretsInText } from "../log-mask.js";
+import { maskUrlsForPublish, redactSecretsInText } from "../log-mask.js";
 import { getLogPath } from "../logger.js";
 import { configFile, defaultLogFile } from "../paths.js";
 import { listSessions } from "../session.js";
@@ -74,8 +77,13 @@ function baseLines(): string[] {
     ];
 }
 
+// #3813: count full-pair scans so tests pin the single-read-per-report
+// contract (a regression to per-tail reads would re-double the cost).
+let candidateLogReads = 0;
+
 /** All non-empty lines across the rotated log pair; [] on any fs failure. */
 function candidateLogLines(): string[] {
+    candidateLogReads += 1;
     try {
         const logFile = getLogPath() ?? defaultLogFile();
         const dir = logFile ? path.dirname(logFile) + path.sep : "";
@@ -93,10 +101,10 @@ function candidateLogLines(): string[] {
     }
 }
 
-/** Last N `[storage]` lines across the rotated pair (same candidate recipe as
- * sendWebLogs); empty on any fs failure. */
-function storageLogTail(): string[] {
-    return candidateLogLines().filter((l) => l.includes("[storage]")).slice(-STORAGE_LOG_TAIL_LINES);
+/** Last N `[storage]` lines from the pre-fetched candidate set ([] when none
+ * match). The caller reads the rotated pair once per report (#3813). */
+function storageLogTail(lines: string[]): string[] {
+    return lines.filter((l) => l.includes("[storage]")).slice(-STORAGE_LOG_TAIL_LINES);
 }
 
 // #3611: the evidence chain of a dsh native-compaction episode, exactly what a
@@ -112,12 +120,16 @@ const CONFLICT_LOG_PATTERNS = [
     "profile bundles include @deepseek-ai/dsh-web-app",
 ];
 
-function conflictLogTail(): string[] {
-    return candidateLogLines()
+function conflictLogTail(lines: string[]): string[] {
+    return lines
         .filter((l) => CONFLICT_LOG_PATTERNS.some((p) => l.includes(p)))
         .slice(-CONFLICT_LOG_TAIL_LINES)
         .map((l) => {
-            const masked = redactSecretsInText(l);
+            // #3811: redactSecretsInText scrubs credential shapes only — a URL in a
+            // log line keeps its host. maskUrlsForPublish masks it unconditionally,
+            // so under BILI_LOG_MASK_HOSTS=0 (real hosts in the on-disk log) the
+            // published tail still cannot leak them.
+            const masked = maskUrlsForPublish(redactSecretsInText(l));
             return masked.length > LOG_LINE_MAX_CHARS ? masked.slice(0, LOG_LINE_MAX_CHARS - 1) + "…" : masked;
         });
 }
@@ -193,8 +205,11 @@ function hostClientVersionLines(): string[] {
 // #3611: the user's config file AS WRITTEN (not the resolved options — a
 // maintainer must see what the user actually typed), secret-bearing values
 // replaced before serialization; redactSecretsInText then scrubs credential
-// SHAPES that survive (bearer/sk-/xai-/AIza/JWT, key=value pairs); URL
-// userinfo — which no pattern of those covers — is stripped separately below.
+// SHAPES that survive (bearer/sk-/xai-/AIza/JWT, key=value pairs). #3811: none
+// of those touch a bare endpoint HOST — providers[].upstream / route-prefix
+// keys / proxy URLs are masked after serialization by maskUrlsForPublish, which
+// runs unconditionally (publish boundary, ignores BILI_LOG_MASK_HOSTS) and drops
+// userinfo/query/hash, so the old userinfo-only strip below is subsumed.
 const SECRET_KEY_RE = /key|token|secret|password|passwd|credential|auth/i;
 
 function maskSecretValues(node: unknown, key?: string): unknown {
@@ -226,10 +241,11 @@ function configSectionLines(): string[] {
     }
     let text: string;
     try {
-        text = redactSecretsInText(JSON.stringify(maskSecretValues(parsed)))
-            // https://user:pass@host → https://host — userinfo is credential-shaped
-            // by definition and no redactSecretsInText pattern covers it.
-            .replace(/(https?:\/\/)[^/\s@]*@/gi, "$1");
+        // #3811: maskUrlsForPublish is the outermost sink net — it masks every
+        // non-public endpoint host whether it appears as a VALUE (upstream/proxy)
+        // or a providers-table KEY, and drops userinfo/query/hash (subsuming the
+        // old userinfo-only strip). Always on: the blob is publish-boundary.
+        text = maskUrlsForPublish(redactSecretsInText(JSON.stringify(maskSecretValues(parsed))));
     } catch {
         lines.push("(config could not be serialized)");
         return lines;
@@ -283,11 +299,16 @@ interface DiagnosticsReport {
 export function buildDiagnostics(topic?: string): DiagnosticsReport {
     const t = topic?.trim().slice(0, 64) ?? "";
     const def = t ? TOPICS[t] : undefined;
+    // #3813: read the rotated log pair at most ONCE per report — the storage
+    // tail and the conflict banner filter the SAME candidate lines, so a
+    // conflict-banner request used to read the whole pair twice (hundreds of MB
+    // possible), stalling the event loop synchronously.
+    const logLines = def || t === "conflict-banner" ? candidateLogLines() : [];
     const ctx: TopicContext = {
         sessions: safeSessionCount(),
-        storageLogLines: def ? storageLogTail() : [],
+        storageLogLines: def ? storageLogTail(logLines) : [],
         conflicts: def ? safeConflictSummary() : null,
-        conflictLogLines: t === "conflict-banner" ? conflictLogTail() : [],
+        conflictLogLines: t === "conflict-banner" ? conflictLogTail(logLines) : [],
     };
     const lines = baseLines();
     if (t && !def) lines.push(`topic: ${t} (no topic-specific section registered)`);
@@ -300,4 +321,12 @@ export function buildDiagnostics(topic?: string): DiagnosticsReport {
         : `bili diagnostics report (v${VERSION}, node ${process.version}, ${process.platform}-${process.arch})`;
     const url = `${GITHUB_NEW_ISSUE_URL}?title=${encodeURIComponent(title)}&body=${encodeURIComponent(blob)}`;
     return { blob, title, url };
+}
+
+export function _candidateLogReadsForTest(): number {
+    return candidateLogReads;
+}
+
+export function _resetCandidateLogReadsForTest(): void {
+    candidateLogReads = 0;
 }
