@@ -187,9 +187,9 @@ export class UnifiedShadow {
                     refs: this.store.getRefs(legacy.id),
                 };
                 const loaded = loadLegacyView(rows);
-                const expect = shadowDigest({ ...legacy, blockContents: orderedBlockContents(completeBlockContents(legacy.blockContents, legacy.state.blocks)) });
-                const got = shadowDigest({ ...loaded, blockContents: orderedBlockContents(loaded.blockContents) });
-                if (got !== expect) {
+                const expectView = { ...legacy, blockContents: orderedBlockContents(completeBlockContents(legacy.blockContents, legacy.state.blocks)) };
+                const gotView = { ...loaded, blockContents: orderedBlockContents(loaded.blockContents) };
+                if (shadowDigest(gotView) !== shadowDigest(expectView)) {
                     this.stats.verifyDrift++;
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
@@ -203,7 +203,10 @@ export class UnifiedShadow {
                     // tail slot through the exact full path (divergence
                     // window bounded to ≤ VERIFY_EVERY_INGESTS saves).
                     this.store.clearIngestWatermark(legacy.id);
-                    loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view — dropped the ingest watermark, the next save re-ingests the full tail`);
+                    // #3437: name WHICH parts diverge — a bare hash mismatch is
+                    // unclassifiable (fold-rewrite vs round-trip loss); drift-only cost.
+                    const divergent = shadowDigestDivergence(expectView, gotView);
+                    loggerLog("error", `[storage] unified shadow DIGEST DRIFT for ${legacy.id}: unified replay != legacy load view${divergent.length > 0 ? ` — divergent parts: ${divergent.join(", ")}` : ""} — dropped the ingest watermark, the next save re-ingests the full tail`);
                 } else {
                     this.stats.verifyOk++;
                 }
@@ -464,6 +467,38 @@ export class UnifiedShadow {
 
 function shadowDigest(view: unknown): string {
     return sha256(JSON.stringify(canonicalize(view)));
+}
+
+/** #3437: field-level breakdown of a digest mismatch. The whole-view hash
+ *  cannot say WHICH component the replay diverged on; this compares per
+ *  top-level key (and per `state.<field>` for the state bucket) under the
+ *  SAME canonicalization shadowDigest uses, so every reported part truly
+ *  differs by the digest's own rules. */
+export function shadowDigestDivergence(expectView: unknown, gotView: unknown): string[] {
+    const a = (expectView ?? {}) as Record<string, unknown>;
+    const b = (gotView ?? {}) as Record<string, unknown>;
+    const out: string[] = [];
+    for (const k of [...new Set([...Object.keys(a), ...Object.keys(b)])].sort()) {
+        const x = a[k];
+        const y = b[k];
+        if (k === "state" && isPlainRecord(x) && isPlainRecord(y)) {
+            for (const sk of [...new Set([...Object.keys(x), ...Object.keys(y)])].sort()) {
+                if (partHash(x[sk]) !== partHash(y[sk])) out.push(`state.${sk}`);
+            }
+        } else if (partHash(x) !== partHash(y)) {
+            out.push(k);
+        }
+    }
+    return out;
+}
+
+function isPlainRecord(v: unknown): v is Record<string, unknown> {
+    return v !== null && typeof v === "object" && !Array.isArray(v) && !(v instanceof Map) && !(v instanceof Set);
+}
+
+function partHash(v: unknown): string {
+    const s = JSON.stringify(canonicalize(v));
+    return sha256(s === undefined ? "\u0000undefined" : s);
 }
 
 // #3407: the parity digest must compare blockContents CONTENTS, not insertion order —
