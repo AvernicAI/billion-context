@@ -25,6 +25,12 @@ import path from "node:path";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST_ZSTD = "0";
+// #3756's D lane reads the unified transcript (unifiedTailViewRows); the CI
+// scheduler's tests/preload-storage-baseline.mjs pins BILI_STORAGE_UNIFIED
+// to "legacy" for the broad corpus, which leaves the sidecar off and the D
+// tests degrade to the legacy render (latch never counts). Assign (not ??=)
+// so this suite overrides the preload — it is ABOUT the unified store.
+process.env.BILI_STORAGE_UNIFIED = "shadow";
 process.env.BILI_CONFIG_FILE = path.join(mkdtempSync(path.join(tmpdir(), "bili-snap-hermetic-")), "no-config.json");
 
 import { defaultConfig } from "acp-kernel";
