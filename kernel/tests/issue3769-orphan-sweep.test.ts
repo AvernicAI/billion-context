@@ -232,3 +232,74 @@ test("a block-boundary fold marks the sweep by covered message refs, not the blo
   assert.deepEqual(r.newlySweptCallIds, [], "cached-prefix orphan before the fold is untouched");
   assert.ok(r.messages.some((m) => m.toolCallId === "f1"), "f1 remains visible");
 });
+
+test("an upgraded pre-fold-gate state keeps its rotation-hidden orphan hidden (#3769)", () => {
+  const state = createInitialState();
+  const messages: CoreMessage[] = [
+    msg("p1", "early"),
+    ...failPair("f1"),
+    msg("p2", "mid"),
+    ...failPair("f2"),
+    msg("p3", "late"),
+    ...failPair("f3"),
+  ];
+  seqRefs(state, messages);
+  // refs: p1=1 c-f1=2 r-f1=3 p2=4 c-f2=5 r-f2=6 p3=7 c-f3=8 r-f3=9
+
+  // Exact shape of a state the old keep-two kernel persisted: with three failures
+  // the rotation had already removed f1 from mid-history and remembered its refs.
+  // sweptOrphanCallIds / pendingOrphanSweepMinRef do not exist yet.
+  state.hiddenOrphanRefs = ["m00002", "m00003"];
+
+  const first = hideConsumedCompressCalls(state, messages, isMcp);
+  assert.deepEqual(first.newlySweptCallIds, [], "nothing newly swept without a fold");
+  const ids = first.messages.map((m) => m.id);
+  assert.ok(!ids.includes("c-f1") && !ids.includes("r-f1"), "previously-hidden pair does not resurface on upgrade");
+  assert.ok(ids.includes("c-f2") && ids.includes("c-f3"), "recent failures stay visible");
+
+  // Pipeline write-back (hide-compress-calls node) then another quiet turn: the
+  // legacy set self-perpetuates through rememberHiddenRef, no new field required.
+  state.hiddenOrphanRefs = first.hiddenOrphanRefs;
+  const second = hideConsumedCompressCalls(state, messages, isMcp);
+  const ids2 = second.messages.map((m) => m.id);
+  assert.ok(!ids2.includes("c-f1") && !ids2.includes("r-f1"), "still hidden on the next quiet turn");
+});
+
+test("the fold marker survives the full pipeline: sync-blocks carries it to the hide node (#3769)", () => {
+  const core = createCore();
+  const messages: CoreMessage[] = [
+    msg("p1", "early cached prefix alpha"),
+    ...failPair("f2"),
+    msg("p2", "mid detailed work item beta content"),
+  ];
+  const state = createInitialState();
+  seqRefs(state, messages);
+  // refs: p1=1 c-f2=2 r-f2=3 p2=4 — a fold starting at ref 2 committed last turn.
+  // Before the sync-blocks carry fix this marker died on the FIRST pipeline node
+  // (syncBlocks rebuilt state without the #3769 fields), so the sweep never fired.
+  state.pendingOrphanSweepMinRef = 2;
+
+  const cfg = { ...config(), isCompressTool: isMcp };
+  const turn = core.processTurn({
+    messages,
+    state,
+    config: cfg,
+    tokenCount: 1000,
+    renderTags: "none",
+  });
+
+  const ids = turn.messages.map((m) => m.id);
+  assert.ok(!ids.includes("c-f2") && !ids.includes("r-f2"), "orphan at/after fold start swept inside the pipeline");
+  assert.deepEqual(turn.state.sweptOrphanCallIds, ["f2"], "swept id folded into the persistent set");
+  assert.equal(turn.state.pendingOrphanSweepMinRef, undefined, "one-shot marker consumed");
+
+  const quiet = core.processTurn({
+    messages: [...messages, msg("p3", "latest user intent theta")],
+    state: turn.state,
+    config: cfg,
+    tokenCount: 1000,
+    renderTags: "none",
+  });
+  const ids2 = quiet.messages.map((m) => m.id);
+  assert.ok(!ids2.includes("c-f2"), "previously-swept orphan stays hidden on the next pipeline pass");
+});
