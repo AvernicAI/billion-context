@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import test from "node:test";
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -103,6 +103,15 @@ test("upgraded pre-fold-gate state keeps rotation-hidden orphans hidden end-to-e
     const upPort = (upstream.address() as { port: number }).port;
 
     const stores: SessionStore[] = [];
+    const proxies: http.Server[] = [];
+    const closedProxies = new Set<http.Server>();
+    async function closeProxy(p: http.Server): Promise<void> {
+        if (closedProxies.has(p)) return;
+        closedProxies.add(p);
+        p.close();
+        p.closeIdleConnections?.();
+        await once(p, "close").catch(() => undefined);
+    }
     try {
         // Phase 1: current code runs two turns; the failed pair rides visibly
         // (fold-gated contract: no fold -> no sweep) and the record lands on disk.
@@ -132,6 +141,7 @@ test("upgraded pre-fold-gate state keeps rotation-hidden orphans hidden end-to-e
             mitm: { enabled: false, domains: [] },
         } as unknown as ProxyOptions);
         await once(proxy1, "listening");
+        proxies.push(proxy1);
         const port1 = (proxy1.address() as { port: number }).port;
         const url1 = `http://127.0.0.1:${port1}/bili/http://127.0.0.1:${upPort}/v1/chat/completions`;
 
@@ -143,12 +153,20 @@ test("upgraded pre-fold-gate state keeps rotation-hidden orphans hidden end-to-e
         const s1 = listSessions().find((x) => x.meta.label === LABEL);
         assert.ok(s1, "session exists");
         assert.ok(store1.flushSync(s1!));
-        proxy1.close();
-        proxy1.closeIdleConnections?.();
-        await once(proxy1, "close");
+        await closeProxy(proxy1);
 
-        // Patch the persisted record into the exact shape an old kernel left:
-        // rotation had hidden the pair (remembered by ref), new fields absent.
+        // Phase 2: a fresh store hydrates the record, then shapes it into
+        // what a pre-fold-gate kernel left behind — rotation had hidden the
+        // pair (remembered by ref), new sweep fields absent. Refs are read
+        // off the dual-written envelope; the mutation itself goes THROUGH THE
+        // STORE: since the #3818 full-mode default the index row IS the load
+        // path, so patching only the envelope would leave a stale row the
+        // loader serves instead.
+        _resetSessionsForTest();
+        const store2 = new SessionStore({ enabled: true, dir, debounceMs: 0 });
+        stores.push(store2);
+        _setStoreForTest(store2);
+
         const file = findSessionFile(dir, LABEL);
         const rec = JSON.parse(readFileSync(file, "utf8")) as PersistRecord;
         const callMsg = rec.payload.messages.find((m) => m.contentType === "tool-call" && m.toolName === "compress");
@@ -157,16 +175,12 @@ test("upgraded pre-fold-gate state keeps rotation-hidden orphans hidden end-to-e
         const callRef = rec.payload.state.messageRefs.byRaw[callMsg!.id];
         const resRef = rec.payload.state.messageRefs.byRaw[resMsg!.id];
         assert.ok(callRef && resRef, "refs resolvable from the persisted state");
-        rec.payload.state.hiddenOrphanRefs = [callRef, resRef];
-        delete rec.payload.state.sweptOrphanCallIds;
-        delete rec.payload.state.pendingOrphanSweepMinRef;
-        writeFileSync(file, JSON.stringify(rec));
-
-        // Phase 2: a fresh server instance hydrates the patched record.
-        _resetSessionsForTest();
-        const store2 = new SessionStore({ enabled: true, dir, debounceMs: 0 });
-        stores.push(store2);
-        _setStoreForTest(store2);
+        const sPre = store2.loadSync(LABEL);
+        assert.ok(sPre, "record hydrates before the upgrade turn");
+        sPre.state.hiddenOrphanRefs = [callRef, resRef];
+        delete sPre.state.sweptOrphanCallIds;
+        delete sPre.state.pendingOrphanSweepMinRef;
+        assert.ok(store2.flushSync(sPre), "patched record commits through the store");
         const proxy2 = await startServer({
             port: 0,
             host: "127.0.0.1",
@@ -188,6 +202,7 @@ test("upgraded pre-fold-gate state keeps rotation-hidden orphans hidden end-to-e
             mitm: { enabled: false, domains: [] },
         } as unknown as ProxyOptions);
         await once(proxy2, "listening");
+        proxies.push(proxy2);
         const port2 = (proxy2.address() as { port: number }).port;
         const url2 = `http://127.0.0.1:${port2}/bili/http://127.0.0.1:${upPort}/v1/chat/completions`;
 
@@ -201,11 +216,10 @@ test("upgraded pre-fold-gate state keeps rotation-hidden orphans hidden end-to-e
         const s2 = listSessions().find((x) => x.meta.label === LABEL);
         assert.ok(s2, "hydrated session exists");
         assert.ok(s2.state.hiddenOrphanRefs?.includes(callRef!), "legacy hidden set survived hydration and self-perpetuates");
-        proxy2.close();
-        proxy2.closeIdleConnections?.();
-        await once(proxy2, "close");
+        await closeProxy(proxy2);
     } finally {
         for (const s of stores) s.closeQuietly();
+        for (const p of proxies) await closeProxy(p);
         upstream.close();
         upstream.closeIdleConnections?.();
         await once(upstream, "close").catch(() => undefined);
