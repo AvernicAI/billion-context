@@ -178,6 +178,34 @@ export interface WebSummaryRow {
     activeCompressedTokens: number;
 }
 
+/** #3830: per-session footprint inside index.db, backing
+ *  `bili sessions ls --with-sizes`. CAS bytes are split by ownership so the
+ *  number is honest: only refcount-1 blobs die with this session (they are
+ *  attributed to it); shared blobs are counted but never double-attributed,
+ *  because they outlive any single session's deletion. */
+export interface SessionStorageStats {
+    rows: {
+        messages: number;
+        blocks: number;
+        deadRefs: number;
+        refs: number;
+        ccrEntries: number;
+        sessionExt: number;
+        checkpoints: number;
+        pinnedCheckpoints: number;
+    };
+    /** Bytes held in inline JSON columns of this session's rows (sessions
+     *  record + blocks payload_json + session_ext value_json) — everything
+     *  except the content-addressed blobs. */
+    inlineBytes: number;
+    /** CAS blob bytes this session references at refcount = 1 (freed when it
+     *  is deleted). */
+    casExclusiveBytes: number;
+    /** CAS blobs this session references that other sessions also hold
+     *  (refcount > 1) — they survive the deletion. */
+    casSharedBlobs: number;
+}
+
 export interface IngestSessionInput {
     session: SessionRow;
     messages: MessageRow[];
@@ -850,6 +878,100 @@ export class UnifiedStore {
             // CAS rows at zero refcount are unreferenced garbage — collect.
             this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
         });
+    }
+
+    /** #3830: physically shrink index.db after session deletions. The DB is
+     *  created without auto_vacuum, so deleted rows and freed CAS blobs leave
+     *  free pages behind until a full VACUUM rewrites the file. Order matters
+     *  in WAL mode: VACUUM writes the compacted image to the WAL and leaves
+     *  the main file at its old size; only a subsequent wal_checkpoint
+     *  (TRUNCATE) flushes the compacted pages back and truncates both files
+     *  (verified empirically: checkpoint-first leaves the size unchanged).
+     *  Retries on SQLITE_BUSY with a short backoff — a live instance sharing
+     *  this directory (#2671/#394) may hold a read transaction; busy_timeout
+     *  already absorbs most contention. Throws when all attempts fail: the
+     *  deletion itself is already committed, the
+     *  caller reports the shrink as partial. */
+    vacuum(): void {
+        let lastErr: unknown;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                this.db.exec("VACUUM");
+                this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+                return;
+            } catch (err) {
+                lastErr = err;
+                const msg = String(err);
+                if (!msg.includes("SQLITE_BUSY") && !msg.includes("database is locked")) throw err;
+                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250 * (attempt + 1));
+            }
+        }
+        throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+    }
+
+    /** #3830: per-session storage footprint for `bili sessions ls --with-sizes`.
+     *  Counts never cascade into each other: inline bytes cover only JSON
+     *  columns, CAS bytes only content-addressed blobs; the CAS split by
+     *  refcount mirrors exactly what deleteSession frees. */
+    sessionStorageStats(sessionId: string): SessionStorageStats {
+        const counts = this.db
+            .prepare(
+                "SELECT " +
+                    "(SELECT COUNT(*) FROM messages WHERE session_id = ?) AS messages, " +
+                    "(SELECT COUNT(*) FROM blocks WHERE session_id = ?) AS blocks, " +
+                    "(SELECT COUNT(*) FROM dead_refs WHERE session_id = ?) AS deadRefs, " +
+                    "(SELECT COUNT(*) FROM refs WHERE session_id = ?) AS refs, " +
+                    "(SELECT COUNT(*) FROM ccr_entries WHERE session_id = ?) AS ccrEntries, " +
+                    "(SELECT COUNT(*) FROM session_ext WHERE session_id = ?) AS ext, " +
+                    "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ?) AS cps, " +
+                    "(SELECT COUNT(*) FROM checkpoints WHERE session_id = ? AND pinned = 1) AS pinnedCps",
+            )
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId, sessionId) as {
+            messages: number; blocks: number; deadRefs: number; refs: number;
+            ccrEntries: number; ext: number; cps: number; pinnedCps: number;
+        };
+        const inlineBytes =
+            ((this.db
+                .prepare(
+                    "SELECT COALESCE(SUM(LENGTH(meta_json)), 0) + COALESCE(SUM(LENGTH(stats_json)), 0) " +
+                        "+ COALESCE(SUM(LENGTH(metadata_json)), 0) + COALESCE(SUM(LENGTH(kstate_json)), 0) " +
+                        "+ COALESCE(SUM(LENGTH(tail_json)), 0) + COALESCE(LENGTH(ccr_json), 0) AS b " +
+                        "FROM sessions WHERE session_id = ?",
+                )
+                .get(sessionId) as { b: number }).b ?? 0) +
+            ((this.db
+                .prepare("SELECT COALESCE(SUM(LENGTH(payload_json)), 0) AS b FROM blocks WHERE session_id = ?")
+                .get(sessionId) as { b: number }).b ?? 0) +
+            ((this.db
+                .prepare("SELECT COALESCE(SUM(LENGTH(value_json)), 0) AS b FROM session_ext WHERE session_id = ?")
+                .get(sessionId) as { b: number }).b ?? 0);
+        const cas = this.db
+            .prepare(
+                "SELECT COALESCE(SUM(CASE WHEN refcount = 1 THEN byte_len ELSE 0 END), 0) AS exclusiveBytes, " +
+                    "COALESCE(SUM(CASE WHEN refcount > 1 THEN 1 ELSE 0 END), 0) AS sharedBlobs " +
+                    "FROM content WHERE hash IN (" +
+                    "SELECT content_hash FROM messages WHERE session_id = ? " +
+                    "UNION SELECT summary_hash FROM blocks WHERE session_id = ? " +
+                    "UNION SELECT one_hash FROM blocks WHERE session_id = ? AND one_hash IS NOT NULL " +
+                    "UNION SELECT content_hash FROM ccr_entries WHERE session_id = ? " +
+                    "UNION SELECT state_hash FROM checkpoints WHERE session_id = ?)",
+            )
+            .get(sessionId, sessionId, sessionId, sessionId, sessionId) as { exclusiveBytes: number; sharedBlobs: number };
+        return {
+            rows: {
+                messages: counts.messages,
+                blocks: counts.blocks,
+                deadRefs: counts.deadRefs,
+                refs: counts.refs,
+                ccrEntries: counts.ccrEntries,
+                sessionExt: counts.ext,
+                checkpoints: counts.cps,
+                pinnedCheckpoints: counts.pinnedCps,
+            },
+            inlineBytes,
+            casExclusiveBytes: cas.exclusiveBytes,
+            casSharedBlobs: cas.sharedBlobs,
+        };
     }
 
     /** Freezes one session record as a checkpoint row + CAS blob. The row

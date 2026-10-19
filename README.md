@@ -550,6 +550,18 @@ The proxy rewrites each session's state file every turn of a long session; on Wi
 
 Short-lived sessions leave small state files behind that are never resumed. Cleanup is **opt-in** (`BILI_SESSION_GC=1`; off by default — session files are user data, no silent deletion policy): when enabled, bili sweeps the sessions dir at boot and hourly and deletes a file only when BOTH hold — older than `BILI_SESSION_GC_MAX_AGE_DAYS` (default 7 days) AND never compressed with its newest request body ≤ `BILI_SESSION_GC_MAX_TOKENS` tokens (default 1M) — so deletion loses nothing but bytes. CCR content stores follow their session file's lifecycle; compressed sessions are never deleted; every deletion is audit-logged. Full policy: [CONFIGURATION.md](CONFIGURATION.md#environment-variables).
 
+### Session cleanup & space reclamation (`bili sessions`) (#3830)
+
+The `#1082` sweep above only ever touches never-compressed JSON files. For real reclamation — including the unified `index.db` side of the default double-write — use the supported cleanup commands, which run standalone (no proxy needed):
+
+```
+bili sessions ls --with-sizes              # what is on disk, per session
+bili sessions rm <id> [--force]            # delete one session (envelope + all index.db rows + CAS refcount release), VACUUM by default
+bili sessions prune --older-than 90d       # batch rm by last-save age (s/m/h/d/w)
+```
+
+Resident/recently-active sessions and sessions holding pinned replica checkpoints are refused without `--force`; legacy lanes degrade to JSON-only deletion automatically. Semantics and safety guards: [CONFIGURATION.md](CONFIGURATION.md#session-cleanup-bili-sessions-3830).
+
 ## Status
 
 Early. Protocol handling and compression work against mock tests (500+ passing). Real-model integration testing is the next milestone. Expect rough edges.

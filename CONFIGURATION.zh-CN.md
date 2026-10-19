@@ -1930,6 +1930,9 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `bili kimi [opts --] [args]` | 代理 + **Kimi Code**(Moonshot CLI)—— 证书 MITM(`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`/`SSL_CERT_FILE`);provider/model 主机取自 `~/.kimi-code/config.toml`(遵循 `KIMI_CODE_HOME`),未声明时用托管 OAuth 端点;回环端点编目并附手动 `/bili/` 前缀提示(#757) |
 | `bili test pi` | 无污染的 pi 链路端到端冒烟测试 |
 | `bili export [session] [--full] [--jsonl] [--output FILE]` | 列出持久化会话 / 把一个会话导出为 Markdown 交接文档(或 `--jsonl`:按行分隔的 JSON 转储,优先从统一索引表渲染,无索引时回退 legacy 记录——生成物仅作互操作,绝非事实源)—— 见[会话与迁移](#会话与迁移) |
+| `bili sessions ls [--with-sizes]` | 列出持久化会话;`--with-sizes` 附带每个会话的磁盘占用(JSON 信封字节 + index.db 行/CAS 贡献)—— 见[会话清理](#会话清理-bili-sessions-3830) |
+| `bili sessions rm <id> [--force] [--no-vacuum]` | 走受支持路径删除单个会话(信封文件 + index.db 全部相关行,释放 CAS 引用计数,默认 VACUUM 缩容) |
+| `bili sessions prune --older-than <dur> [--force] [--no-vacuum]` | 对最后保存时间早于 `<dur>`(`s`/`m`/`h`/`d`/`w`)的会话批量 rm |
 | `bili acp-cache diff <dump-dir> [--json] [--log FILE] [--no-log] [--session SID]` | 从 `ACP_DUMP_BODY` dump 归因缓存失效原因 —— 对同会话相邻请求做前缀 diff(#1266) |
 | `bili update` | 立即检查并安装新版本（绕过 3 分钟节流） |
 | `bili plugin install <agent>` | 把原生工具插件 / MCP 桥装进宿主 —— 见[插件模式（原生工具）](#插件模式原生工具) |
@@ -1953,6 +1956,22 @@ launcher 命令里 `--` 之后的参数原样透传给客户端（`bili pi -- pr
 | `--no-passthrough` | 强制开启压缩（覆盖配置文件） |
 | `--no-auto-update` | 本次运行禁用后台自动更新 |
 | `--mitm-domain <domain>` | 追加 MITM 白名单域名（可重复；仅 launcher） |
+
+### 会话清理（`bili sessions`）(#3830)
+
+sessions 目录会无界增长：默认 `shadow` 双写下每个会话同时存在于 JSON 信封与 `index.db` 行（共享内容 CAS），且没有任何自动删除或自动 VACUUM。`bili sessions` 是受支持的减重入口，**独立运行**——直接对 sessions 目录开 store，不需要代理在跑——也不触碰其他会话的状态。
+
+- **`bili sessions ls [--with-sizes]`** —— 列出所有可枚举会话（统一索引 ∪ JSON 树）。`--with-sizes` 时附带：每会话 JSON 信封字节、`index.db` 行数、内联 JSON 列字节、独占 CAS blob 字节（与他会话共享的 blob 只计一次，不重复归属）、`index.db` + WAL 总大小。
+- **`bili sessions rm <id> [--force] [--no-vacuum]`** —— 走启动期 rekey/去重同一条受支持路径删除单个会话：先删统一边车（`deleteSession` 级联删全部相关表并释放内容 CAS 引用计数），再删信封文件（无论它在命名空间、`_unknown/` 还是平铺位置）。默认随后缩小 `index.db`（WAL 模式顺序：先 VACUUM 再 checkpoint-TRUNCATE——顺序反了文件大小不会变小）；`--no-vacuum` 跳过。成功退出码 0，拒绝/未找到为 1。
+- **`bili sessions prune --older-than <dur> [--force] [--no-vacuum]`** —— 对所有最后保存时间（信封 `savedAt` 与索引 `updated_at` 取较大者）早于 `<dur>`（`90s`/`12h`/`30d`/`4w`）的会话批量 rm。被拒绝的会话逐条报告、不中断批次；有删除发生时最后统一缩容一次。
+
+安全语义（`rm` 与 `prune` 相同）：
+
+- **驻留保护** —— bili 探测状态注册表里的每个存活实例（`/__bili/sessions`）。在该实例内存中驻留、或最近 10 分钟内出现过的会话，未加 `--force` 一律拒绝：驻留会话下一轮就会被重新保存，刚删的东西会复活。实例不可达只产生告警行，不阻塞命令。
+- **pinned checkpoint 保护** —— pinned replica checkpoint 按设计持有 CAS 引用计数、比 `deleteSession` 活得久。目标存在 pinned checkpoint 时未加 `--force` 拒绝删除；即使 `--force`，pinned 行本身仍然保留（其 blob 仍被引用），输出会说明还剩几个。
+- **legacy 车道** —— `storage.unified=legacy`（无 `index.db`）时一切退化为只删 JSON，命令行为一致。`full` + `jsonWriter=off` 车道里部分会话只存在于 `index.db`——命令同样覆盖（纯行删除）。
+
+手工 `rm` JSON 文件**不是**受支持的清理路径：它会让 `index.db` 行成为孤儿（GC parity 只在 bili 自己的删除路径触发），空间收不回来。
 
 ---
 

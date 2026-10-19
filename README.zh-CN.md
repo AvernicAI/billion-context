@@ -427,6 +427,18 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 短命会话会留下永远不会再被恢复的小状态文件。清理是**可选开启(opt-in)**的:设 `BILI_SESSION_GC=1` 才启用(默认关闭 —— 会话文件属于用户数据,不应有静默删除策略)。启用且持久化开启时,bili 在启动时和每小时扫描会话目录,只有**两个条件同时满足**才删除一个文件:年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`(默认 7 天),并且该会话**从未被压缩过**(没有折叠块)、最近一次请求体 ≤ `BILI_SESSION_GC_MAX_TOKENS` token(默认 1M)—— 删除只丢字节不丢内容。CCR 内容存储遵循其会话文件的生命周期;被压缩过的会话永不删除;每次删除都写审计日志。详见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
 
+### 会话清理与空间回收(`bili sessions`)(#3830)
+
+上面的 #1082 清扫只碰「从未被压缩」的 JSON 文件。真正的减重——包括默认双写下统一存储 `index.db` 那一侧——走受支持的清理命令,**独立运行**(不需要代理在跑):
+
+```
+bili sessions ls --with-sizes              # 看清磁盘上有什么、各占多少
+bili sessions rm <id> [--force]            # 删单个会话(信封 + index.db 全部相关行 + 释放 CAS 引用计数),默认 VACUUM 缩容
+bili sessions prune --older-than 90d       # 按最后保存时间批量 rm(s/m/h/d/w)
+```
+
+驻留中/最近活跃的会话、持有 pinned replica checkpoint 的会话,未加 `--force` 一律拒绝;legacy 车道自动退化为只删 JSON。语义与安全边界见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md#会话清理-bili-sessions-3830)。
+
 ## 状态
 
 早期。协议处理和压缩已通过 mock 测试(500+ 项通过)。真实模型集成测试是下一里程碑。预期会有粗糙的地方。

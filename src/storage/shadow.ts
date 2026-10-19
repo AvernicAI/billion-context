@@ -24,7 +24,7 @@
 import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
-import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
+import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type SessionStorageStats, type WebSummaryRow } from "./store.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
@@ -404,6 +404,19 @@ export class UnifiedShadow {
     listSessionIds(): string[] {
         this.assertLive();
         return this.store.listSessionIds();
+    }
+
+    /** #3830: physical index.db shrink after operator session deletion.
+     *  Throws like every other pass-through — an explicit operator action. */
+    vacuum(): void {
+        this.assertLive();
+        this.store.vacuum();
+    }
+
+    /** #3830: per-session footprint for `bili sessions ls --with-sizes`. */
+    sessionStorageStats(sessionId: string): SessionStorageStats {
+        this.assertLive();
+        return this.store.sessionStorageStats(sessionId);
     }
 
     /** Identity lookup passthrough (#2960 R2.1). */

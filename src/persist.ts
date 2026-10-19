@@ -292,7 +292,7 @@ function durableWriteFile(file: string, data: Buffer | string, mode?: number): v
  *  originals are payload bytes, not state — keeping them out of the session
  *  record preserves whole-file encryption, .json discovery, and the bounded
  *  in-memory session cache (the envelope is lazily loaded per session). */
-function contentStoreRelPathFor(id: string, protocol?: string, upstreamOrigin?: string): string {
+export function contentStoreRelPathFor(id: string, protocol?: string, upstreamOrigin?: string): string {
     const base = relPathFor(id, protocol, upstreamOrigin);
     return base.slice(0, -".json".length) + ".content-store.json";
 }
@@ -1144,20 +1144,77 @@ export class SessionStore {
         // #2671 GC parity: when the legacy file goes, the unified sidecar's
         // rows go with it (deleteSession releases CAS refcounts too).
         this.shadow?.remove(id);
-        const candidates = new Set([
-            relPathFor(id, session.meta.protocol, session.meta.upstreamOrigin),
+        await this.removeSessionFiles(id, session.meta);
+    }
+
+    /** Every on-disk file belonging to this session id, whatever namespace it
+     *  sits in. Explicit candidates first (when meta is known), then a shallow
+     *  tree walk with loadEnvelope's lazy hash-suffix predicate: a standalone
+     *  opener never ran a directory scan, and legacy lanes carry no index row
+     *  revealing the protocol, so the walk is the only complete answer there. */
+    private async findSessionFiles(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Promise<string[]> {
+        const rels = new Set<string>();
+        for (const rel of [
+            relPathFor(id, meta?.protocol, meta?.upstreamOrigin),
             relPathFor(id),
             flatFileNameFor(id),
-        ]);
-        for (const rel of candidates) {
-            await rm(path.join(this.sessionsDir, rel), { force: true }).catch(() => {});
-        }
-        for (const rel of [
-            contentStoreRelPathFor(id, session.meta.protocol, session.meta.upstreamOrigin),
-            contentStoreRelPathFor(id),
         ]) {
-            await rm(path.join(this.sessionsDir, rel), { force: true }).catch(() => {});
+            if (existsSync(path.join(this.sessionsDir, rel))) rels.add(rel);
         }
+        const expected = path.basename(relPathFor(id));
+        const matches = (base: string): boolean =>
+            fileNameMatchesId(base, id, meta?.protocol, meta?.upstreamOrigin) || base.endsWith(`_${expected}`);
+        try {
+            for (const entry of await readdir(this.sessionsDir, { withFileTypes: true })) {
+                if (entry.isFile()) {
+                    if (matches(entry.name)) rels.add(entry.name);
+                    continue;
+                }
+                if (!entry.isDirectory()) continue;
+                try {
+                    for (const f of await readdir(path.join(this.sessionsDir, entry.name), { withFileTypes: true })) {
+                        if (f.isFile() && matches(f.name)) rels.add(path.join(entry.name, f.name));
+                    }
+                } catch { /* unreadable subdir: the explicit candidates still cover it */ }
+            }
+        } catch { /* missing dir: nothing on disk */ }
+        return [...rels];
+    }
+
+    private async removeSessionFiles(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Promise<void> {
+        for (const rel of await this.findSessionFiles(id, meta)) {
+            await rm(path.join(this.sessionsDir, rel), { force: true }).catch(() => {});
+            if (rel.endsWith(".json") && !rel.endsWith(".fb.json")) {
+                await rm(path.join(this.sessionsDir, `${rel.slice(0, -".json".length)}.content-store.json`), { force: true }).catch(() => {});
+            }
+        }
+    }
+
+    /** #3830: user-facing single-session deletion (`bili sessions rm`). The
+     *  same supported path the boot rekey/dedup uses, exposed standalone:
+     *  unified sidecar rows FIRST (deleteSession cascades every table and
+     *  releases CAS refcounts; pinned checkpoints survive by design), then
+     *  the legacy files. Safe to call from a process where no proxy runs and
+     *  nothing is resident in memory — that is exactly the point. */
+    async removeSession(id: string): Promise<{ envelopeFound: boolean; unifiedHadRows: boolean }> {
+        // Resolve identity from whichever side knows it: the unified row
+        // carries protocol+origin even when the JSON tree is already gone,
+        // and the envelope carries them when only the tree survives.
+        let meta: { protocol?: string; upstreamOrigin?: string } | undefined;
+        const unifiedAvailable = this.replicasAvailable();
+        if (unifiedAvailable) {
+            try {
+                const row = (this.shadow as UnifiedShadow).sessionSummaries().find((r) => r.sessionId === id);
+                if (row && (row.protocol || row.origin)) meta = { protocol: row.protocol, upstreamOrigin: row.origin };
+            } catch { /* sidecar degraded mid-call: fall back to tree-only probing */ }
+        }
+        const envelope = this.loadEnvelope(id, meta);
+        if (envelope) meta = { ...meta, ...envelope.payload.meta };
+        const unifiedHadRows = unifiedAvailable && this.shadow!.sessionUpdatedAt(id) !== null;
+        const files = await this.findSessionFiles(id, meta);
+        if (unifiedAvailable) this.shadow!.remove(id);
+        await this.removeSessionFiles(id, meta);
+        return { envelopeFound: files.length > 0 || envelope !== null, unifiedHadRows };
     }
 
     /** Shared envelope probe for the sync read paths. When the request names
@@ -1529,6 +1586,23 @@ export class SessionStore {
         } catch {
             return null; // sidecar degraded mid-call: fall back to the walk
         }
+    }
+
+    /** #3830: per-session index.db footprint for `bili sessions ls --with-sizes`.
+     *  Null when the unified store is unavailable (legacy-only lanes). */
+    unifiedSessionStorageStats(sessionId: string): import("./storage/store.js").SessionStorageStats | null {
+        if (!this.replicasAvailable()) return null;
+        try {
+            return this.shadow!.sessionStorageStats(sessionId);
+        } catch {
+            return null; // sidecar degraded mid-call: sizes degrade to JSON-only
+        }
+    }
+
+    /** #3830: physical index.db shrink (`bili sessions rm/prune`). Throws in
+     *  legacy-only lanes — callers must check replicasAvailable() first. */
+    unifiedVacuum(): void {
+        this.liveShadow().vacuum();
     }
 
     /** #2960 R2.1: durable identity lookup — (namespace, conversation id) →

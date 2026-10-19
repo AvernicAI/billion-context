@@ -37,6 +37,7 @@ import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
+import { parseDuration, runSessionsCommand } from "./sessions-cleanup.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
 import { fixDshLedgers, renderDoctorReport, renderLedgerFixReport, runDoctor } from "./doctor.js";
 import { VERSION, PACKAGE_NAME, BUILD_COMMIT } from "./version.js";
@@ -79,6 +80,9 @@ Usage:
                                    each (pure-append / mid-stream-rewrite / prefix-stable-miss);
                                    --json machine output, --log FILE correlates [acp-usage]
                                    lines (default <dir>/bili.log), --no-log skips, --session SID filters
+  bili sessions ls [--with-sizes]  list persisted sessions; --with-sizes adds each session's disk footprint (JSON envelope bytes + index.db rows/CAS contribution) and totals; --json machine output
+  bili sessions rm <id> [--force]  delete one session through the supported path (JSON files + index.db rows, CAS refcounts released), then VACUUMs index.db (--no-vacuum skips); refuses resident/recently-active sessions and sessions holding pinned checkpoints without --force
+  bili sessions prune --older-than <dur>   delete sessions not saved for <dur> (e.g. 30d); same safety checks as rm, one VACUUM at the end
   bili update                      check for & install a newer version now
   bili doctor                      audit every install lane: versions, owners,
                                     freshness vs registry, running proxy processes
@@ -161,7 +165,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache";
+    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -181,6 +185,12 @@ type Parsed = {
     jsonOutput?: boolean;
     doctorJson?: boolean;
     doctorFix?: boolean;
+    sessionsSub?: "ls" | "rm" | "prune";
+    sessionsTarget?: string;
+    sessionsOlderThanMs?: number;
+    withSizes?: boolean;
+    sessionsForce?: boolean;
+    noVacuum?: boolean;
 };
 
 export function parseArgs(argv: string[]): Parsed {
@@ -205,6 +215,12 @@ export function parseArgs(argv: string[]): Parsed {
     let jsonOutput = false;
     let doctorJson = false;
     let doctorFix = false;
+    let sessionsSub: Parsed["sessionsSub"];
+    let sessionsTarget: string | undefined;
+    let sessionsOlderThanMs: number | undefined;
+    let withSizes = false;
+    let sessionsForce = false;
+    let noVacuum = false;
 
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!;
@@ -268,6 +284,29 @@ export function parseArgs(argv: string[]): Parsed {
             case "--with-mcp":
                 pluginWithMcp = true;
                 break;
+            case "--with-sizes":
+                withSizes = true;
+                break;
+            case "--force":
+                sessionsForce = true;
+                break;
+            case "--no-vacuum":
+                noVacuum = true;
+                break;
+            case "--older-than": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value`);
+                    process.exit(2);
+                }
+                try {
+                    sessionsOlderThanMs = parseDuration(val);
+                } catch (err) {
+                    console.error(`bili: ${err instanceof Error ? err.message : String(err)}`);
+                    process.exit(2);
+                }
+                break;
+            }
             case "--json":
                 jsonOutput = true;
                 doctorJson = true;
@@ -348,6 +387,25 @@ export function parseArgs(argv: string[]): Parsed {
         } else if (cmd === "export") {
             command = "export";
             exportSelector = positional[1];
+        } else if (cmd === "sessions") {
+            command = "sessions";
+            const sub = positional[1];
+            if (sub === "ls" || sub === "rm" || sub === "prune") {
+                sessionsSub = sub;
+            } else {
+                console.error(`bili sessions: unknown action "${sub ?? ""}" (try "bili sessions ls|rm|prune")`);
+                process.exit(2);
+            }
+            if (sub === "rm") {
+                sessionsTarget = positional[2];
+                if (!sessionsTarget) {
+                    console.error("bili sessions rm: session id is required");
+                    process.exit(2);
+                }
+            } else if (sub === "prune" && sessionsOlderThanMs === undefined) {
+                console.error("bili sessions prune: --older-than <dur> is required (e.g. 30d)");
+                process.exit(2);
+            }
         } else if (cmd === "plugin-register") {
             command = "plugin-register";
             registerConversationId = positional[1];
@@ -401,11 +459,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson, doctorFix };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson, doctorFix, sessionsSub, sessionsTarget, sessionsOlderThanMs, withSizes, sessionsForce, noVacuum };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson, doctorFix } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson, doctorFix, sessionsSub, sessionsTarget, sessionsOlderThanMs, withSizes, sessionsForce, noVacuum } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -518,12 +576,18 @@ export async function main(): Promise<void> {
             return;
         }
     }
-    if (command === "export") {
+    if (command === "sessions") {
+        // #3830: standalone session cleanup — opens the sessions dir directly,
+        // no proxy required. Same env-override wiring as `bili doctor`.
+        for (const [k, v] of Object.entries(overrides)) {
+            if (v !== undefined) process.env[k] = v;
+        }
         try {
-            const text = await exportSession(exportSelector, { output: exportOutput, full: exportFull, jsonl: exportJsonl });
+            const { code, text } = await runSessionsCommand({ sub: sessionsSub!, target: sessionsTarget, olderThanMs: sessionsOlderThanMs, withSizes: withSizes === true, force: sessionsForce === true, vacuum: !noVacuum, json: jsonOutput === true });
             process.stdout.write(text + "\n");
+            if (code !== 0) process.exit(code);
         } catch (error) {
-            console.error(`bili export: ${error instanceof Error ? error.message : String(error)}`);
+            console.error(`bili sessions: ${error instanceof Error ? error.message : String(error)}`);
             process.exit(1);
         }
         return;
