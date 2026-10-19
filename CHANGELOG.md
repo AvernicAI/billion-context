@@ -15,6 +15,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ### Fixed
 
+- **DSH 0.2.x Code Mode 会话恢复压缩面(#3884,#3603 修复在 DSH 0.2.x 形态上的复发)**:#3603 的可达性门只认 `run_code`(dsh-tools 内置名);DSH 0.2.x 把 Code Mode 移入 dsh-codemode 插件后 transport 改名为 `code_run`(保留名 `run_code` 归 dsh-tools,插件不能注册),判据整体失配——所有 DSH 0.2.x code-mode/PTC 会话的压缩面被**永久静默关闭**(issue 实测:usage 仅 42%、pendingT1 达门槛 10 倍仍 12× ARMED-SUPPRESSED / 0 INJECT,上下文涨到 63% 靠人工兜底)。修法:omnibus 已知形态收敛为集合 `CODE_MODE_OMNIBUS_TOOL_NAMES`(`run_code` / `code_run`,注释逐条列形态与出处),两处检测点共用——lane-decisions 可达性(主缺陷)与 proxy 车道的 `ptcNoteMode` exempt 注记(同族第二检测点,此前 code_run 客户端拿不到「直接调用」豁免注记)。真阴性精度不放松:裸单一非 omnibus 工具(get_weather/acp_status/bash)仍关面,矩阵新增 `code_run`→开面行(含 EMERGENCY 对偶行)、四 wire 双向断言。后续宿主变体按流量证据向集合追加;结构级真源(宿主 manifest 注册状态)仍在 #3417/#3482 Step3+ 路线上。
 - **快照渲染接缝加固(#3812)**:身份签名没有 id 分量,重复短文本("继续"/yes/1)会让单次签名命中伪装成接缝,静默截断两点之间的全部历史。现在接缝要求至少 2 条连续匹配(`MIN_SEAM_RUN`,fold-reconcile `MIN_RESYNC_RUN` 同款纪律),单次命中一律降级走 legacy(`seam-too-short`),绝不猜测;同时容忍接缝中恰好一条未观测消息(上一轮回复的观察滞后——重发/重试轮的常态),第二条未命中即断链。块覆盖的签名传播被整体移除:它无法区分升级孪生与真实重复消息,会把未折叠的同文消息静默并入覆盖集(丢真消息);折叠期 id 在视图中完全失锚的块现在降级(`block-unanchored`)而不是把摘要锚点放在裸历史顶端。插件车道整体旁路(插件契约本就客户端权威)。影响面:灰度 0% 下零暴露,属开闸前必修。
 
 ### Changes

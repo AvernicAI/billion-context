@@ -262,6 +262,21 @@ export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.ma
 //    only-run_code rule for exactly these tools.
 export const RUN_CODE_TOOL_NAME = "run_code";
 
+// #3884: known code-mode/PTC omnibus tool names, one entry per OBSERVED host
+// shape — a code-mode harness collapses every registered tool behind ONE
+// directly callable omnibus whose NAME is host-chosen, so both detection
+// sites (lane-decisions reachability, ptcNoteMode below) match this set
+// instead of a single literal (#3603's single-literal gate went stale when
+// DSH 0.2.x swapped transports and silently suppressed the whole compress
+// surface of every code-mode session):
+//   - "run_code" — dsh-tools built-in; DSH 0.1.x PTC preset (#3600/#3252);
+//   - "code_run" — dsh-codemode plugin transport; DSH 0.2.x (the reserved
+//     name "run_code" belongs to dsh-tools, so the plugin registers its own).
+// A future host variant adds ITS observed name here with traffic evidence;
+// the structural home for this judgment (host manifest registry state as the
+// reachability truth, wire shape only a proxy signal) is #3417/#3482 Step3+.
+export const CODE_MODE_OMNIBUS_TOOL_NAMES: ReadonlySet<string> = new Set([RUN_CODE_TOOL_NAME, "code_run"]);
+
 /** Calling-convention note mode for one request (internal to this module —
  *  inject.ts/plugin.ts pick the mode via ptcNoteMode()/the literal "binding"). */
 type AcpNoteMode = "binding" | "exempt" | "none";
@@ -330,9 +345,10 @@ export function withProjectAttribution(prompt: string): string {
 }
 
 /** Note mode for one request: the harness is code-mode-shaped when the
- *  client's own tools array carries a tool literally named run_code. */
+ *  client's own tools array carries a tool named like a known code-mode
+ *  omnibus (run_code / code_run — see CODE_MODE_OMNIBUS_TOOL_NAMES, #3884). */
 export function ptcNoteMode(names: Iterable<string | undefined>): AcpNoteMode {
-    for (const n of names) if (n === RUN_CODE_TOOL_NAME) return "exempt";
+    for (const n of names) if (typeof n === "string" && CODE_MODE_OMNIBUS_TOOL_NAMES.has(n)) return "exempt";
     return "none";
 }
 

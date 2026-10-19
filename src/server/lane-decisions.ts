@@ -25,7 +25,7 @@
 import { biliToolsDeclaredOnWire } from "../session-self-heal.js";
 import { extractBillingAttributionBlock } from "../preflight.js";
 import { ANONYMOUS, hostProfileFor, type HostProfile } from "../host-profiles.js";
-import { RUN_CODE_TOOL_NAME } from "../compress-tool.js";
+import { CODE_MODE_OMNIBUS_TOOL_NAMES } from "../compress-tool.js";
 
 type LaneProtocol = "anthropic" | "openai" | "google" | "responses";
 
@@ -228,14 +228,19 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     // In PLUGIN mode the host owns the tool table: reach when this request
     // declares `compress` (observed — some dsh profiles DO surface it, #3401)
     // or the host exposes bili tools to the model by design (profile default,
-    // #3177). PTC presets collapse EVERY tool into a single `run_code`
-    // omnibus (SDK bindings nested inside it), so top-level absence of
-    // `compress` is not evidence of unreachability there — an omnibus
-    // declaration reads as reachable (#3600: released 0.1.198 suppressed the
-    // surface on every dsh PTC session until the window hit 100%).
+    // #3177). PTC presets collapse EVERY tool into a single omnibus (SDK
+    // bindings nested inside it), so top-level absence of `compress` is not
+    // evidence of unreachability there — ANY known omnibus name reads as
+    // reachable. Known shapes live in CODE_MODE_OMNIBUS_TOOL_NAMES (run_code
+    // = dsh-tools built-in, DSH 0.1.x; code_run = dsh-codemode transport,
+    // DSH 0.2.x): #3600's miss was released 0.1.198 suppressing the surface
+    // on every dsh PTC session until the window hit 100%, and #3884's miss
+    // was that same single-literal gate going stale when DSH 0.2.x renamed
+    // the transport (12× ARMED-SUPPRESSED at 42% usage, pendingT1 10× over
+    // threshold, fully silent).
     const compressReachable = !input.pluginMode
         || declaredTools.has("compress")
-        || declaredTools.has(RUN_CODE_TOOL_NAME)
+        || [...CODE_MODE_OMNIBUS_TOOL_NAMES].some((n) => declaredTools.has(n))
         || !profile.toolsHostScopedByDefault;
     const compressSurfaceOn = input.shouldInject && compressReachable;
     const billingBlockObserved = extractBillingAttributionBlock(systemOf(input.parsed)) !== undefined;

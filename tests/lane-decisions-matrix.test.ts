@@ -260,6 +260,14 @@ const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; t
     // 100% window (89× ARMED-SUPPRESSED, output clamped) — the omnibus reads
     // as reachable now.
     { name: "dsh run_code omnibus keeps the surface (#3600 PTC shape)", lane: "dsh", tools: ["run_code"], expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #3884 FIX ROW: DSH 0.2.x moved Code Mode into the dsh-codemode plugin,
+    // whose transport is named `code_run` (the reserved name `run_code` belongs
+    // to dsh-tools) — the #3603 single-literal gate missed this renamed shape
+    // and suppressed the surface forever (issue log: 12× ARMED-SUPPRESSED at
+    // 42% usage with pendingT1=504985 vs the 50000 threshold, 0 INJECT). The
+    // omnibus-name set reads it reachable now; the precision rows below are
+    // the negative direction of the same pair.
+    { name: "dsh code_run omnibus keeps the surface (#3884 DSH 0.2.x shape)", lane: "dsh", tools: ["code_run"], expect: () => ({ nudge: true, standingPrompt: true }) },
     // Named-tool precision must survive the #3600 fix: a bare single tool
     // that is NOT the omnibus and NOT compress stays a true negative
     // (#3177 preset-standard shape keeps its suppression).
@@ -287,6 +295,7 @@ const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; t
     { name: "EMERGENCY override injects where the kernel declined cadence (#3461 guard)", lane: "omp", tools: [], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "EMERGENCY cannot punch through an unreachable dsh tool table (reverse guard)", lane: "dsh", tools: [], teach: 45_000, expect: () => ({ nudge: false, standingPrompt: false }) },
     { name: "EMERGENCY override fires on the PTC run_code shape too", lane: "dsh", tools: ["run_code"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "EMERGENCY override fires on the PTC code_run shape too (#3884)", lane: "dsh", tools: ["code_run"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
 ];
 
 for (const wire of ["anthropic", "openai", "responses", "google"] as const) {
