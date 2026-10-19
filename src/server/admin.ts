@@ -25,6 +25,7 @@ import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInF
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts } from "../upstream-alerts.js";
+import { pckAblations } from "../pck-probe.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, recordUpstreamConnection, resetProxyCache, resolveProxyDecision } from "../upstream-proxy.js";
 import { detectStaleInstall } from "../update.js";
 import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
@@ -1006,6 +1007,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promi
         conflicts: summarizeConflicts(listSessions()),
         passthrough: { enabled: !!opts.passthrough, source: opts.passthroughSource },
         alerts: getUpstreamAlerts(),
+        pckSuppressions: pckAblations(),
         storage: storageStatusWire(),
         attribution: attributionStatusWire(),
     }, null, 2));

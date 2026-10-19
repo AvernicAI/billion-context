@@ -863,6 +863,25 @@ export const WEB_CLIENT = `(function () {
                 pb.innerHTML = "";
             }
         }
+        // #2645: the key-hostile upstream pairs learned by A/B this process
+        // (in-memory only — a restart re-probes and clears them).
+        const kb = $("pck-banner");
+        if (kb) {
+            const pcks = Array.isArray(d.pckSuppressions) ? d.pckSuppressions : [];
+            if (pcks.length > 0) {
+                kb.hidden = false;
+                kb.classList.add("show");
+                const items = pcks.slice(0, 3).map((p) => [
+                    (p.model ? '<span class="mono">' + escapeHtml(p.model) + "</span>: " : "") + '<span class="mono">' + escapeHtml(p.origin) + "</span>",
+                    p.sessions && p.sessions.length > 0 ? t("pck.sessions", { ids: p.sessions.join(", ") }) : null,
+                ].filter(Boolean).join(" ")).join(" · ");
+                kb.innerHTML = "<strong>" + t("pck.on") + '</strong> <span class="mono">' + items + "</span> " + t("pck.hint");
+            } else {
+                kb.hidden = true;
+                kb.classList.remove("show");
+                kb.innerHTML = "";
+            }
+        }
         // #2861: host-side metering plugin notice — dismissal is server-side
         // (POST /__bili/host-plugins/dismiss) so one close silences every browser.
         const hb = $("host-plugin-banner");

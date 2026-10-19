@@ -14,6 +14,7 @@ import { conflictClientOf, conflictEventsOf, formatConflictSection } from "./con
 import { getOpenUpstreamCircuits } from "./upstream-alerts.js";
 import { dshLedgerFloorTokens } from "./server/budget.js";
 import { getBlindTunnelStats } from "./mitm.js";
+import { pckAblations } from "./pck-probe.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
@@ -422,6 +423,27 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // No install command on purpose: hosts differ (npm -g / opencode
         // plugin / dsh / pi) — naming the version is host-neutral advice.
         lines.push("Live state: the update field of GET /__bili/status.");
+        extra.push(...lines);
+    }
+    // #2645 probe-and-remember: bili learned (via A/B retry at egress) which
+    // upstream origin+model pair(s) reject prompt_cache_key and now withholds
+    // the key there until proxy restart. The memory is process-local and
+    // config-free, so this is where an operator can see that their
+    // relay/account pool's prefix-cache affinity may have degraded — naming
+    // the destination, model, and affected sessions.
+    const pckAbled = pckAblations();
+    if (pckAbled.length > 0) {
+        extra.push("");
+        const lines: string[] = [];
+        for (const a of pckAbled.slice(0, 5)) {
+            const model = a.model ? ` (model ${a.model})` : "";
+            const sessions = a.sessions.length > 0 ? ` Affected session(s): ${a.sessions.join(", ")}.` : "";
+            lines.push(`CACHE ROUTING KEY BLOCKED (instance-level): upstream ${a.origin}${model} rejects OpenAI's prompt_cache_key body field — confirmed ${a.confirmations}× by A/B retry since process start (request with the key \u2192 400, identical request without it \u2192 accepted); bili withholds the key there until restart.${sessions}`);
+        }
+        if (pckAbled.length > 5) {
+            lines.push(`\u2026${pckAbled.length - 5} more destination(s): GET /__bili/status field pckSuppressions.`);
+        }
+        lines.push("If this destination is your relay/account pool, its prefix-cache affinity for the listed sessions may degrade until restart.");
         extra.push(...lines);
     }
     const blind = getBlindTunnelStats();

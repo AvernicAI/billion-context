@@ -67,11 +67,16 @@ export function isLoopbackAddress(addr: string | undefined): boolean {
  *  (scheme://host[:port]). Lanes report different shapes — `new URL().origin`
  *  from the forward path, full URLs with paths from resolveUpstream — and the
  *  baseline-provenance / calibration checks compare keys, so both must land on
- *  the same form. Unparseable input falls back to its trimmed raw value. */
+ *  the same form. Provider routes may carry the `mitm://` config-lookup scheme
+ *  (#2645): the egress path rewrites it to https:// (forwardUpstreamUrl), so
+ *  reduce it identically here — otherwise a mitm route normalizes to the opaque
+ *  "null" origin and can never match the https:// key the egress side records
+ *  (the pck ablation lookup and the server.ts baseline-origin compare both hit
+ *  this). Unparseable input falls back to its trimmed raw value. */
 export function normalizeUpstreamOrigin(u: string | undefined): string | undefined {
     if (!u) return undefined;
     try {
-        return new URL(u).origin;
+        return new URL(u.replace(/^mitm:\/\//, "https://")).origin;
     } catch {
         const t = u.trim();
         return t || undefined;

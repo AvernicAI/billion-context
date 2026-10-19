@@ -49,6 +49,7 @@ import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.
 import { clearUpstreamAlertsForHost, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason } from "../upstream-alerts.js";
 import { formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
+import { recordPckAblation } from "../pck-probe.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
 import { estimateWireOverhead } from "./budget.js";
 import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./headers.js";
@@ -795,6 +796,94 @@ export async function forward(
                     await hop("user");
                 } else if ((await hop("system")) === "placement-400") {
                     await hop("user");
+                }
+            }
+        }
+    }
+    // #2645 probe-and-remember: strict direct APIs 400 unknown body params
+    // (NIM: "Unsupported parameter(s): `prompt_cache_key`"). Instead of
+    // guessing which destinations are strict by destination shape, run the
+    // controlled experiment at this chokepoint on the first key-carrying 400:
+    // re-send the IDENTICAL request minus prompt_cache_key once. Accepted ⇒
+    // causation confirmed — adopt the retry's response, remember the
+    // origin+model pair process-locally (src/pck-probe.ts; surfaced via log /
+    // acp_status / web panel), every later prepare withholds the key there
+    // until proxy restart. Still failing ⇒ NOT this field — discard the
+    // second response, forward the original 400 verbatim, learn nothing (the
+    // next turn carries the key again and re-runs the probe). One attempt per
+    // request, no loops; the error body is buffered so the passthrough below
+    // re-reads the same bytes (same pattern as the #552 ladder above).
+    if (
+        prepared &&
+        req.method !== "GET" &&
+        req.method !== "HEAD" &&
+        typeof wireBody === "string" &&
+        upstreamResult.response.status === 400 &&
+        upstreamResult.response.body
+    ) {
+        let pckErrText: string | null = null;
+        try {
+            pckErrText = (await readStreamToBuffer(upstreamResult.response.body)).toString("utf8");
+        } catch {
+            pckErrText = null;
+        }
+        if (pckErrText !== null) {
+            upstreamResult = {
+                response: new Response(pckErrText, {
+                    status: upstreamResult.response.status,
+                    statusText: upstreamResult.response.statusText,
+                    headers: new Headers(upstreamResult.response.headers),
+                }),
+                clearTimer: upstreamResult.clearTimer,
+                stopIdleTimer: upstreamResult.stopIdleTimer,
+            };
+            let strippedPckBody: string | null = null;
+            let pckModel: string | undefined;
+            try {
+                const p = JSON.parse(wireBody) as Record<string, unknown>;
+                if (p && typeof p.prompt_cache_key === "string") {
+                    delete p.prompt_cache_key;
+                    pckModel = typeof p.model === "string" ? p.model : undefined;
+                    strippedPckBody = JSON.stringify(p);
+                }
+            } catch {
+                strippedPckBody = null;
+            }
+            if (strippedPckBody !== null) {
+                let retried: Awaited<ReturnType<typeof fetchWithTimeout>> | null = null;
+                try {
+                    applyResign(headers, strippedPckBody);
+                    retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(strippedPckBody) }, undefined, clientAbort.signal);
+                } catch {
+                    retried = null; // transport failure — inconclusive, original 400 stands
+                }
+                if (retried !== null) {
+                    if (retried.response.ok) {
+                        upstreamResult.clearTimer();
+                        // The key-less bytes are the accepted wire base now — track
+                        // them like the #552/#1900 role hops do, so every later
+                        // same-request re-send derives from what upstream accepted.
+                        wireBody = strippedPckBody;
+                        recordPckAblation({
+                            origin: upstreamUrl,
+                            model: pckModel,
+                            sessionId: prepared.session.id,
+                            statusWithKey: 400,
+                            errSnippet: pckErrText,
+                        });
+                        log("info", `[${prepared.session.id}] [pck] egress carried prompt_cache_key \u2192 400; identical request without the key was accepted — withholding the key for ${maskUrlForLog(upstreamUrl)} until proxy restart (#2645)`);
+                        upstreamResult = retried;
+                    } else {
+                        if (retried.response.body) {
+                            try {
+                                await readStreamToBuffer(retried.response.body);
+                            } catch {
+                                /* discarded either way */
+                            }
+                        }
+                        retried.clearTimer();
+                        log("debug", `[${prepared.session.id}] [pck] A/B retry without prompt_cache_key also failed (${retried.response.status}) — not the key's fault; key stays, original 400 forwarded (#2645)`);
+                    }
                 }
             }
         }
