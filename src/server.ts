@@ -88,6 +88,7 @@ import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClien
 import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
+import { activeDumpDirs, dumpRetentionState, formatUnboundedDumpWarning, measureDumpDir, type DumpDirStat } from "./state-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, clearSignedRefusal, decodeApigCredential, inboundSignedScheme, readPendingRefusals, recordSignedRefusal, resignApig, signedRefusal, unresolvedRefusals, type ApigCredential } from "./apig-resign.js";
 import { renderUI, handleConfigGet, handleConfigPut, handleSummaryCredentialPut, buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, hiddenEmptyCount } from "./web/index.js";
@@ -1230,6 +1231,21 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 "warn",
                 `[security] bound to ${opts.host} — proxy endpoints (/bili/, CONNECT for whitelisted model hosts) are reachable from the network with NO authentication; /__bili/ management endpoints stay loopback-only. Restrict access with a firewall on untrusted networks. Remote agents: point baseURL at http://<this-host>:${actualPort}/bili/`,
             );
+        }
+        // #3851: capture without retention bounds grows silently until the disk
+        // fills — say so once per boot. Async: measuring a large dir must not
+        // delay ready, and the warn still fires when the scan itself fails.
+        const dumpRet = dumpRetentionState();
+        if (dumpRet.unbounded) {
+            void (async (): Promise<void> => {
+                let stats: DumpDirStat[] = [];
+                try {
+                    stats = await Promise.all(activeDumpDirs().map(measureDumpDir));
+                } catch {
+                    // measurement failed — warn anyway, sizes omitted
+                }
+                log("warn", formatUnboundedDumpWarning(dumpRet, stats));
+            })();
         }
         if (opts.debug) {
             log("info", `[debug] build features: raw-HTTP-capture(${bodyDumpEnabled() ? "on" : "off"}) | remote_compaction_v2-strip(on) | cert-MITM-launcher(on) | strip-acp-summary(on) — seeing this line confirms the launcher build (not registry 0.1.34)`);

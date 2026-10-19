@@ -575,6 +575,16 @@ export function rawDumpDir(): string {
     return path.join(stateDir(), "raw");
 }
 
+/** ACP_DUMP_SSE > top-level dumpSse > off (undefined). Directory for raw SSE
+ *  stream captures; part of the #3851 retention-audit surface. */
+export function sseDumpDir(): string | undefined {
+    const envRaw = process.env.ACP_DUMP_SSE;
+    if (envRaw && envRaw.length > 0) return envRaw;
+    const f = loadConfigFile().dumpSse;
+    if (typeof f === "string" && f.trim().length > 0) return f;
+    return undefined;
+}
+
 /** BILI_DUMP_4XX > diagnostics.dump4xx > false. */
 export function dump4xxEnabled(): boolean {
     const envRaw = process.env.BILI_DUMP_4XX;

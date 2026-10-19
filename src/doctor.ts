@@ -12,7 +12,9 @@ import { isPidAlive, listInstances, procMainScript } from "./instance.js";
 import { PLUGIN_AGENTS, UPDATE_CHANNEL, claudeDesktopPresent, inspectLanePresence, type PluginAgent } from "./plugin-install.js";
 import { findInstallDir, fetchRegistryVersion, hostManagedInstall, isGitWorkingTree, isVersionNewer, lastUpdateCheckTime, normalizeUpdateTag, staleInstallStatus } from "./update.js";
 import { describeAdvisory, evaluateAdvisories, type AdvisoryEvaluation } from "./advisory.js";
-import { claudeRoutingWarningFile } from "./paths.js";
+import { claudeRoutingWarningFile, dumpsDir } from "./paths.js";
+import { rawDumpDir, sseDumpDir } from "./knobs.js";
+import { dumpRetentionState, fmtBytes, measureDumpDir, type DumpDirStat, type DumpRetentionState } from "./state-gc.js";
 import { dshProfileDirs } from "./dsh-channel.js";
 import { convergeDshLedger, dshProfileLedgerFindings, readDshLedgerState, type LedgerChangeDetail, type LedgerFinding } from "./dsh-ledger.js";
 
@@ -77,6 +79,9 @@ export interface DoctorReport {
     global: DoctorGlobalInfo;
     lanes: DoctorLane[];
     processes: DoctorProcess[];
+    /** #3851: debug dump dirs — current size + retention bounds. Always present
+     *  so data left behind by a since-disabled capture stays visible. */
+    dumps: { retention: DumpRetentionState; dirs: DumpDirStat[] };
     /** #3496: set only when `--fix` ran — what the repair pass changed per profile. */
     ledgerFixes?: DshLedgerFixRow[];
 }
@@ -210,7 +215,14 @@ export async function runDoctor(opts: DoctorOpts): Promise<DoctorReport> {
         };
     });
 
-    return { generatedAt: Date.now(), packageName: opts.packageName, global: g, lanes, processes };
+    // #3851: dump-dir visibility. Measure every dir the current config can write
+    // PLUS the default dirs, so leftover data from a since-disabled capture still
+    // shows up (the 51.9 GB case: capture stayed on, but the same applies in reverse).
+    const retention = dumpRetentionState();
+    const dumpCandidates = [dumpsDir(), rawDumpDir(), sseDumpDir()].filter((d): d is string => d !== undefined);
+    const dumpDirs = await Promise.all([...new Set(dumpCandidates)].map(measureDumpDir));
+
+    return { generatedAt: Date.now(), packageName: opts.packageName, global: g, lanes, processes, dumps: { retention, dirs: dumpDirs } };
 }
 
 /** #3496: the explicit repair pass behind `bili doctor --fix`. Converges every
@@ -360,6 +372,20 @@ export function renderDoctorReport(report: DoctorReport): string {
             lines.push(`  pid ${String(p.pid).padEnd(7)} port ${String(p.port).padEnd(6)} ${p.origin}  ${state}`);
             if (p.runningFrom !== undefined) lines.push(`  ${"".padEnd(12)} runs from ${p.runningFrom}${p.staleCopy ? " (not the current install dir)" : ""}`);
         }
+    }
+    lines.push("");
+    lines.push("dump dirs");
+    const ret = report.dumps.retention;
+    const capParts = [
+        ret.maxTotalBytes != null ? `maxTotalBytes=${fmtBytes(ret.maxTotalBytes)}` : "",
+        ret.maxAgeDays != null ? `maxAgeDays=${Number.isInteger(ret.maxAgeDays) ? String(ret.maxAgeDays) : ret.maxAgeDays.toFixed(1)}` : "",
+    ].filter(Boolean).join(", ");
+    if (ret.channels.length === 0) lines.push(`  retention     off (no capture enabled)`);
+    else if (ret.unbounded) lines.push(`  retention     UNBOUNDED — capture on (${ret.channels.join("+")}) with no maxTotalBytes/maxAgeDays set: dirs grow forever until the disk fills (#3851)`);
+    else lines.push(`  retention     bounded — capture on (${ret.channels.join("+")}): ${capParts}`);
+    for (const d of report.dumps.dirs) {
+        const size = d.exists ? `${fmtBytes(d.bytes)} (${d.files.toLocaleString("en-US")} ${d.files === 1 ? "file" : "files"})` : "(absent)";
+        lines.push(`  ${path.basename(d.dir).padEnd(16)} ${size.padEnd(24)} ${d.dir}`);
     }
     const counts: Record<LaneVerdict, number> = { ok: 0, stale: 0, frozen: 0, broken: 0, absent: 0 };
     for (const l of report.lanes) counts[l.verdict]++;

@@ -126,6 +126,7 @@ function syntheticReport(overrides?: { lanes?: DoctorLane[]; processes?: DoctorP
         global: { installDir: "/x/node_modules/billion-context", form: "npm", diskVersion: "0.1.143", runningVersion: "0.1.143", registryVersion: "0.1.143", updateTag: "latest", lastCheckTime: Date.parse("2026-09-24T00:00:00Z"), verdict: "ok" },
         lanes: overrides?.lanes ?? [],
         processes: overrides?.processes ?? [],
+        dumps: { retention: { channels: [], maxTotalBytes: null, maxAgeDays: null, unbounded: false }, dirs: [] },
     };
 }
 

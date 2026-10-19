@@ -1,7 +1,9 @@
 import { readdirSync, statSync, unlinkSync } from "node:fs";
+import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import { log as loggerLog } from "./logger.js";
-import { dumpGcMaxTotalBytes, dumpGcMaxAgeMs } from "./knobs.js";
+import { bodyDumpEnabled, dump4xxEnabled, dumpGcMaxAgeMs, dumpGcMaxTotalBytes, rawDumpDir, sseDumpDir } from "./knobs.js";
+import { configFile, dumpsDir } from "./paths.js";
 
 /**
  * #2412: retention GC for the debug dump directories (`dumps/`, `raw/`, the
@@ -126,4 +128,100 @@ export function gcDumpDirIfConfigured(dir: string): void {
     const maxAgeMs = dumpGcMaxAgeMs();
     if (maxBytes == null && maxAgeMs == null) return;
     gcDebugDir(dir, { maxBytes, maxAgeMs });
+}
+
+// --- #3851: retention visibility -------------------------------------------------
+// The bounds above are opt-in and default OFF by design ("leave both unset for
+// unbounded retention", CONFIGURATION.md). The gap #3851 reports: once capture
+// is turned on per the docs, nothing says the dirs are unbounded or how big they
+// already are — 51.9 GB over 10 days before anyone noticed. This block is that
+// signpost: read-only measurement + message building only. No new config keys,
+// no deletion, no change to any write path.
+
+export interface DumpDirStat {
+    dir: string;
+    exists: boolean;
+    bytes: number;
+    files: number;
+}
+
+export interface DumpRetentionState {
+    /** Capture channels writing dumps right now: "body" (dumps/ + raw/),
+     *  "4xx" (err-* incident dumps in dumps/), "sse" (raw SSE stream dir). */
+    channels: string[];
+    maxTotalBytes: number | null;
+    maxAgeDays: number | null;
+    /** Capture on with NEITHER bound set — dirs grow forever. */
+    unbounded: boolean;
+}
+
+/** Live retention posture for the debug dump dirs. Resolves the same knobs as
+ *  the GC itself (env > file > default-off), so what is reported is what runs. */
+export function dumpRetentionState(): DumpRetentionState {
+    const channels: string[] = [];
+    if (bodyDumpEnabled()) channels.push("body");
+    if (dump4xxEnabled()) channels.push("4xx");
+    if (sseDumpDir() !== undefined) channels.push("sse");
+    const maxBytes = dumpGcMaxTotalBytes();
+    const maxAgeMs = dumpGcMaxAgeMs();
+    return {
+        channels,
+        maxTotalBytes: maxBytes,
+        maxAgeDays: maxAgeMs == null ? null : maxAgeMs / 86_400_000,
+        unbounded: channels.length > 0 && maxBytes == null && maxAgeMs == null,
+    };
+}
+
+/** Every dump dir the current config can write (deduped — a custom rawDumpDir
+ *  may coincide with dumpsDir). Order: dumps/, raw/, SSE dir. */
+export function activeDumpDirs(): string[] {
+    const st = dumpRetentionState();
+    const dirs: string[] = [];
+    if (st.channels.includes("body") || st.channels.includes("4xx")) dirs.push(dumpsDir());
+    if (st.channels.includes("body")) dirs.push(rawDumpDir());
+    if (st.channels.includes("sse")) dirs.push(sseDumpDir()!);
+    return [...new Set(dirs)];
+}
+
+/** Total size + file count of one dump dir. Best-effort: a missing/unreadable
+ *  dir reports exists:false instead of throwing. Flat-file assumption matches
+ *  gcDebugDir — all bili dump dirs are flat. */
+export async function measureDumpDir(dir: string): Promise<DumpDirStat> {
+    let names: string[];
+    try {
+        names = await readdir(dir);
+    } catch {
+        return { dir, exists: false, bytes: 0, files: 0 };
+    }
+    let bytes = 0;
+    let files = 0;
+    for (const name of names) {
+        try {
+            const st = await stat(path.join(dir, name));
+            if (st.isFile()) {
+                bytes += st.size;
+                files += 1;
+            }
+        } catch {
+            // vanished between readdir and stat
+        }
+    }
+    return { dir, exists: true, bytes, files };
+}
+
+/** Human-readable byte count for logs/doctor (binary units, one decimal). */
+export function fmtBytes(n: number): string {
+    if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(1)} GiB`;
+    if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MiB`;
+    if (n >= 1024) return `${(n / 1024).toFixed(1)} KiB`;
+    return `${n} B`;
+}
+
+/** One-shot boot warning text (#3851). Pure builder so the exact wording is
+ *  unit-tested; empty `stats` = measurement failed, sizes omitted. */
+export function formatUnboundedDumpWarning(state: DumpRetentionState, stats: DumpDirStat[]): string {
+    const sizes = stats.length === 0
+        ? "size measurement unavailable"
+        : stats.map((s) => `${s.dir}=${s.exists ? `${fmtBytes(s.bytes)} (${s.files} file${s.files === 1 ? "" : "s"})` : "(not created yet)"}`).join(", ");
+    return `[dump] UNBOUNDED retention: capture is ON (${state.channels.join("+")}) but diagnostics.maxTotalBytes and diagnostics.maxAgeDays are both unset — these dirs are write-only and grow forever (~GB/day measured under active sessions, #2412). Current: ${sizes}. Set diagnostics.maxTotalBytes (total bytes) and/or diagnostics.maxAgeDays in ${configFile()} to bound them, or turn capture off (diagnostics.dumpBody=false) when you no longer need it.`;
 }
