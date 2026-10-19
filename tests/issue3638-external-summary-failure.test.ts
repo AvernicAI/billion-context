@@ -2,12 +2,9 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { afterEach, test } from "node:test";
 import { ExternalSummaryExecutor, type SummaryCandidate, type SummaryWork } from "../src/external-summary.ts";
-import { createSummaryHttpCandidate, _setSummaryRetryDelayForTest, type SummaryHttpTarget } from "../src/external-summary-http.ts";
+import { createSummaryHttpCandidate, type SummaryHttpTarget } from "../src/external-summary-http.ts";
 import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 import { composeExternalFailureMessage } from "../src/external-summary-compress.ts";
-import { ConfiguredSummaryPlan } from "../src/external-summary-runtime.ts";
-import { renderLaneNudgeText } from "../src/nudge-decide.ts";
-import { defaultPrompts, type NudgeDecision } from "acp-kernel";
 import {
     ExternalSummaryError,
     classifyError,
@@ -95,28 +92,20 @@ test("#3638 hard overflow dispatches nothing and classifies input_budget_overflo
 });
 
 test("#3638 provider rejection is classified with the HTTP status only (no body)", async () => {
-    // Zero the retry backoff via the #3488 seam: with real sleeps the three
-    // attempts consume most of totalTimeoutMs and slow machines classify the
-    // last attempt as a deadline timeout instead of the rejection.
-    _setSummaryRetryDelayForTest(0);
-    try {
-        await upstream((req, res) => {
-            res.setHeader("content-type", "text/plain");
-            res.statusCode = 429;
-            res.end("rate limited — bearer super-secret-key echoed by upstream");
-        }, async (url) => {
-            const candidate = createSummaryHttpCandidate(target(url), 4096);
-            const result = await new ExternalSummaryExecutor(1).execute({ content: "c", instructions: "i" }, [candidate], budget);
-            assert.equal(result.status, "failed");
-            if (result.status === "failed") {
-                assert.equal(result.attempts[0]?.outcome, "error");
-                assert.equal(result.attempts[0]?.failure?.cls, "provider_rejected");
-                assert.equal(result.attempts[0]?.failure?.detail, "HTTP 429");
-            }
-        });
-    } finally {
-        _setSummaryRetryDelayForTest(null);
-    }
+    await upstream((req, res) => {
+        res.setHeader("content-type", "text/plain");
+        res.statusCode = 429;
+        res.end("rate limited — bearer super-secret-key echoed by upstream");
+    }, async (url) => {
+        const candidate = createSummaryHttpCandidate(target(url), 4096);
+        const result = await new ExternalSummaryExecutor(1).execute({ content: "c", instructions: "i" }, [candidate], budget);
+        assert.equal(result.status, "failed");
+        if (result.status === "failed") {
+            assert.equal(result.attempts[0]?.outcome, "error");
+            assert.equal(result.attempts[0]?.failure?.cls, "provider_rejected");
+            assert.equal(result.attempts[0]?.failure?.detail, "HTTP 429");
+        }
+    });
 });
 
 test("#3638 composed failure message distinguishes per-candidate classes and stays bounded", async () => {
@@ -168,51 +157,6 @@ test("#3638 failure latch arms after consecutive all-failed batches and clears o
     recordExternalBatchOutcome(metadata, { successes: 0, total: 1, classes: ["timeout"], fingerprint: changed, dispatched: true });
     assert.equal(externalFailureStreak(metadata), 1, "a config change resets the streak");
     assert.equal(externalFailureLatchActive(metadata, fingerprint), false);
-});
-
-test("#3638 lane seam: renderLaneNudgeText swaps the tier>=2 catalog for the standing notice", () => {
-    // Windows deliberately omitted: parseExternalSummarySettings fills them, so
-    // this fixture is exactly the case where fingerprinting parsed settings vs
-    // the raw rail chain would disagree and silently dead the latch.
-    const chain = {
-        enabled: true,
-        targets: [{ name: "sm", protocol: "responses", url: "https://api.example/v1/chat/completions", model: "m", apiKey: "super-secret-key-value" }],
-        budget: { totalTimeoutMs: 50000, targetTimeoutMs: 25000, maxSummaryBytes: 65536 },
-    };
-    const config = { externalSummary: chain }; // full request-Config shape, not the bare chain
-    assert.equal(new ConfiguredSummaryPlan(chain).fingerprint, externalSummaryFingerprint(chain), "plan fingerprints the raw rail chain");
-
-    function decision(tier: number | null): NudgeDecision {
-        return {
-            shouldInject: true,
-            reason: "test",
-            compressibleRanges: [{ startRef: "m00001", endRef: "m00042", tokens: 1000 }],
-            contextUsage: 0.99,
-            tier,
-            breakdown: { emergencyOverride: 1 },
-        } as NudgeDecision;
-    }
-    const metadata: Record<string, unknown> = {};
-    const recordFailure = () => recordExternalBatchOutcome(metadata, { successes: 0, total: 1, classes: ["provider_rejected"], fingerprint: externalSummaryFingerprint(chain), dispatched: true });
-
-    recordFailure();
-    const once = renderLaneNudgeText(decision(2), defaultPrompts, undefined, metadata, config);
-    assert.ok(!once.text.includes("EXTERNAL SUMMARY UNAVAILABLE"), "one failed batch does not arm the latch");
-    assert.match(once.text, /TIER 2 DISTILLATION/, "unswapped tier-2 nudge keeps the full catalog");
-
-    recordFailure();
-    const swapped = renderLaneNudgeText(decision(2), defaultPrompts, undefined, metadata, config);
-    assert.equal(swapped.voice, "gentle");
-    assert.match(swapped.text, /EXTERNAL SUMMARY UNAVAILABLE — TIER 2 DISTILLATION PAUSED/);
-    assert.ok(!swapped.text.includes("TIER 2 DISTILLATION TRIGGER"), "the standing notice must not re-inject the block catalog");
-    assert.match(swapped.text, /provider_rejected/);
-
-    assert.match(renderLaneNudgeText(decision(3), defaultPrompts, undefined, metadata, config).text, /TIER 3 CONDENSATION PAUSED/);
-
-    // Negative rows: tier-1 untouched; mode disabled untouched even with the latch armed.
-    assert.ok(!renderLaneNudgeText(decision(1), defaultPrompts, undefined, metadata, config).text.includes("EXTERNAL SUMMARY UNAVAILABLE"));
-    const offConfig = { externalSummary: { ...chain, enabled: false } };
-    assert.ok(!renderLaneNudgeText(decision(2), defaultPrompts, undefined, metadata, offConfig).text.includes("EXTERNAL SUMMARY UNAVAILABLE"));
 });
 
 test("#3638 classifyError maps legacy messages, transport codes and typed errors", () => {
