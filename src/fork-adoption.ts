@@ -262,6 +262,14 @@ export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, pare
     // dropped (its failed tail, a rewound branch) — and the model's older
     // text may still cite those. Reserve the parent's whole ref space.
     reserveRefsThrough(session, highestUsedIndex(parent.state.messageRefs));
+    // #3769: carry the orphan-cleanup ledgers too — without this, the failed
+    // compress pairs the pre-upgrade keep-two rotation hid (hiddenOrphanRefs)
+    // or the fold-gated sweep already swept (sweptOrphanCallIds) would
+    // RESURFACE on resume/fork replay, rewriting mid-history at full cache
+    // cost. Both are monotonic id/ref sets; the hide pass re-records them
+    // every turn, so the carry self-perpetuates afterwards.
+    if (parent.state.hiddenOrphanRefs?.length) session.state.hiddenOrphanRefs = [...parent.state.hiddenOrphanRefs];
+    if (parent.state.sweptOrphanCallIds?.length) session.state.sweptOrphanCallIds = [...parent.state.sweptOrphanCallIds];
     markDirty(session);
 }
 
