@@ -11,10 +11,12 @@
 // therefore re-injects the in-place acp_summary carrier from block state on
 // every request. Since the #1567 fix the carrier is STRIPPED per-block, but
 // self-verified: only while that exact fold's compress pair actually rides
-// the (post-prepare) inbound history. A pair pruned client-side or swept by
-// the kernel's fold-gated orphan cleanup (#3769) keeps the anchor, so an
-// active fold never has zero carriers. This suite pins that behavior
-// byte-for-byte.
+// the (post-prepare) inbound history. Under fold-gated sweeps (#3769) a pair
+// whose call sits at/after a committed fold's start ref is hidden from that
+// fold turn on — in this harness the fold POST and its model request share
+// one step, so each failed pair is swept at its own fold step, never rides,
+// and its anchor carries the summary for good (zero-carrier fail-safe). This
+// suite pins that behavior byte-for-byte.
 //
 // Invariants pinned per wire (bodies = consecutive upstream-bound request
 // payloads of one session, compared as flat unit lists — text blocks and
@@ -34,19 +36,17 @@
 //       /__bili/plugin/tool fold):
 //        P2a the pre-fold span is replaced by exactly the expected carrier
 //            units and nothing else moves or mutates (exact reconstruction);
-//        P2b the in-place carrier is stripped from every post-fold turn
-//            while the client's pair rides inbound — occurrence counts
-//            pinned: exactly 2 summary-text hits per post-fold turn (the
-//            fold spec echoed in the re-sent tool_call args + the tail
-//            quote inside the persistently re-sent tool result) and ZERO
-//            carrier markers (#1567 fix);
- //        P2c fail-safe (#1567 hardening): the anchor re-carries the summary
- //            whenever the pair does NOT ride inbound — the client stops
- //            re-sending it, or the kernel swept it on a later fold (#3769) —
- //            pinned by the hardening subtests at the bottom of this file;
- //   P3 multi-fold: two folds in one session; both pairs stay visible for the
- //       rest of the session (fold-gated sweeps, #3769 — keep-two rotation is
- //       gone) and the pair-quote counts stay constant across all later turns;
+//        P2b the pair is swept at its own fold step (#3769) and never rides
+//            inbound — occurrence counts pinned: exactly ONE summary-text hit
+//            per post-fold turn (the anchor carrier) and ZERO pair quotes,
+//            one carrier marker per committed fold (#1567 fail-safe);
+//        P2c fail-safe (#1567 hardening): the anchor carries the summary
+//            whenever the pair does NOT ride inbound — under #3769 that is
+//            every post-fold turn in this harness; the drop-pair subtest
+//            pins that a client-side pair drop afterwards is a wire no-op;
+//   P3 multi-fold: two folds in one session; each anchor carries its own
+//       summary from its fold turn on, the carrier count grows by one per
+//       fold and then stays constant (keep-two rotation is gone, #3769);
 //   P4 no transient acp_loop_* artifact leaks into any forwarded body
 //      (plugin mode has none by construction — pin it);
 //   P5 marker/tag hygiene: every content text unit carries exactly one
@@ -69,7 +69,8 @@
 //
 // Scenario (main, all wires): t1=[q1,a1,q2,a2], t2=+q3,a3, t3=+q4,a4,
 // foldA(m00001..m00002)+pairA@t4, t5=+q5,a5, foldB(m00003..m00005)+pairB@t6,
-// t7=+q7,a7, t8=+q8,a8 — every historical pair rides every later request.
+// t7=+q7,a7, t8=+q8,a8 — each failed pair is swept at its own fold step
+// (#3769); its anchor carries the summary from there on.
 //
 // Scope notes: tool protocol only (the default). The swallow/back-to-back
 // fold geometries get a dedicated anthropic subtest (kernel-side behavior,
@@ -614,28 +615,29 @@ for (const wire of ["anthropic", "openai", "responses", "google"] as Wire[]) {
 
         assertPrefix(cans[0]!.core, cans[1]!.core, L(1), ["q3", "a3"]);
         assertPrefix(cans[1]!.core, cans[2]!.core, L(2), ["q4", "a4"]);
-        assertFoldTransition(cans[2]!.core, cans[3]!.core, ["q1", "a1"], ["q1"], L(3)); // head boundary survives; anchor stripped (#1567)
-        assertPrefix(cans[3]!.core, cans[4]!.core, L(4), wire === "google" ? ["a5"] : ["q5", "a5"], wire === "google"); // google: #3159 — q5 leads the fold-pair result
-        assertFoldTransition(cans[4]!.core, cans[5]!.core, ["q2", "a2", "q3"], [], L(5)); // anchor stripped (#1567)
-        assertPrefix(cans[5]!.core, cans[6]!.core, L(6), wire === "google" ? ["a7"] : ["q7", "a7"], wire === "google"); // google: #3159 — q7 leads the fold-pair result
+        assertFoldTransition(cans[2]!.core, cans[3]!.core, ["q1", "a1"], ["q1", "SA"], L(3)); // head boundary survives; anchor A carries — its pair was swept at fold time (#3769)
+        assertPrefix(cans[3]!.core, cans[4]!.core, L(4), ["q5", "a5"]);
+        assertFoldTransition(cans[4]!.core, cans[5]!.core, ["q2", "a2", "q3"], ["SB"], L(5)); // span consumed; anchor B carries (#3769)
+        assertPrefix(cans[5]!.core, cans[6]!.core, L(6), ["q7", "a7"]);
         assertPrefix(cans[6]!.core, cans[7]!.core, L(7), ["q8", "a8"]);
 
         for (let i = 3; i < cans.length; i++) {
             const raw = cans[i]!.raw;
-            // #1567 (fixed): the in-place carrier is stripped per-block while
-            // the client's re-sent pair rides inbound — only the two pair
-            // quotes (tool_call args + tool result) keep the summary text.
-            const expA = 2;
-            const expB = i < 5 ? 0 : 2;
-            assert.equal(countOcc(raw, SUM_MARKER), 0, `${L(i)}: in-place carrier must be stripped while the client's pair rides inbound (got ${countOcc(raw, SUM_MARKER)})`);
-            assert.equal(countOcc(raw, SUM_A), expA, `${L(i)}: SUM_A occurrences ${countOcc(raw, SUM_A)} != ${expA} (pair quotes only, #1567)`);
-            assert.equal(countOcc(raw, SUM_B), expB, `${L(i)}: SUM_B occurrences ${countOcc(raw, SUM_B)} != ${expB} (pair quotes only, #1567)`);
-            // google part-shapes carry no call id; pin pair presence through
-            // the fold topic embedded in the re-sent functionCall args
-            const pairA = wire === "google" ? "CFP-TOPIC-A" : "\"cfp_a\"";
-            const pairB = wire === "google" ? "CFP-TOPIC-B" : "\"cfp_b\"";
-            assert.ok(raw.includes(pairA), `${L(i)}: pairA lost from re-sent history`);
-            if (i >= 5) assert.ok(raw.includes(pairB), `${L(i)}: pairB lost from re-sent history`);
+            // #3769: each failed pair is swept at its own fold step, so no
+            // pair quotes ride inbound — each anchor carries its summary for
+            // good (zero-carrier fail-safe, #1567)
+            const expA = 1;
+            const expB = i < 5 ? 0 : 1;
+            assert.equal(countOcc(raw, SUM_MARKER), i < 5 ? 1 : 2, `${L(i)}: one carrier per committed fold (pairs swept, #3769)`);
+            assert.equal(countOcc(raw, SUM_A), expA, `${L(i)}: SUM_A occurrences ${countOcc(raw, SUM_A)} != ${expA} (anchor carrier only, #3769)`);
+            assert.equal(countOcc(raw, SUM_B), expB, `${L(i)}: SUM_B occurrences ${countOcc(raw, SUM_B)} != ${expB} (anchor carrier only, #3769)`);
+            // google part-shapes carry no call id; pin pair ABSENCE through
+            // the fold spec refs that would sit in the re-sent functionCall
+            // args (the anchor carrier embeds topic+summary, never the spec)
+            const pairA = wire === "google" ? "\"startId\":\"m00001\"" : "\"cfp_a\"";
+            const pairB = wire === "google" ? "\"startId\":\"m00003\"" : "\"cfp_b\"";
+            assert.ok(!raw.includes(pairA), `${L(i)}: swept pairA must stay hidden (#3769)`);
+            assert.ok(!raw.includes(pairB), `${L(i)}: swept pairB must stay hidden (#3769)`);
         }
 
     }, { timeout: 120_000 });
@@ -666,21 +668,32 @@ testCompat("cache-friendly plugin matrix: anthropic swallow/back-to-back geometr
 
     assertPrefix(cans[0]!.core, cans[1]!.core, L(1), ["q3", "a3"]);
     assertPrefix(cans[1]!.core, cans[2]!.core, L(2), ["q4", "a4"]);
-    assertFoldTransition(cans[2]!.core, cans[3]!.core, ["q1", "a1"], ["q1"], L(3)); // head boundary survives; anchor stripped (#1567)
+    assertFoldTransition(cans[2]!.core, cans[3]!.core, ["q1", "a1"], ["q1", "SA"], L(3)); // head boundary survives; anchor A carries (pair swept at fold time, #3769)
     assertPrefix(cans[3]!.core, cans[4]!.core, L(4), ["q5", "a5"]);
 
     const wide = FOLD_WIDE.summary;
     const gamma = FOLD_E.summary;
+    // Fold-gated sweeps (#3769): every failed pair is hidden from its own
+    // fold step on, so no pair quotes ride inbound and each anchor carries
+    // its summary. The wide fold (m00001..m00004) swallows the alpha fold's
+    // range entirely — the alpha summary merges away and the wide carrier
+    // takes over. FOLD_E's tail sits in the protected zone, so only its
+    // first message folds and the gamma carrier lands where q3 used to sit.
     for (const i of [5, 6, 7]) {
         const raw = cans[i]!.raw;
-        // carrier is superseded on every turn; the geo_a pair quotes ride
-        // every later turn — fold-gated sweeps (#3769) replaced keep-two
-        // rotation, so no later fold prunes this oldest pair here
-        assert.equal(countOcc(raw, SUM_A), 2, `${L(i)}: SUM_A occurrences ${countOcc(raw, SUM_A)} != 2`);
-        assert.equal(countOcc(raw, SUM_MARKER), 0, `${L(i)}: carriers must be stripped while their pairs ride inbound (got ${countOcc(raw, SUM_MARKER)})`);
         assert.ok(!raw.includes("q2-marker"), `${L(i)}: swallowed content q2 must stay hidden`);
         assert.ok(!raw.includes("a2-marker"), `${L(i)}: swallowed content a2 must stay hidden`);
+        assert.ok(!raw.includes("\"geo_a\"") && !raw.includes("\"geo_wide\"") && !raw.includes("\"geo_e\""), `${L(i)}: all three failed pairs swept at their fold steps (#3769)`);
     }
+    assert.equal(countOcc(cans[5]!.raw, SUM_A), 0, `${L(5)}: alpha summary absorbed into the wide fold`);
+    assert.equal(countOcc(cans[5]!.raw, wide), 1, `${L(5)}: wide carrier only (its pair swept, #3769)`);
+    assert.equal(countOcc(cans[5]!.raw, SUM_MARKER), 1, `${L(5)}: single carrier after the swallow`);
+    assert.equal(countOcc(cans[6]!.raw, wide), 1, `${L(6)}: wide carrier persists`);
+    assert.equal(countOcc(cans[6]!.raw, gamma), 1, `${L(6)}: gamma carrier only (its pair swept, #3769)`);
+    assert.equal(countOcc(cans[6]!.raw, SUM_MARKER), 2, `${L(6)}: one carrier per committed fold`);
+    assert.equal(countOcc(cans[7]!.raw, wide), 1, `${L(7)}: wide carrier persists`);
+    assert.equal(countOcc(cans[7]!.raw, gamma), 1, `${L(7)}: gamma carrier persists`);
+    assert.equal(countOcc(cans[7]!.raw, SUM_MARKER), 2, `${L(7)}: carriers stable across quiet turns`);
     const surviveKeys = new Set(["q1", "a1", "q2", "a2", "SA"]);
     const keepT5 = cans[4]!.core.filter((u) => !surviveKeys.has(keyOf(u)));
     let cursor = -1;
@@ -689,32 +702,23 @@ testCompat("cache-friendly plugin matrix: anthropic swallow/back-to-back geometr
         assert.ok(found > cursor, `cfp-geo t6: unit ${JSON.stringify(keyOf(u))} lost or reordered by the wide fold`);
         cursor = found;
     }
-    assert.equal(countOcc(cans[5]!.raw, wide), 2, `${L(5)}: wide fold turn occurrences (pair quotes; anchor stripped)`);
-    assert.equal(countOcc(cans[6]!.raw, gamma), 2, `${L(6)}: gamma fold turn occurrences (pair quotes; anchor stripped)`);
-    assert.equal(countOcc(cans[7]!.raw, wide), 2, `${L(7)}: resent wide quotes must survive`);
-    assert.equal(countOcc(cans[7]!.raw, gamma), 2, `${L(7)}: resent gamma quotes must survive`);
-    for (const i of [6, 7]) {
-        const raw = cans[i]!.raw;
-        // all three failed pairs stay visible: fold-gated sweeps (#3769) only
-        // remove orphans at/after a committed fold's start, never rotate the
-        // newest failures away between folds
-        assert.ok(raw.includes("\"geo_a\"") && raw.includes("\"geo_wide\"") && raw.includes("\"geo_e\""), `${L(i)}: all three pairs must stay visible (no keep-two rotation)`);
-    }
-    // #1567 (fixed): no text unit carries the wide summary anymore (stripped
-    // anchor); the quotes ride structured tool units, not text
+    // #1567/#3769: the wide summary rides its anchor carrier (a text unit)
+    // for good — the pair was swept at fold time, so the carrier is never
+    // stripped again
     const wideT6 = cans[6]!.core.filter((u) => u.k === "text" && u.x.includes(wide));
     const wideT7 = cans[7]!.core.filter((u) => u.k === "text" && u.x.includes(wide));
-    assert.equal(wideT6.length, 0, `${L(6)}: wide carrier must be stripped while the geo_wide pair rides inbound`);
-    assert.equal(wideT7.length, 0, `${L(7)}: wide carrier must be stripped while the geo_wide pair rides inbound`);
+    assert.equal(wideT6.length, 1, `${L(6)}: wide carrier rides a text unit while the geo_wide pair stays swept`);
+    assert.equal(wideT7.length, 1, `${L(7)}: wide carrier rides a text unit while the geo_wide pair stays swept`);
     assertPrefix(cans[6]!.core, cans[7]!.core, L(7), ["q8", "a8"]);
 }, { timeout: 120_000 });
 
-// #1567 hardening scenario A: a contract-violating (or pruning) client stops
-// re-sending an older compress pair. While pairA rides, its anchor is
-// stripped (P2b); the moment the pair vanishes the anchor MUST re-carry the
-// summary (zero-carrier fail-safe) and the body must stay append-stable on
-// later turns (no flapping).
-testCompat(`cache-friendly plugin matrix: anthropic — client drops re-sent pair → anchor re-carries (#1567 hardening)`, async () => {
+// #1567 hardening scenario A, re-pinned under #3769: a contract-violating
+// (or pruning) client stops re-sending an older compress pair at t7. Under
+// fold-gated sweeps the pair was already hidden at its own fold step (t4),
+// so its anchor has carried the summary since then — the client-side drop is
+// a wire no-op, and the body stays append-stable with exactly one carrier
+// per committed fold (no flapping).
+testCompat(`cache-friendly plugin matrix: anthropic — client drops re-sent pair → wire unaffected, carriers stable (#1567/#3769)`, async () => {
     const steps: Step[] = [
         { send: [T(1), A(1), T(2), A(2)] },
         { send: [T(3), A(3)] },
@@ -733,35 +737,28 @@ testCompat(`cache-friendly plugin matrix: anthropic — client drops re-sent pai
         assert.equal(countOcc(cans[i]!.raw, "acp_loop_"), 0, `${L(i)}: acp_loop_ artifact leaked`);
     }
     assertTagPolicy(cans, "cfp-drop");
-    // t4..t6: both pairs ride → both anchors stripped
-    for (const i of [3, 4, 5]) {
+    // t4..t8: both pairs swept at their fold steps → each anchor is the sole
+    // carrier of its summary; the client dropping pairA at t7 changes nothing
+    for (const i of [3, 4, 5, 6, 7]) {
         const raw = cans[i]!.raw;
-        assert.equal(countOcc(raw, SUM_MARKER), 0, `${L(i)}: carrier must be stripped while pair rides`);
-        assert.ok(raw.includes('"cfp_a"'), `${L(i)}: pairA still re-sent here`);
-    }
-    assert.ok(cans[5]!.raw.includes('"cfp_b"'), `${L(5)}: pairB rides`);
-    // t7/t8: pairA gone → anchor A is the ONLY carrier again
-    for (const i of [6, 7]) {
-        const raw = cans[i]!.raw;
-        assert.ok(!raw.includes('"cfp_a"'), `${L(i)}: client no longer re-sends pairA`);
-        assert.equal(countOcc(raw, SUM_MARKER), 1, `${L(i)}: anchor A must re-carry (exactly one carrier)`);
-        assert.equal(countOcc(raw, SUM_A), 1, `${L(i)}: SUM_A = carrier only (pair quotes gone with the pair)`);
-        assert.equal(countOcc(raw, SUM_B), 2, `${L(i)}: SUM_B quotes only, anchor B still stripped (pairB rides)`);
-        assert.ok(raw.includes('"cfp_b"'), `${L(i)}: pairB rides`);
+        assert.ok(!raw.includes('"cfp_a"') && !raw.includes('"cfp_b"'), `${L(i)}: failed pairs swept at fold time (#3769)`);
+        assert.equal(countOcc(raw, SUM_A), 1, `${L(i)}: anchor A carries (sole occurrence)`);
+        assert.equal(countOcc(raw, SUM_B), i < 5 ? 0 : 1, `${L(i)}: anchor B carries from its fold turn on`);
+        assert.equal(countOcc(raw, SUM_MARKER), i < 5 ? 1 : 2, `${L(i)}: one carrier per committed fold`);
     }
     assert.ok(cans[6]!.raw.includes("q7-marker"), `${L(6)}: new turn visible`);
     // once re-carried, the body stays append-stable (no flapping)
     assertPrefix(cans[6]!.core, cans[7]!.core, L(7), ["q8", "a8"]);
 }, { timeout: 120_000 });
 
-// #3769 contract pin (plugin lane): three concurrent ACTIVE folds. The old
-// KEEP_LAST_ORPHANED=2 rotation hid the oldest failed pair on EVERY turn —
-// a mid-history rewrite with no fold behind it, exactly #3769's cache seam.
-// Fold-gated sweeps replaced it: failed pairs stay visible between folds, so
-// every anchor stays stripped (its own pair rides) and later turns remain
-// append-stable. The zero-carrier fail-safe itself (pair gone → anchor
-// re-carries) is pinned by the drop-pair subtest above.
-testCompat(`cache-friendly plugin matrix: anthropic — 3 concurrent folds keep all failed pairs riding (fold-gated sweeps, #3769)`, async () => {
+// #3769 contract pin (plugin lane): three back-to-back folds, each with a
+// failed (client-visible) compress pair. The old KEEP_LAST_ORPHANED=2
+// rotation hid the oldest pair on EVERY turn — a mid-history rewrite with no
+// fold behind it, exactly #3769's cache seam. Fold-gated sweeps hide each
+// pair at its own fold step (the deletion rides the fold's own rewrite), so
+// every anchor carries its summary from the fold turn on, carriers stack
+// without churning, and quiet turns stay append-stable.
+testCompat(`cache-friendly plugin matrix: anthropic — 3 concurrent folds: pairs swept at fold time, anchors carry (#3769)`, async () => {
     const SUM_P1 = "Prune-safe fold one summary covering m00001..m00002";
     const SUM_P2 = "Prune-safe fold two summary covering m00003..m00004";
     const SUM_P3 = "Prune-safe fold three summary covering m00005..m00006";
@@ -785,20 +782,23 @@ testCompat(`cache-friendly plugin matrix: anthropic — 3 concurrent folds keep 
         assert.equal(countOcc(cans[i]!.raw, "acp_loop_"), 0, `${L(i)}: acp_loop_ artifact leaked`);
     }
     assertTagPolicy(cans, "cfp-prune");
-    // t3/t4: each fold's pair rides from its own turn on → anchors stripped
-    for (const i of [2, 3]) {
-        assert.equal(countOcc(cans[i]!.raw, SUM_MARKER), 0, `${L(i)}: anchors stripped while pairs ride`);
-    }
-    assert.ok(cans[3]!.raw.includes('"fs1"') && cans[3]!.raw.includes('"fs2"'), `${L(3)}: both pairs visible`);
-    // t5..t7: three failed pairs coexist and ALL stay visible (no keep-two
-    // rotation, #3769) → every anchor stays stripped, no carrier needed
-    for (const i of [4, 5, 6]) {
+    // t3..t5: each fold's pair is swept at its own fold step → each anchor
+    // carries its summary; carrier count grows by one per fold
+    for (const i of [2, 3, 4]) {
         const raw = cans[i]!.raw;
-        assert.ok(raw.includes('"fs1"') && raw.includes('"fs2"') && raw.includes('"fs3"'), `${L(i)}: all three failed pairs must stay visible (fold-gated sweeps, #3769)`);
-        assert.equal(countOcc(raw, SUM_MARKER), 0, `${L(i)}: no carrier needed — every anchor's pair rides inbound`);
-        assert.equal(countOcc(raw, SUM_P1), 2, `${L(i)}: SUM_P1 pair quotes only`);
-        assert.equal(countOcc(raw, SUM_P2), 2, `${L(i)}: SUM_P2 pair quotes only`);
-        assert.equal(countOcc(raw, SUM_P3), 2, `${L(i)}: SUM_P3 pair quotes only`);
+        assert.ok(!raw.includes('"fs1"') && !raw.includes('"fs2"') && !raw.includes('"fs3"'), `${L(i)}: failed pairs swept at their fold steps (#3769)`);
+        assert.equal(countOcc(raw, SUM_P1), 1, `${L(i)}: anchor P1 carries (sole occurrence)`);
+        assert.equal(countOcc(raw, SUM_P2), i < 3 ? 0 : 1, `${L(i)}: anchor P2 carries from its fold turn on`);
+        assert.equal(countOcc(raw, SUM_P3), i < 4 ? 0 : 1, `${L(i)}: anchor P3 carries from its fold turn on`);
+        assert.equal(countOcc(raw, SUM_MARKER), i - 1, `${L(i)}: one carrier per committed fold`);
+    }
+    // t6/t7: all three carriers persist, stable across quiet turns
+    for (const i of [5, 6]) {
+        const raw = cans[i]!.raw;
+        assert.equal(countOcc(raw, SUM_P1), 1, `${L(i)}: P1 carrier persists`);
+        assert.equal(countOcc(raw, SUM_P2), 1, `${L(i)}: P2 carrier persists`);
+        assert.equal(countOcc(raw, SUM_P3), 1, `${L(i)}: P3 carrier persists`);
+        assert.equal(countOcc(raw, SUM_MARKER), 3, `${L(i)}: three carriers, stable`);
     }
     // mid-history never mutates between quiet turns
     assertPrefix(cans[5]!.core, cans[6]!.core, L(6), ["q8", "a8"]);
