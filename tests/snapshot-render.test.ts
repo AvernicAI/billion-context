@@ -25,13 +25,18 @@ import path from "node:path";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST_ZSTD = "0";
+// The D-lane renders from the unified store's tail view, so its sidecar must be
+// open. Pin shadow explicitly: an ambient BILI_STORAGE_UNIFIED of legacy/0/false
+// (or a config value) otherwise resolves mode to "legacy", where maybeOpen returns
+// null SILENTLY and every D-on test degrades to the legacy path (#3771).
+process.env.BILI_STORAGE_UNIFIED = "shadow";
 process.env.BILI_CONFIG_FILE = path.join(mkdtempSync(path.join(tmpdir(), "bili-snap-hermetic-")), "no-config.json");
 
 import { defaultConfig } from "acp-kernel";
 import { __setMessageIdSaltForTests } from "acp-kernel/wire";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { SessionStore, _setStoreForTest, getStore } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions, _resetSessionsForTest } from "../src/session.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -261,6 +266,21 @@ function assertPrefixStable(a: { role: string; content: unknown }[], b: { role: 
     }
 }
 
+/** Loud guard for the #3771 blind spot: a D-on test must prove the lane
+ *  ACTUALLY rendered, not silently run the legacy path (whose behavior also
+ *  satisfies most functional asserts, so a silent fallback read as green). On
+ *  short activation, throw naming the degrade reason + store state. */
+function assertDActive(h: Harness, label: string, minTurns: number, ctx: string): void {
+    const s = h.sessionOf(label)!;
+    const turns = s.metadata["snapshotRenderTurns"] as number | undefined;
+    if (typeof turns === "number" && turns >= minTurns) return;
+    const st = getStore();
+    throw new Error(
+        `[D-lane] did not activate (${ctx}): snapshotRenderTurns=${turns ?? "undefined"} (want >= ${minTurns}); degradeReason=${s.metadata["snapshotRenderDegradeReason"] ?? "(none - lane off or nothing armed)"}; ` +
+        `replicasAvailable=${String(st.replicasAvailable())} rows=${st.unifiedTailViewRows(label)?.length ?? "null"} seqs=${st.unifiedTailSeqs(label)?.length ?? "null"}`,
+    );
+}
+
 async function armBlock(h: Harness, label: string): Promise<void> {
     const r = await turn(h, h.openaiUrl, label, conversation());
     assert.equal(r.status, 200, r.body);
@@ -298,8 +318,8 @@ test("D on: steady state — anchor rendered once, covered rows absent, prefix b
         // tail = the new user message + the assistant run that absorbed the
         // turn-2 reply (#3658 openai assistant run-merge discipline).
         assertPrefixStable(out3, out2, 2, "steady-state");
-        const s = h.sessionOf("s-steady")!;
-        assert.ok((s.metadata["snapshotRenderTurns"] as number) >= 2, "D observability latch counted turns");
+        assertDActive(h, "s-steady", 2, "steady-state");
+        assert.equal(h.sessionOf("s-steady")!.metadata["snapshotRenderDegradeReason"], undefined, "degrade reason cleared after successful D renders");
     }, true);
 });
 
@@ -327,6 +347,7 @@ test("D on: identity-seed upgrade — outbound prefix byte-identical, block aliv
         assert.equal(anchorCount(joined3), 1, "exactly one anchor copy");
         // prefix (everything except the live tail) byte-identical to pre-upgrade
         assertPrefixStable(out3, out2, 1, "seed-upgrade");
+        assertDActive(h, "s-upg", 1, "seed-upgrade");
         const s = h.sessionOf("s-upg")!;
         assert.ok(s.state.blocks.some((b) => b.active), "block survived the upgrade");
         assert.equal(s.metadata["foldDriftEscalated"], undefined, "no destroy verdict");
@@ -372,6 +393,7 @@ test("D on: client drops/checkpoints the covered region — server-authoritative
         assert.equal(r4.status, 200, r4.body);
         const out4 = sent(h.bodies, r4.idx);
         assertPrefixStable(out4, out3, 1, "client-checkpoint");
+        assertDActive(h, "s-drop", 1, "client-checkpoint");
     }, true);
 });
 
@@ -391,6 +413,7 @@ test("D on: rewind — dropped tail messages do not come back", async () => {
         assert.ok(!joined3.includes("RW_A_"), "rewound message not rendered");
         assert.ok(joined3.includes("RW_B_"), "new question present");
         assert.ok(joined3.includes(SUMMARY), "anchor still rendered");
+        assertDActive(h, "s-rw", 1, "rewind");
     }, true);
 });
 
@@ -414,6 +437,7 @@ test("D on: protocol switch mid-session — anchors render on the new wire, sess
         assert.ok(joined2.includes("SW_A_"), "tail present");
         const s = h.sessionOf("s-switch");
         assert.ok(s, "session survived the protocol switch (not forked away)");
+        assertDActive(h, "s-switch", 1, "protocol-switch");
     }, true);
 });
 
@@ -452,6 +476,7 @@ test("D on but storage unavailable: legacy fallback, request still served", asyn
         const joined2 = sent(h.bodies, r2.idx).map(textOf).join("\n");
         assert.ok(joined2.includes("NS_A_"), "served");
         assert.equal(h.sessionOf("s-nostore")!.metadata["snapshotRenderTurns"], undefined, "D inactive without rows");
+        assert.equal(h.sessionOf("s-nostore")!.metadata["snapshotRenderDegradeReason"], "transcript-empty", "degrade reason surfaced on post-arm degrade");
     }, false);
 });
 
@@ -531,8 +556,7 @@ test("D on · google: steady state — anchor rendered once, covered rows suppre
         const p3 = prefixThroughSummary(j3);
         assert.ok(p2 !== null && p3 !== null, "summary present in both turns");
         assert.equal(p3, p2, "google prefix through the summary byte-stable");
-        const s = h.sessionOf("g-steady")!;
-        assert.ok((s.metadata["snapshotRenderTurns"] as number) >= 2, "D observability latch counted turns");
+        assertDActive(h, "g-steady", 2, "google-steady-state");
     }, true);
 });
 
@@ -562,6 +586,7 @@ test("D on · google: identity-seed upgrade — prefix byte-identical, block ali
         const s = h.sessionOf("g-upg")!;
         assert.ok(s.state.blocks.some((b) => b.active), "block survived the upgrade");
         assert.equal(s.metadata["foldDriftEscalated"], undefined, "no destroy verdict");
+        assertDActive(h, "g-upg", 1, "google-seed-upgrade");
     }, true);
 });
 

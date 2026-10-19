@@ -77,6 +77,15 @@ function noteRender(session: Session, deps: SnapshotRenderDeps): void {
     if (prior === 0) deps.log?.("info", `[snapshot-render] active: outbound prefix now rendered from the unified transcript (issue #3756)`);
 }
 
+/** Post-arm degrade marker (observability only — never touches outbound bytes).
+ *  Set here, cleared on a successful render. Pre-arm exits (rollout off / nothing
+ *  armed) must NOT route through this: an unrendered lane is not a degradation. */
+function legacyFor(session: Session, deps: SnapshotRenderDeps, clientMsgs: BiliMessage[], reason: string): BiliMessage[] {
+    session.metadata["snapshotRenderDegradeReason"] = reason;
+    deps.log?.("debug", `[snapshot-render] legacy fallback (${reason})`);
+    return clientMsgs;
+}
+
 function parseRow(content: string, seq: number): BiliMessage | null {
     try {
         const parsed = JSON.parse(content) as { id?: unknown; role?: unknown };
@@ -89,35 +98,36 @@ function parseRow(content: string, seq: number): BiliMessage | null {
 
 /**
  * Returns the merged view, or `clientMsgs` unchanged when the lane is
- * inactive/degraded. Pure with respect to the transcript: the only mutation
- * is the observability latch on `session.metadata`.
+ * inactive/degraded. Pure with respect to the transcript: the only mutations
+ * are two observability fields on `session.metadata` (the render latch and the
+ * last post-arm degrade reason) — neither touches outbound bytes.
  */
 export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], deps: SnapshotRenderDeps): BiliMessage[] {
     if (!featureEnabled("snapshotRender")) return clientMsgs;
     const activeBlocks = session.state.blocks.filter((b) => b.active);
     if (activeBlocks.length === 0) return clientMsgs;
     const store = getStore();
-    if (!store) return clientMsgs;
+    if (!store) return legacyFor(session, deps, clientMsgs, "store-unavailable");
     let rows: ViewRow[] = [];
     try {
         const rawRows = store.unifiedTailViewRows(session.id);
         const seqs = store.unifiedTailSeqs(session.id);
-        if (!rawRows || rawRows.length === 0 || !seqs || seqs.length === 0) return clientMsgs;
+        if (!rawRows || rawRows.length === 0 || !seqs || seqs.length === 0) return legacyFor(session, deps, clientMsgs, "transcript-empty");
         const bySeq = new Map<number, ViewRow>();
         for (const row of rawRows) {
             const msg = parseRow(row.content, row.seq);
-            if (!msg) return clientMsgs; // untrustworthy transcript: degrade, never guess
+            if (!msg) return legacyFor(session, deps, clientMsgs, "row-unparsable"); // untrustworthy transcript: degrade, never guess
             bySeq.set(row.seq, { seq: row.seq, msg });
         }
         for (const seq of seqs) {
             const v = bySeq.get(seq);
-            if (!v) return clientMsgs; // view pointer to a missing row: degrade
+            if (!v) return legacyFor(session, deps, clientMsgs, "view-pointer-missing-row"); // view pointer to a missing row: degrade
             rows.push(v);
         }
     } catch {
-        return clientMsgs;
+        return legacyFor(session, deps, clientMsgs, "transcript-error");
     }
-    if (rows.length === 0) return clientMsgs;
+    if (rows.length === 0) return legacyFor(session, deps, clientMsgs, "transcript-empty");
 
     // Backward chain: from the client's end, match view rows (id fast path,
     // then identity signature). The chain must be contiguous; the first
@@ -168,7 +178,7 @@ export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], d
             }
             cursor = hit;
         }
-        if (!started) return clientMsgs; // nothing chains: epoch-like rewrite, legacy
+        if (!started) return legacyFor(session, deps, clientMsgs, "chain-not-started"); // nothing chains: epoch-like rewrite, legacy
     }
     const d = joinRow + 1; // prefix = rows[0..d) — everything up to the join; rows beyond (rewound-away tails) never render
 
@@ -230,6 +240,7 @@ export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], d
     while (ai < anchors.length) merged.push(anchors[ai++].msg);
     for (let k = clientJoin; k < clientMsgs.length; k++) merged.push(clientMsgs[k]);
 
+    delete session.metadata["snapshotRenderDegradeReason"];
     noteRender(session, deps);
     return merged;
 }
