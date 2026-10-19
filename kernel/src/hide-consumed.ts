@@ -276,10 +276,18 @@ export function hideConsumedCompressCalls(
     if (info.fate === "inactive") {
       hide = true;
     } else if (info.fate === "orphan") {
+      const ref = state.messageRefs.byRaw[messages[i]!.id];
       if (sweptSet.has(callId)) {
         hide = true;
+      } else if (ref && state.hiddenOrphanRefs?.includes(ref)) {
+        // Pre-#3769 states persisted the rotation's hidden set as message refs
+        // (hiddenOrphanRefs). Honor it on upgrade: resurrecting a pair the old
+        // kernel already removed would re-insert it mid-history and break the
+        // cached prefix again. The set self-perpetuates — rememberHiddenRef
+        // re-records these refs on every pass they stay hidden.
+        hide = true;
       } else if (foldMinRef !== undefined) {
-        const num = refNum(state.messageRefs.byRaw[messages[i]!.id]);
+        const num = refNum(ref);
         if (num !== null && num >= foldMinRef) {
           hide = true;
           newlySweptCallIds.push(callId);
