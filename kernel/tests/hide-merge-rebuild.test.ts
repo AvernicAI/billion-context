@@ -75,7 +75,10 @@ test("hideConsumedCompressCalls keeps active-block calls and orphans until a fol
     .filter((m) => m.toolName === "compress")
     .map((m) => m.toolCallId);
   assert.ok(remainingCallIds.includes("call-active"), "active carrier kept");
-  assert.ok(remainingCallIds.includes("call-consumed"), "orphan stays visible between folds");
+  assert.ok(
+    remainingCallIds.includes("call-consumed"),
+    "orphan stays visible between folds",
+  );
   assert.ok(remainingCallIds.includes("call-orphan1"));
   assert.ok(remainingCallIds.includes("call-orphan2"));
   assert.ok(result.messages.some((m) => m.text === "hello"));

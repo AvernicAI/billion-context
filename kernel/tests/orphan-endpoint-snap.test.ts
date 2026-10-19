@@ -83,7 +83,11 @@ test("hideConsumedCompressCalls records refs of hidden orphan calls only", () =>
 
   const result = hideConsumedCompressCalls(state, messages);
 
-  assert.equal(result.hidden, 2, "previously-swept orphan pair stays hidden (#3769)");
+  assert.equal(
+    result.hidden,
+    2,
+    "previously-swept orphan pair stays hidden (#3769)",
+  );
   assert.deepEqual(
     result.hiddenOrphanRefs,
     ["m00001", "m00002"],

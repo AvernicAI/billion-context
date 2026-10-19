@@ -240,29 +240,29 @@ export interface CompressionState {
    *  dead-ending the whole range (#396). A drifted/dangling ref (#387) is NOT in
    *  this set and keeps the clear "cannot be anchored" error. Optional for
    *  pre-feature persisted states. */
-   hiddenOrphanRefs?: string[];
-   /** Persistent, MONOTONIC set of orphan compress-call ids permanently swept
-    *  (#3769). An orphan (a failed compress call/result with no matching block)
-    *  is only removed from the visible view when a REAL fold gives a cache-safe
-    *  place to do it: the hide node sweeps orphans at/after the fold's earliest
-    *  start ref onto this set, and they stay hidden forever — across the next
-    *  turn, repeated processTurn calls, restarts and upgrades. Monotonic (never
-    *  shrinks) so a previously-hidden record can never reappear once the client
-    *  resends full history. Replaces the old keep-last-two rotation, which hid
-    *  the oldest failure on EVERY quiet turn and moved the cached prefix
-    *  breakpoint forward for no new fold. Optional: pre-feature persisted states
-    *  lack it (nothing was permanently hidden under the old per-pass rule). */
-   sweptOrphanCallIds?: string[];
-   /** Numeric part (mNNNNN -> NNNNN) of the EARLIEST start ref of the most
-    *  recent fold that has not yet been consumed by an orphan sweep (#3769).
-    *  Written by applyCompression when it creates >=1 block (min over the newly
-    *  created blocks' startRef); consumed + cleared by the hide-compress-calls
-    *  node on the next processTurn, which then sweeps orphans with ref >= this
-    *  value (orphans before it sit in the still-cached prefix and stay visible).
-    *  Carries the position so the sweep is cache-neutral: it only removes records
-    *  the fold already invalidated. Optional: absent until the first post-fix fold. */
-   pendingOrphanSweepMinRef?: number;
-   /** Padded refs (mNNNNN) proven UNREACHABLE (#2362): known in messageRefs but
+  hiddenOrphanRefs?: string[];
+  /** Persistent, MONOTONIC set of orphan compress-call ids permanently swept
+   *  (#3769). An orphan (a failed compress call/result with no matching block)
+   *  is only removed from the visible view when a REAL fold gives a cache-safe
+   *  place to do it: the hide node sweeps orphans at/after the fold's earliest
+   *  start ref onto this set, and they stay hidden forever — across the next
+   *  turn, repeated processTurn calls, restarts and upgrades. Monotonic (never
+   *  shrinks) so a previously-hidden record can never reappear once the client
+   *  resends full history. Replaces the old keep-last-two rotation, which hid
+   *  the oldest failure on EVERY quiet turn and moved the cached prefix
+   *  breakpoint forward for no new fold. Optional: pre-feature persisted states
+   *  lack it (nothing was permanently hidden under the old per-pass rule). */
+  sweptOrphanCallIds?: string[];
+  /** Numeric part (mNNNNN -> NNNNN) of the EARLIEST start ref of the most
+   *  recent fold that has not yet been consumed by an orphan sweep (#3769).
+   *  Written by applyCompression when it creates >=1 block (min over the newly
+   *  created blocks' startRef); consumed + cleared by the hide-compress-calls
+   *  node on the next processTurn, which then sweeps orphans with ref >= this
+   *  value (orphans before it sit in the still-cached prefix and stay visible).
+   *  Carries the position so the sweep is cache-neutral: it only removes records
+   *  the fold already invalidated. Optional: absent until the first post-fix fold. */
+  pendingOrphanSweepMinRef?: number;
+  /** Padded refs (mNNNNN) proven UNREACHABLE (#2362): known in messageRefs but
    *  backing no visible or folded message — the client rewrote or dropped those
    *  messages (an edit reissues a new ref; a host-native compaction or bulk
    *  history rewrite drops them outright), so no range citing them can ever
