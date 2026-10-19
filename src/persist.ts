@@ -732,6 +732,7 @@ export class SessionStore {
         // full) — NOT readsUnified, which is the full-mode-only "rows are
         // authoritative" predicate.
         if (this.replicasAvailable()) {
+            this.healAdoptedDuplicates();
             this.seedIndexedAliases(canonical);
             const hot = (filesByRoot.get(this.sessionsDir) ?? [])
                 .map((file) => {
@@ -759,6 +760,14 @@ export class SessionStore {
                 const savedAt = rec.payload.savedAt ?? 0;
                 if (rec.payload.id === rec.meta.label || rec.payload.id.startsWith("pfa-")) this.noteCanonical(rec.payload.id, canonical);
                 else if (rec.meta.label) this.upsertLegacyAlias(rec.meta.label, { file: cand.file, id: rec.payload.id, savedAt }, canonical);
+                // #3831-b: a historical twin of a canonical session (its
+                // pre-adoption filename under the same label) must not warm
+                // under its dead id — warming would cold-load and re-import
+                // the row the adopted label already owns. The alias line above
+                // already refuses to register it against the canonical name;
+                // skipping the window keeps it out of the session map.
+                if (rec.meta.label !== undefined && rec.payload.id !== rec.meta.label
+                    && !rec.payload.id.startsWith("pfa-") && canonical.has(rec.meta.label)) continue;
                 const bytes = parsed.bytes;
                 if (bytes > limits.maxBytes) continue;
                 windowBytes += bytes;
@@ -862,6 +871,44 @@ export class SessionStore {
         if (previous && entry.savedAt < previous.savedAt) return false;
         this.legacyAliases.set(label, entry);
         return true;
+    }
+
+    /** #3831-b: heal adoption duplicates minted before convergence landed —
+     *  a row keyed by a pre-adoption id X alongside the adopted label row L
+     *  is otherwise permanent: the X-row hit blocks re-import, nothing else
+     *  deletes it, and listings / byte accounting / eviction carry the
+     *  session twice. A row whose LABEL owns no row is legitimate
+     *  pre-adoption state (the sole row that seeds label resume) and must
+     *  survive. Freshness: drop X only when the label row is at least as
+     *  fresh — a newer twin means a racing writer we do not trust; leave it
+     *  and re-evaluate next boot. Runs before seedIndexedAliases so seeding
+     *  never sees stale rows. Full mode only: in shadow the JSON tree stays
+     *  the truth base and rows are a reconciled baseline. */
+    private healAdoptedDuplicates(): void {
+        const shadow = this.shadow;
+        if (!shadow?.readsUnified) return;
+        let rows;
+        try {
+            rows = shadow.sessionSummaries();
+        } catch {
+            return; // sidecar degraded mid-boot: the file-scan aliases still cover resume
+        }
+        const byId = new Map(rows.map((r) => [r.sessionId, r]));
+        let healed = 0;
+        for (const r of rows) {
+            if (!r.label || r.label === r.sessionId || r.sessionId.startsWith("pfa-")) continue;
+            const owner = byId.get(r.label);
+            if (!owner) continue;
+            if (owner.updatedAt < r.updatedAt) {
+                this.log("warn", `[persist] adoption duplicate ${r.sessionId}/${r.label}: pre-adoption row is newer than the label row — leaving it for the next boot (#3831)`);
+                continue;
+            }
+            shadow.remove(r.sessionId);
+            healed++;
+        }
+        if (healed > 0) {
+            this.log("info", `[persist] healed ${healed} stale pre-adoption index row(s) into their adopted label rows (#3831)`);
+        }
     }
 
     /** #3199: pre-seed label aliases from the unified index rows so label-based
@@ -1353,6 +1400,9 @@ export class SessionStore {
             if (!envelope) return null;
             const imported = this.shadow.importRecord(envelope.payload);
             if (imported) {
+                // #3831-b: the import committed the label-keyed row — converge
+                // the pre-adoption row it supersedes (no-op without an alias).
+                this.convergeAdoptedRow(id);
                 // #3818: serve the freshly PARSED view, not the index rebuild.
                 // The full file was already read to import it, so this is both
                 // cheaper and LOSSLESS: the index represents blockContents for
@@ -1406,6 +1456,34 @@ export class SessionStore {
         }
         this.logColdLoad(id, "unified store", session, record.savedAt);
         return session;
+    }
+
+    /** #3831-b: label adoption converges the unified row, it does not copy
+     *  it. When the index holds (or just gained) a row under an adopted
+     *  label L while the alias map still points L at the pre-adoption id X,
+     *  the X row describes the SAME session — kept, it is permanent ballast:
+     *  double byte accounting, double listing, split-brain eviction, and a
+     *  stale boot entry once the historical file stops aliasing. Drop X once
+     *  L is committed; the in-process alias entry goes too (transient
+     *  bookkeeping, re-derived from the file scan each boot — while the
+     *  canonical file exists the envelope probes never reach the alias
+     *  branch, and #2803 pins the FILE twin, not the alias). Never throws —
+     *  save and read paths must not fail over convergence bookkeeping. */
+    private convergeAdoptedRow(id: string): void {
+        const shadow = this.shadow;
+        const alias = this.legacyAliases.get(id);
+        if (!shadow || !alias || alias.id === id) return;
+        try {
+            // null = this id was never ingested (e.g. the save hit the
+            // orphan-contents skip) — dropping X would orphan the session's
+            // only row.
+            if (shadow.stats.disabled || shadow.sessionUpdatedAt(id) === null) return;
+            shadow.remove(alias.id);
+            this.legacyAliases.delete(id);
+            this.log("info", `[persist] label adoption converged index row ${alias.id} -> ${id} (#3831)`);
+        } catch {
+            // bookkeeping failure: the duplicate heals at the next boot sweep
+        }
     }
 
     /** Unified-first view load (full mode). Null on miss. */
@@ -1927,6 +2005,10 @@ export class SessionStore {
                 this.shadow?.record(record, tail && tail.length > 0
                     ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
                     : undefined, session.contentStore ?? undefined);
+                // #3831-b: first save that finally ingests under an adopted
+                // label (e.g. after the session loses its orphan shape) —
+                // converge the pre-adoption row it supersedes.
+                this.convergeAdoptedRow(record.id);
                 this.noteOwnCommit(session.id, record);
                 return record;
             }
@@ -1947,6 +2029,7 @@ export class SessionStore {
             // arbitration the write side just used.
             this.convergeToDisk(session, disk);
             this.shadow?.record(disk);
+            this.convergeAdoptedRow(disk.id);
             // Rewrite the disk's own payload: content-identical no-op that
             // preserves the newer state while satisfying the write chain.
             this.noteOwnCommit(session.id, disk);
