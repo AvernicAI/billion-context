@@ -600,6 +600,10 @@ export function createCore(ports: Ports = {}): CompressionCore {
       }
     }
 
+    // #3769: capture which blocks already exist so, after the loop, we can tell
+    // which were created by THIS fold and where it starts (for the orphan sweep).
+    const preFoldBlockIds = new Set(state.blocks.map((b) => b.blockId));
+
     for (const spec of input.ranges) {
       if (skipSpecs.has(spec)) continue;
       const resolution = classifications.get(spec);
@@ -670,6 +674,24 @@ export function createCore(ports: Ports = {}): CompressionCore {
     state.stats.tokensCompressed += tokensCompressed;
 
     if (blocksCreated > 0) {
+      // #3769: record where THIS fold starts (min over the newly-created
+      // blocks' startRef) so the next processTurn sweeps orphan failures at/after
+      // it cache-neutrally, leaving orphans before it in the still-cached prefix.
+      // Kept as the running min across folds that commit before a sweep consumes it.
+      let foldStartRef: number | undefined;
+      for (const b of state.blocks) {
+        if (preFoldBlockIds.has(b.blockId)) continue;
+        const n = Number((b.startRef ?? "").replace(/\D/g, ""));
+        if (Number.isFinite(n) && (foldStartRef === undefined || n < foldStartRef)) {
+          foldStartRef = n;
+        }
+      }
+      if (foldStartRef !== undefined) {
+        state.pendingOrphanSweepMinRef =
+          state.pendingOrphanSweepMinRef === undefined
+            ? foldStartRef
+            : Math.min(state.pendingOrphanSweepMinRef, foldStartRef);
+      }
       // Compress succeeded: clear the growth baseline so the next turn
       // re-establishes it at the new (lower) token count. Without this the
       // nudge re-fires in a feedback loop (the §5.7 baseline-reset bug).
@@ -996,10 +1018,26 @@ const hideCompressCallsNode: PipelineNode = {
       io.messages,
       ctx.config.isCompressTool,
     );
+    // #3769: fold the newly-swept orphans into the persistent monotonic set so
+    // they stay hidden across turns/restarts/upgrades, then consume the fold
+    // marker (one-shot) — a quiet turn leaves both untouched except clearing a
+    // stale marker.
+    const patch: Partial<CompressionState> = {
+      hiddenOrphanRefs: hidden.hiddenOrphanRefs,
+      pendingOrphanSweepMinRef: undefined,
+    };
+    if (hidden.newlySweptCallIds.length > 0) {
+      patch.sweptOrphanCallIds = [
+        ...new Set([
+          ...(io.state.sweptOrphanCallIds ?? []),
+          ...hidden.newlySweptCallIds,
+        ]),
+      ];
+    }
     return {
       ...io,
       messages: hidden.messages,
-      state: { ...io.state, hiddenOrphanRefs: hidden.hiddenOrphanRefs },
+      state: { ...io.state, ...patch },
     };
   },
 };
@@ -1794,6 +1832,10 @@ function cloneState(state: CompressionState): CompressionState {
     hiddenOrphanRefs: state.hiddenOrphanRefs
       ? [...state.hiddenOrphanRefs]
       : undefined,
+    sweptOrphanCallIds: state.sweptOrphanCallIds
+      ? [...state.sweptOrphanCallIds]
+      : undefined,
+    pendingOrphanSweepMinRef: state.pendingOrphanSweepMinRef,
     deadRefs: state.deadRefs ? [...state.deadRefs] : undefined,
     lastPassIds: state.lastPassIds ? [...state.lastPassIds] : undefined,
   };
