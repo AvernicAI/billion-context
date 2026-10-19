@@ -265,6 +265,75 @@ test("an upgraded pre-fold-gate state keeps its rotation-hidden orphan hidden (#
   assert.ok(!ids2.includes("c-f1") && !ids2.includes("r-f1"), "still hidden on the next quiet turn");
 });
 
+test("a re-sent pair quoting an active block's range is its carrier: the fold sweep leaves it visible (#3769/#1567)", () => {
+  // Plugin-style fold: the block is minted a server-side callId the client can
+  // never echo, so the client's re-sent pair for that exact fold is fate=orphan
+  // by id — yet it IS the block's summary carrier (the host strips the in-place
+  // anchor only while the pair rides the history). Sweeping it would strand the
+  // fold with zero wire carriers. Both arg shapes must be recognized, mirroring
+  // the host carrier index (flat {startId,endId} AND {content:[…]}).
+  const core = createCore();
+  const build = (callId: string, callText: string): CoreMessage[] => [
+    msg("h1", "first detailed work item alpha content"),
+    msg("h2", "second detailed work item beta content"),
+    msg("h3", "third detailed work item gamma content"),
+    {
+      id: `c-${callId}`,
+      role: "assistant",
+      contentType: "tool-call",
+      toolName: "compress",
+      toolCallId: callId,
+      text: callText,
+    },
+    {
+      id: `r-${callId}`,
+      role: "tool",
+      contentType: "tool-result",
+      toolCallId: callId,
+      text: "compressed the head",
+    },
+    msg("last", "latest user intent theta"),
+  ];
+  const fold = (messages: CoreMessage[], state: CompressionState) =>
+    core.applyCompression({
+      ranges: [
+        { startRef: "m00001", endRef: "m00003", summary: "fold the spent head", topic: "head", compressCallId: "plugin_1234" },
+      ],
+      messages,
+      state,
+      config: config(),
+    });
+
+  const carriers: Array<[string, string]> = [
+    ["flat {startId,endId}", JSON.stringify({ startId: "m00001", endId: "m00003", topic: "head", summary: "fold the spent head" })],
+    ["{content:[…]} array", JSON.stringify({ content: [{ startId: "m00001", endId: "m00003", topic: "head", summary: "fold the spent head" }] })],
+  ];
+  for (const [label, callText] of carriers) {
+    const messages = build("call_echo_1", callText);
+    const state = createInitialState();
+    state.messageRefs = assignRefs(messages, { existing: state.messageRefs, nextIndex: 1 }).map;
+    const out = fold(messages, state);
+    assert.equal(out.result.errors.length, 0, `${label}: unexpected errors: ${out.result.errors.join("; ")}`);
+    assert.ok(out.result.blocksCreated >= 1, `${label}: the head genuinely folds`);
+
+    const r = hideConsumedCompressCalls(out.state, messages, isMcp);
+    assert.deepEqual(r.newlySweptCallIds, [], `${label}: carrier pair exempt from the fold sweep`);
+    assert.ok(r.messages.some((m) => m.toolCallId === "call_echo_1"), `${label}: carrier pair stays visible (#1567)`);
+  }
+
+  // Negative control: a failure whose quoted range matches NO block is still swept.
+  const messages = build(
+    "call_fail_9",
+    JSON.stringify({ content: [{ startId: "mX", endId: "mY", summary: "s" }] }),
+  );
+  const state = createInitialState();
+  state.messageRefs = assignRefs(messages, { existing: state.messageRefs, nextIndex: 1 }).map;
+  const out = fold(messages, state);
+  assert.equal(out.result.errors.length, 0, `negative: unexpected errors: ${out.result.errors.join("; ")}`);
+  const r = hideConsumedCompressCalls(out.state, messages, isMcp);
+  assert.deepEqual(r.newlySweptCallIds, ["call_fail_9"], "true failure residue at/after the fold is swept");
+});
+
 test("the fold marker survives the full pipeline: sync-blocks carries it to the hide node (#3769)", () => {
   const core = createCore();
   const messages: CoreMessage[] = [

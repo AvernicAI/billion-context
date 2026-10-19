@@ -32,6 +32,61 @@ function rangeKey(startRef: string, endRef: string): string {
   return `${startRef}::${endRef}`;
 }
 
+// #3769: does this call's args quote the folded range of an ACTIVE block? Such a
+// re-sent pair IS that block's summary carrier — the host strips the in-place
+// anchor only while it rides the history (stripKernelSummaries, #1567/#2042) —
+// so the fold-gated sweep must leave it alone. Both arg shapes are accepted to
+// mirror the host index ({content:[…]} AND the flat {startId,endId} models emit
+// natively); parseCallText alone misses the flat form. Unparseable args fail
+// safe as NOT a carrier (under-sweep is safe, over-sweep is not).
+function quotesActiveBlock(
+  text: string | undefined,
+  activeRangeKeys: Set<string>,
+): boolean {
+  const raw = text ?? "";
+  const start = raw.indexOf("{");
+  if (start < 0) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.slice(start));
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object") return false;
+  const obj = parsed as Record<string, unknown>;
+  let entries: unknown[];
+  if (Array.isArray(obj.content)) {
+    entries = obj.content;
+  } else if (typeof obj.content === "string") {
+    try {
+      const inner: unknown = JSON.parse(obj.content);
+      entries = Array.isArray(inner) ? inner : [];
+    } catch {
+      return false;
+    }
+  } else {
+    entries = [obj];
+  }
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") continue;
+    const e = entry as Record<string, unknown>;
+    const s =
+      typeof e.startId === "string"
+        ? e.startId
+        : typeof e.messageId === "string"
+          ? e.messageId
+          : "";
+    const end =
+      typeof e.endId === "string"
+        ? e.endId
+        : typeof e.messageId === "string"
+          ? e.messageId
+          : "";
+    if (s && end && activeRangeKeys.has(rangeKey(s, end))) return true;
+  }
+  return false;
+}
+
 // Numeric position of a padded ref (mNNNNN -> NNNNN); null when unmapped/blocked
 // so the caller treats it as "position unknown" and never sweeps on a guess.
 // Exported: applyCompression derives the fold sweep marker from covered message
@@ -262,6 +317,8 @@ export function hideConsumedCompressCalls(
   // this fold's earliest start ref so we additionally sweep orphans at/after it.
   // Orphans before it sit in the still-cached prefix and stay visible; with no
   // fold pending nothing new is swept, so a quiet turn never breaks the prefix.
+  // Orphans quoting an ACTIVE block's folded range are that block's summary
+  // carrier (#1567) and are exempt from the sweep (quotesActiveBlock).
   const sweptSet = new Set(state.sweptOrphanCallIds ?? []);
   const foldMinRef = state.pendingOrphanSweepMinRef;
   const newlySweptCallIds: string[] = [];
@@ -286,7 +343,7 @@ export function hideConsumedCompressCalls(
         // cached prefix again. The set self-perpetuates — rememberHiddenRef
         // re-records these refs on every pass they stay hidden.
         hide = true;
-      } else if (foldMinRef !== undefined) {
+      } else if (foldMinRef !== undefined && !quotesActiveBlock(messages[i]!.text, activeRangeKeys)) {
         const num = refNum(ref);
         if (num !== null && num >= foldMinRef) {
           hide = true;
