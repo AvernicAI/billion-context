@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { hashId } from "./util.js";
 
 /**
@@ -41,6 +42,40 @@ import { hashId } from "./util.js";
  *  historical text so image ids on the busiest lane (anthropic) do not
  *  re-mint on upgrade. */
 export const CANONICAL_IMAGE_TEXT = "[image]";
+
+/** #3751: base id for an image core, seeded by a PAYLOAD FINGERPRINT instead
+ *  of the shared "[image]" placeholder.
+ *
+ *  With the constant seed every image in the repo shared one base id and the
+ *  only discriminator was the ClusterCounter suffix — the Nth occurrence in
+ *  THIS conversion pass. Fold/rewind any earlier image and every surviving
+ *  image's suffix shifted (identity became a function of set membership),
+ *  re-minting ids per fold: one prefix-cache break per fold on the wire and
+ *  one fresh wrapper blob + rc=0 orphan per image in the CAS (#3748).
+ *
+ *  Seeding by the exact content hash (sha256 of the base64 payload bytes,
+ *  plus the declared media type) restores the content-derived discipline of
+ *  MESSAGE-IDENTITY.md: same pixels → same base id across membership
+ *  changes; different pixels → naturally different bases. Residual churn is
+ *  confined to true duplicates of the SAME image inside one pass (the
+ *  cluster suffix still orders them).
+ *
+ *  No parseable payload (raw-only sidecars: file/url sources, opaque relay
+ *  parts) falls back to the legacy constant seed so those ids never move. */
+export function deriveImageMessageId(
+  role: string,
+  mediaType: string | undefined,
+  base64: string | undefined,
+): string {
+  if (!base64) {
+    return deriveCanonicalMessageId(role, "text", CANONICAL_IMAGE_TEXT);
+  }
+  const fingerprint = createHash("sha256")
+    .update(`${mediaType ?? ""}:`, "utf8")
+    .update(base64, "utf8")
+    .digest("hex");
+  return "h_" + hashId(`${role}|text|||${CANONICAL_IMAGE_TEXT}#${fingerprint}`);
+}
 
 /** Canonical placeholder for an opaque redacted-thinking payload
  *  (anthropic-only shape; kept for symmetry with the legacy codec text). */

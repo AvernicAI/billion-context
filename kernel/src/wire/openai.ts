@@ -3,6 +3,7 @@ import {
   CANONICAL_IMAGE_TEXT,
   canonicalToolArgs,
   deriveCanonicalMessageId,
+  deriveImageMessageId,
 } from "./identity.js";
 import { hashId } from "./util.js";
 import { ClusterCounter } from "./message-id.js";
@@ -145,10 +146,11 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
               (part as { image_url?: { url?: unknown } }).image_url?.url;
             const parsed =
               typeof url === "string" ? parseDataUrl(url) : undefined;
-            const base = deriveCanonicalMessageId(
+            // #3751: seed by payload fingerprint, not the shared placeholder.
+            const base = deriveImageMessageId(
               "user",
-              "text",
-              CANONICAL_IMAGE_TEXT,
+              parsed?.mediaType,
+              parsed?.base64,
             );
             msgs.push({
               id: clusters.next(base),

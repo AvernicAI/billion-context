@@ -4,6 +4,7 @@ import {
   CANONICAL_IMAGE_TEXT,
   canonicalToolArgs,
   deriveCanonicalMessageId,
+  deriveImageMessageId,
 } from "./identity.js";
 import type { BiliMessage } from "./bili-message.js";
 
@@ -212,10 +213,11 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
         typeof inline.mimeType === "string" &&
         typeof inline.data === "string"
       ) {
-        const base = deriveCanonicalMessageId(
+        // #3751: seed by payload fingerprint, not the shared placeholder.
+        const base = deriveImageMessageId(
           isModel ? "assistant" : "user",
-          "text",
-          CANONICAL_IMAGE_TEXT,
+          inline.mimeType,
+          inline.data,
         );
         msgs.push({
           id: clusters.next(base),

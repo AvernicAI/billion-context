@@ -4,6 +4,7 @@ import {
   CANONICAL_REDACTED_THINKING_TEXT,
   canonicalToolArgs,
   deriveCanonicalMessageId,
+  deriveImageMessageId,
 } from "./identity.js";
 import { hashId } from "./util.js";
 import { ClusterCounter } from "./message-id.js";
@@ -192,11 +193,6 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
           break;
         }
         case "image": {
-          const base = deriveCanonicalMessageId(
-            m.role,
-            "text",
-            CANONICAL_IMAGE_TEXT,
-          );
           // #3642: parse the base64 source into the shared media sidecars so
           // every dialect presents the same image core (marker text +
           // imageMediaType/imageBase64); the raw block keeps verbatim
@@ -216,6 +212,13 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
                   imageBase64: source.data,
                 }
               : {};
+          // #3751: seed by payload fingerprint (needs the sidecar above),
+          // not the shared placeholder — ids survive membership changes.
+          const base = deriveImageMessageId(
+            m.role,
+            mediaSidecar.imageMediaType,
+            mediaSidecar.imageBase64,
+          );
           msgs.push({
             id: clusters.next(base),
             role: m.role,

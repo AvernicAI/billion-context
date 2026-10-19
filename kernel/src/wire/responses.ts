@@ -6,6 +6,7 @@ import {
   canonicalOpaqueSeed,
   canonicalToolArgs,
   deriveCanonicalMessageId,
+  deriveImageMessageId,
 } from "./identity.js";
 import type { ConversationIdentity } from "./util.js";
 import { hashId } from "./util.js";
@@ -309,12 +310,13 @@ export function responsesToCore(
                 part.type === "input_image" &&
                 typeof part.image_url === "string"
               ) {
-                const base = deriveCanonicalMessageId(
-                  "user",
-                  "text",
-                  CANONICAL_IMAGE_TEXT,
-                );
                 const image = parseDataUrl(part.image_url);
+                // #3751: seed by payload fingerprint, not the shared placeholder.
+                const base = deriveImageMessageId(
+                  "user",
+                  image?.mediaType,
+                  image?.base64,
+                );
                 msgs.push({
                   id: clusters.next(base),
                   role: "user",
@@ -374,9 +376,6 @@ export function responsesToCore(
               role === "user"
                 ? userDisplayText(message.content, effText)
                 : effText;
-            coreId = clusters.next(
-              deriveCanonicalMessageId(role, "text", displayText),
-            );
             const imageUrl = Array.isArray(message.content)
               ? message.content.find(
                   (part) =>
@@ -386,6 +385,15 @@ export function responsesToCore(
               : undefined;
             const image =
               typeof imageUrl === "string" ? parseDataUrl(imageUrl) : undefined;
+            // #3751: image cores (displayText collapsed to the marker) seed
+            // by payload fingerprint — same as the splittable path above, so
+            // the single-part and multi-part shapes of the same image mint
+            // the same id. Text-bearing cores keep the text seed.
+            coreId = clusters.next(
+              image && displayText === CANONICAL_IMAGE_TEXT
+                ? deriveImageMessageId(role, image.mediaType, image.base64)
+                : deriveCanonicalMessageId(role, "text", displayText),
+            );
             msgs.push({
               id: coreId,
               role,
