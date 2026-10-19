@@ -136,3 +136,34 @@ test("#3751: fingerprint is protocol-invariant — same pixels, same id across a
   const ids = [pick(anthropic), pick(openai), pick(responses), pick(google)];
   assert.equal(new Set(ids).size, 1, `all four dialects mint the same id: ${ids.join(" ")}`);
 });
+
+test("#3751: responses single-part and multi-part shapes of one image mint the same id", () => {
+  const dataUrl = `data:image/png;base64,${IMG.a}`;
+  // Multi-part shape → per-part splittable path.
+  const multi = responsesToCore({
+    model: "gpt-x",
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_text", text: "q" },
+          { type: "input_image", image_url: dataUrl },
+        ],
+      },
+    ],
+  }).msgs;
+  // Single-part shape → collapsed path (content.length > 1 is false).
+  const single = responsesToCore({
+    model: "gpt-x",
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_image", image_url: dataUrl }],
+      },
+    ],
+  }).msgs;
+  const pick = (msgs: { text?: string }[]) => msgs.find((m) => m.text === CANONICAL_IMAGE_TEXT)!.id;
+  assert.equal(pick(single), pick(multi), "collapsed and splittable paths mint the same id for one image");
+});
