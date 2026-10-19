@@ -495,7 +495,10 @@ test(
                     child.once("exit", (code) => resolve(code));
                     setTimeout(() => resolve(undefined), 120_000).unref();
                 });
-                assert.equal(exitCode, 1, "the duplicate must fail fast with exit code 1");
+                // #3654: a twin-collision loser exits TWIN_ADOPT_EXIT_CODE (3, the spawner's adopt signal);
+                // a loser that loses at the post-bind claim exits 1. Both = lost loudly without hopping —
+                // the hop/port asserts below carry the real invariant.
+                assert.ok(exitCode === 1 || exitCode === 3, `the duplicate must fail fast (exit 1 or the #3654 adopt signal 3), got ${String(exitCode)}`);
                 assert.equal(await portOpen(ZONE_PORT_BASE + 1), false, "nothing may have hopped onto the next port — the hopper IS the orphan shape");
                 assert.equal(await portOpen(ZONE_PORT_BASE), true, "the serving twin keeps its port");
                 assert.ok(daemon1 !== undefined && isPidAlive(daemon1), "the serving twin must still be alive");

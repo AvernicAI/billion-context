@@ -1334,13 +1334,27 @@ async function handleRequest(
                         publicForkPrefix = true;
                         return true;
                     }
-                    // #3741: the 409 used to be a total blind spot — classify the
-                    // mismatch server-side and echo the detail back so the client
-                    // log alone points at the cause (id drift vs flag drift vs shape).
-                    loggerLog("warn", `[fork-prefix] ${sessionId}: first child request rejected — ${verdict.reason} (protocol=${protocol})`);
-                    res.writeHead(409, { "content-type": "application/json" });
-                    res.end(JSON.stringify({ ok: false, code: "FORK_PREFIX_CONFLICT", error: "first child request does not match its inherited ordered prefix", detail: verdict.reason }));
-                    return false;
+                    // #3741 resolution (owner decision): the ordered-prefix gate is
+                    // now ADVISORY, not blocking. The session-id binding above is
+                    // what actually wakes the fork child (client conversation id →
+                    // registered child session), and fold reconcile — #3641's
+                    // order-over-hash doctrine — repairs coverage drift on resent
+                    // history, so a byte-exact pre-gate adds no correctness the
+                    // pipeline below doesn't already enforce. What it DID add was a
+                    // permanent 409 dead-end: any drift the gate couldn't tolerate
+                    // (in-place proxy upgrade re-keying message ids — #3741's field
+                    // report, host body rewrite, legacy-hash adoption) stuck the
+                    // child conversation forever, because the rejected first request
+                    // never increments stats.requests, so every retry re-hit the same
+                    // gate with no clear or TTL path. Adopt with a classified warn
+                    // (reason taxonomy from the #3743 diagnostics) and let reconcile
+                    // settle the inherited folds; a divergent child's first request
+                    // goes out unfolded — a one-time token spike, never corruption.
+                    // publicForkPrefix stays false on mismatch: the side-lane
+                    // heuristics below keep their normal say instead of trusting an
+                    // unverified inherited prefix to veto demotion.
+                    loggerLog("warn", `[fork-prefix] ${sessionId}: inherited prefix mismatch — adopting anyway (${verdict.reason}; protocol=${protocol})`);
+                    return true;
                 });
                 if (!accepted) return;
             } finally {
@@ -1907,9 +1921,9 @@ async function handleRequest(
         const dshTitleSidecar = pluginAgentHeader(req.headers) === "dsh" && requestAgent !== "main" && isDshTitleRequest(parsed);
         const sideIntent = isSideRequest(parsed, requestAgent) || dshTitleSidecar;
         // #388/#2157 follow-up: side requests must not touch kernel state under
-        // a public-fork receipt either. The receipt's first-request 409
-        // discipline above has already accepted this request (inherited prefix
-        // matched, or the child has live traffic), and a side request reads
+        // a public-fork receipt either. The receipt's first-request check above
+        // has already accepted this request (inherited prefix matched, or live
+        // traffic, or an advisory adoption per #3741), and a side request reads
         // none of the kernel state fork adoption maintains — so the historical
         // !publicForkPrefix veto here only had the effect of running
         // full-history-replaying side calls (dsh title-gen under a forked

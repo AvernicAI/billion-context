@@ -68,6 +68,7 @@ type Harness = {
     bodies: string[];
     openaiUrl: string;
     anthropicUrl: string;
+    store: { unifiedTailSeqs(sessionId: string): number[] | null } | null;
     sessionOf: (label: string) => { meta: { label: string }; state: { blocks: { id: string; active: boolean }[] }; metadata: Record<string, unknown> } | undefined;
 };
 
@@ -134,6 +135,7 @@ async function withHarness(fn: (h: Harness) => Promise<void>, storeEnabled: bool
         bodies,
         openaiUrl: `http://127.0.0.1:${port}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
         anthropicUrl: `http://127.0.0.1:${port}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`,
+        store: storeEnabled ? store : null,
         sessionOf: (label) => listSessions().find((x) => x.meta.label === label) as never,
     };
     try {
@@ -161,13 +163,40 @@ async function turn(h: Harness, url: string, label: string, messages: unknown[],
         body: JSON.stringify({ model: "gpt-test", messages, stream: true }),
     });
     const body = await r.text();
-    await new Promise((res) => setTimeout(res, 60)); // let debounced=0 writes land
+    await settleRows(h, label); // debounced=0 write + ingest must LAND before the next turn's D view build
     void history; // (history appended below after body parse)
     // realistic client: fold the assistant's visible reply into the transcript
     if (history) {
         for (const m of extractAssistantText(body)) history.push(m);
     }
     return { status: r.status ?? 0, body, idx: h.bodies.length - 1 };
+}
+
+/** Wait until the unified store's row count for the session GROWS past the
+ *  count observed after the previous turn (first turn: ≥1) — the D engine
+ *  reads rows DURING the next turn's prepare, and on a loaded CI runner the
+ *  save→ingest roundtrip can outlive a fixed 60ms nap (the exact flake
+ *  #3767's first full run tripped: surface asserts passed on the legacy
+ *  path, only the D latch exposed that rows weren't there yet). */
+const rowsSeen = new Map<string, number>();
+async function settleRows(h: Harness, label: string): Promise<void> {
+    if (!h.store) {
+        await new Promise((res) => setTimeout(res, 60)); // D off: legacy path, no rows needed
+        return;
+    }
+    const prev = rowsSeen.get(label) ?? 0;
+    for (let i = 0; i < 200; i++) {
+        const n = h.store.unifiedTailSeqs(label)?.length ?? 0;
+        // The tail view is the CURRENT observation selector — a rewind turn
+        // legitimately NET-SHRINKS it (dropped pointers), so wait for any
+        // CHANGE, not growth.
+        if (n !== prev && n > 0) {
+            rowsSeen.set(label, n);
+            return;
+        }
+        await new Promise((res) => setTimeout(res, 25));
+    }
+    throw new Error(`settleRows: store tail view never changed for ${label} (still ${prev})`);
 }
 
 /** One assistant transcript entry per response: all plain-text content deltas

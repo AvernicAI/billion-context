@@ -12,7 +12,8 @@ import { applyAbsorb, buildStoredPlaceholder, createContentStore, defaultConfig,
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { _resetPluginStateForTest, forkParentRevisionLegacy, rememberPluginMessages, resolveConversation } from "../src/plugin.ts";
+import { setLogCapture } from "../src/logger.ts";
+import { _resetPluginStateForTest, forkParentRevisionLegacy, publicForkInputCheck, rememberPluginMessages, resolveConversation } from "../src/plugin.ts";
 import { _resetSessionsForTest, getSession, markDirty } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { recordToolWitness, resetToolRingForTest } from "../src/tool-ring.ts";
@@ -527,71 +528,91 @@ test("HTTP exact fork materializes its inherited summary with equivalent SDK tex
     } finally { await h.close(); }
 });
 
-test("HTTP first fork request rejects a mismatched inherited prefix without forwarding or mutating state", { timeout: 60_000 }, async () => {
+test("HTTP first fork request adopts a mismatched inherited prefix with a classified warn (#3741 advisory gate)", { timeout: 60_000 }, async () => {
     const h = await harness();
+    const warns: string[] = [];
+    setLogCapture((level, msg) => { if (level === "warn") warns.push(msg); });
     try {
         await compress(h);
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
         assert.equal((await h.request("/__bili/plugin/fork", forkRequest(snapshot))).status, 201);
         const child = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
         const requests = h.forwarded.length;
-        // #3741: every rejection class must carry a classified detail, not just a code.
-        for (const { messages, details } of [
-            { messages: [{ ...h.messages[0], content: "changed semantic content" }, h.messages[1], { role: "user", content: "continue child" }], details: [/cell-mismatch@0/, /id-drift/] },
-            { messages: [h.messages[1], h.messages[0], { role: "user", content: "reordered prefix" }], details: [/cell-mismatch@0/, /id-drift/] },
-            { messages: h.messages.slice(0, 1), details: [/prefix-longer-than-incoming \(expected=2 incoming=1\)/] },
+        // Three drift shapes that used to 409: semantic change under the prefix,
+        // reordering, and a too-short replay. All must now be ADOPTED: the
+        // session-id binding woke the fork child and fold reconcile settles the
+        // inherited folds — a divergent child's first request simply goes out
+        // unfolded (token spike, never corruption) instead of sticking the
+        // conversation with a permanent 409 dead-end.
+        for (const messages of [
+            [{ ...h.messages[0], content: "changed semantic content" }, h.messages[1], { role: "user", content: "continue child" }],
+            [h.messages[1], h.messages[0], { role: "user", content: "reordered prefix" }],
+            h.messages.slice(0, 1),
         ]) {
             const response = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "ekko-agent", "x-bili-plugin-conversation": "child" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages }) });
             const body = await response.text();
-            assert.equal(response.status, 409, body);
-            const parsed = JSON.parse(body);
-            assert.equal(parsed.code, "FORK_PREFIX_CONFLICT");
-            for (const pattern of details) assert.match(String(parsed.detail), pattern, body);
-            assert.equal(h.forwarded.length, requests);
-            assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=child")).body.parentRevision, child.parentRevision);
+            assert.equal(response.status, 200, body);
+            assert.ok(h.forwarded.length > requests, "mismatched first request must be forwarded (adopted), not rejected");
+            // the child's traffic must never touch the parent session
             assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).body.parentRevision, snapshot.parentRevision);
         }
-        // #3741: same-id hash drift (an adapter-attached flag flipped under unchanged bytes)
-        // must classify separately from id drift — that distinction is what triage keys on.
-        const storedCell = resolveConversation("child").session!.pluginSnapshot?.[0];
-        assert(storedCell);
-        const savedThinkingTokens = storedCell.thinkingTokens;
-        storedCell.thinkingTokens = 7;
+        // Advisory signal: the gate is one-shot (first request only — after it,
+        // stats.requests > 0 bypasses the check entirely), so exactly one
+        // classified warn is expected, from the first adopted mismatch; the
+        // 2nd/3rd requests ride the live-traffic path with no check at all.
+        const forkWarns = warns.filter((w) => w.includes("[fork-prefix]") && w.includes("adopting anyway"));
+        assert.equal(forkWarns.length, 1, JSON.stringify(warns.filter((w) => w.includes("fork-prefix"))));
+        assert.ok(/id-drift|hash-drift-under-same-id|prefix-longer-than-incoming/.test(forkWarns[0]!), forkWarns[0]);
+        assert.notEqual((await h.request("/__bili/plugin/snapshot?conversationId=child")).body.parentRevision, child.parentRevision);
+        // The child keeps working afterwards — no dead-end, no manual escape.
+        await sendModel(h, "child", [...h.messages.slice(0, 2), { role: "user", content: "valid follow-up" }]);
+        assert(JSON.stringify(h.forwarded.at(-1)).includes("changed semantic content") || JSON.stringify(h.forwarded.at(-1)).includes(summary));
+    } finally {
+        setLogCapture(null);
+        await h.close();
+    }
+});
+
+test("publicForkInputCheck keeps the #3743 taxonomy pinned per class (hash-drift vs ref-broken)", { timeout: 60_000 }, async () => {
+    // The advisory adoption above only pins id-drift/prefix-longer-than-incoming through the warn;
+    // these two branches lost their HTTP sub-cases when the 409 assertions were inverted, so pin
+    // them directly — including #3743's fix that a pruned ref (id+hash intact) reports ref-broken
+    // ALONE and must not be mislabeled hash-drift.
+    const h = await harness();
+    try {
+        await compress(h);
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        assert.equal((await h.request("/__bili/plugin/fork", forkRequest(snapshot))).status, 201);
+        const child = resolveConversation("child").session!;
+        const cell = child.pluginSnapshot![0];
+        const body = { model: "claude-test", max_tokens: 1024, stream: false, messages: [...h.messages.slice(0, 2), { role: "user", content: "continue child" }] };
+        assert.deepEqual(publicForkInputCheck(child, "anthropic", body), { ok: true }, "intact snapshot verifies clean before any mutation");
+        const savedThinkingTokens = cell.thinkingTokens;
+        cell.thinkingTokens = 7;
         try {
-            const response = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "ekko-agent", "x-bili-plugin-conversation": "child" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages: [...h.messages.slice(0, 2), { role: "user", content: "flag drift" }] }) });
-            const body = await response.text();
-            assert.equal(response.status, 409, body);
-            const parsed = JSON.parse(body);
-            assert.equal(parsed.code, "FORK_PREFIX_CONFLICT");
-            assert.match(String(parsed.detail), /cell-mismatch@0/, body);
-            assert.match(String(parsed.detail), /hash-drift-under-same-id/, body);
-            assert.ok(!String(parsed.detail).includes("id-drift"), body);
+            const verdict = publicForkInputCheck(child, "anthropic", body);
+            assert.equal(verdict.ok, false);
+            if (!verdict.ok) {
+                assert.match(verdict.reason, /cell-mismatch@0 hash-drift-under-same-id/);
+                assert.doesNotMatch(verdict.reason, /id-drift|ref-broken/);
+            }
         } finally {
-            storedCell.thinkingTokens = savedThinkingTokens;
+            cell.thinkingTokens = savedThinkingTokens;
         }
-        // #3741: a broken ref mapping with id+hash intact must classify as ref-broken
-        // ALONE — inventing a hash-drift label for two equal hashes would send triage
-        // after a phantom adapter-flag flip (pruned mappings are the real cause).
-        const childSession = resolveConversation("child").session!;
-        const brokenCell = childSession.pluginSnapshot?.[0];
-        assert(brokenCell);
-        const savedRef = childSession.state.messageRefs.byRaw[brokenCell.id];
-        delete childSession.state.messageRefs.byRaw[brokenCell.id];
+        const savedRef = child.state.messageRefs.byRaw[cell.id];
+        assert.notEqual(savedRef, undefined);
+        delete child.state.messageRefs.byRaw[cell.id];
         try {
-            const response = await fetch(`${h.origin}/bili/${h.upstreamUrl}/v1/messages`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "ekko-agent", "x-bili-plugin-conversation": "child" }, body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: false, messages: [...h.messages.slice(0, 2), { role: "user", content: "ref drift" }] }) });
-            const body = await response.text();
-            assert.equal(response.status, 409, body);
-            const parsed = JSON.parse(body);
-            assert.equal(parsed.code, "FORK_PREFIX_CONFLICT");
-            assert.match(String(parsed.detail), /cell-mismatch@0/, body);
-            assert.match(String(parsed.detail), /ref-broken/, body);
-            assert.ok(!String(parsed.detail).includes("hash-drift-under-same-id"), body);
-            assert.ok(!String(parsed.detail).includes("id-drift"), body);
+            const verdict = publicForkInputCheck(child, "anthropic", body);
+            assert.equal(verdict.ok, false);
+            if (!verdict.ok) {
+                assert.match(verdict.reason, /cell-mismatch@0 ref-broken \(rawId=[^ ]+ ref=MISSING\)/);
+                assert.doesNotMatch(verdict.reason, /id-drift|hash-drift-under-same-id/);
+            }
         } finally {
-            if (savedRef !== undefined) childSession.state.messageRefs.byRaw[brokenCell.id] = savedRef;
+            child.state.messageRefs.byRaw[cell.id] = savedRef;
         }
-        await sendModel(h, "child", [...h.messages.slice(0, 2), { role: "user", content: "valid retry" }]);
-        assert(JSON.stringify(h.forwarded.at(-1)).includes(summary));
+        assert.deepEqual(publicForkInputCheck(child, "anthropic", body), { ok: true }, "restored state verifies clean again");
     } finally { await h.close(); }
 });
 

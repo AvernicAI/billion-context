@@ -21,6 +21,7 @@ other, #2838). If neither is importable the discovery fails open to an empty whi
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -53,6 +54,17 @@ SPAWN_WAIT_S = 10.0
 SPAWN_POLL_S = 0.1
 STARTING_MARKER_TTL_S = 90.0
 MAX_TRACKED_SESSIONS = 256
+# Host-resolution memo (#3261 follow-up): (model, base_url) -> (window|None, monotonic_ts).
+# The window lookup runs on the request path, so a repeat must be free; a positive answer is
+# trusted for an hour, a miss expires in 30s (an offline endpoint is usually transient).
+_HOST_HIT_TTL_S = 3600.0
+_HOST_MISS_TTL_S = 30.0
+# Mirror the host's _maybe_cache_local_context_length floor: sub-minimum windows are returned but
+# never blessed into the shared cache file, where they would poison every other consumer.
+_MIN_PERSIST_CONTEXT = 64_000
+_host_resolve_cache: Dict[Tuple[str, str], Tuple[Optional[int], float]] = {}
+_host_resolve_inflight: set = set()
+_host_resolve_lock = threading.Lock()
 _PROXY_ENV_KEYS = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
 
 # mode values: "attach" | "spawn"; child: Popen of the spawned proxy;
@@ -670,34 +682,207 @@ def _request_base_url(request: Dict[str, Any], context: Dict[str, Any]) -> Optio
     return _provider_base_url(context.get("provider"))
 
 
+def _host_import(module: str) -> Any:
+    """Import one hermes module from the plugin process (the plugin is loaded *inside* the agent,
+    so `agent.*` is importable). Cached; None when the module is unavailable (standalone tests,
+    a stripped install) — every caller treats that as "ask the host failed, fail open"."""
+    try:
+        import importlib  # noqa: PLC0415
+        return importlib.import_module(module)
+    except Exception:
+        return None
+
+
+def _positive_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    n = int(value)
+    return n if n > 0 else None
+
+
+def _host_provider_slugs(base: str) -> List[str]:
+    """Registry provider slugs suggested by a base URL host: `apihub.agnes-ai.com` suggests
+    `agnes`. Labels are compared with their `-ai` suffix stripped and must be at least 3 chars,
+    so a short vendor key cannot accidentally claim an unrelated host."""
+    origin = _base_url_origin(base)
+    _, _, rest = origin.partition("://")
+    host = rest.split("/", 1)[0].split("@")[-1].split(":")[0]
+    labels = [lbl for lbl in host.replace("-", ".").split(".") if len(lbl) >= 3]
+    return labels
+
+
+def _catalog_context(md: Any, name: str, base: str = "") -> Optional[int]:
+    """Unscoped models.dev lookup: a custom provider (an OpenAI-compatible reseller) has no
+    PROVIDER_TO_MODELS_DEV mapping, so the host's provider-scoped catalog step cannot see it — yet
+    models.dev lists the very same model under the vendor's own slug. Read the host's on-disk
+    registry (allow_network=False, never the network) for an exact (case-insensitive) model id.
+    When the endpoint's host names exactly one catalogued vendor, that vendor's number wins;
+    otherwise every match must agree on ONE number, and an ambiguous model id yields nothing
+    rather than a guess (aggregators list resold models with their own caps)."""
+    registry = None
+    with contextlib.suppress(Exception):
+        registry = md.fetch_models_dev(allow_network=False)
+    if not isinstance(registry, dict):
+        return None
+    target = name.strip().lower()
+
+    def contexts(entry: Any) -> List[int]:
+        models = entry.get("models") if isinstance(entry, dict) else None
+        if not isinstance(models, dict):
+            return []
+        out: List[int] = []
+        for mid, model in models.items():
+            if str(mid).strip().lower() != target:
+                continue
+            limit = model.get("limit") if isinstance(model, dict) else None
+            ctx = _positive_int(limit.get("context")) if isinstance(limit, dict) else None
+            if ctx is not None:
+                out.append(ctx)
+        return out
+
+    labels = set(_host_provider_slugs(base))
+    keyed = [pid for pid, entry in registry.items()
+             if isinstance(entry, dict) and str(pid).strip().lower() in labels]
+    if len(keyed) == 1:
+        got = contexts(registry[keyed[0]])
+        if got and len(set(got)) == 1:
+            return got[0]
+    values: List[int] = []
+    for entry in registry.values():
+        values.extend(contexts(entry))
+    return values[0] if values and len(set(values)) == 1 else None
+
+
+def _host_resolve(name: str, base: str) -> Optional[int]:
+    """Ask the host to resolve the window itself, cache-first, mirroring the order Hermes uses:
+    config.yaml override -> persistent cache -> endpoint /models (+ llama.cpp /props) -> local
+    server probe -> models.dev catalog. The two network steps are the host's own probes, which it
+    TTL-memosizes on disk and caps at 3s; the rest never touches the network. Positive results are
+    persisted through the host's writer so the next process hits the file path directly."""
+    mm = _host_import("agent.model_metadata")
+    if mm is None:
+        return None
+    found: Any = None
+    cfg = _host_import("hermes_cli.config_providers")
+    if cfg is not None and base:
+        with contextlib.suppress(Exception):
+            found = cfg.get_custom_provider_context_length(model=name, base_url=base)
+    if found is None and base:
+        with contextlib.suppress(Exception):
+            found = mm.get_cached_context_length(name, base)
+    if found is None and base:
+        # Endpoint metadata first: it is disk-memoized. The live local probe is last (3s timeout,
+        # 30s in-process memo on the host side) so a cold model costs one bounded probe, not a stall.
+        for step in ("_resolve_endpoint_context_length", "_query_local_context_length"):
+            fn = getattr(mm, step, None)
+            if fn is None:
+                continue
+            with contextlib.suppress(Exception):
+                found = fn(name, base)
+            if _positive_int(found):
+                break
+    if found is None:
+        md = _host_import("agent.models_dev")
+        if md is not None:
+            provider = None
+            with contextlib.suppress(Exception):
+                provider = mm._infer_provider_from_url(base) if base else None
+            with contextlib.suppress(Exception):
+                found = md.lookup_models_dev_context(provider or "", name)
+            if not _positive_int(found):
+                found = _catalog_context(md, name, base)
+    ctx = _positive_int(found)
+    if ctx is None:
+        return None
+    # Persist through the host's writer (locked + atomic) so the answer is reused by every process.
+    # Sub-minimum windows stay unpersisted, matching the host's own _maybe_cache_local_context_length.
+    if base and ctx >= _MIN_PERSIST_CONTEXT:
+        with contextlib.suppress(Exception):
+            mm.save_context_length(name, base, ctx)
+    return ctx
+
+
+def host_context_length(model: Any, base_url: Any) -> Optional[int]:
+    """Memoized view of _host_resolve, safe on the request path.
+
+    The window lookup runs inside the llm_request middleware, so it must never stall a turn: a
+    known answer is served from the memo, an unknown one starts ONE background resolve and returns
+    None for this request (the proxy then uses its own chain, exactly as before this patch). The
+    resolver persists its answer through the host's writer, so from the next request on — and for
+    every later process — the file path answers instantly and the real window is pinned.
+    Positives are kept for an hour; a miss expires in 30s, because a miss is usually a transient
+    offline endpoint and must be retried, not frozen in."""
+    name = str(model or "").strip()
+    if not name:
+        return None
+    key = (name, _norm_base_url(base_url))
+    now = time.monotonic()
+    with _host_resolve_lock:
+        hit = _host_resolve_cache.get(key)
+        if hit is not None and (now - hit[1]) < (_HOST_HIT_TTL_S if hit[0] is not None else _HOST_MISS_TTL_S):
+            return hit[0]
+        if key in _host_resolve_inflight:
+            return None
+        if len(_host_resolve_cache) > MAX_TRACKED_SESSIONS:
+            _host_resolve_cache.clear()
+        _host_resolve_inflight.add(key)
+
+    def resolve() -> None:
+        result: Optional[int] = None
+        try:
+            result = _host_resolve(name, key[1])
+        except Exception:
+            result = None
+        with _host_resolve_lock:
+            _host_resolve_inflight.discard(key)
+            _host_resolve_cache[key] = (result, time.monotonic())
+        if result is not None:
+            logger.info("billion-context: resolved the context window of %s at %s to %s tokens — "
+                        "pinning it for compression (#3261)", name, key[1] or "the configured endpoint",
+                        f"{result:,}")
+
+    threading.Thread(target=resolve, name="bili-context-window", daemon=True).start()
+    return None
+
+
 def context_window_for(model: Any, base_url: Any = None) -> Optional[int]:
     """#3261: the host's own known context window for a model, read from
-    HERMES_HOME/context_length_cache.yaml (flat mapping "<model>@<base_url>" -> tokens).
-    Fail-open to None on any miss/error so the proxy falls back to its normal window chain.
-    A stage matching several DIFFERENT windows yields nothing rather than a guess: an
-    overestimate risks preflight overflow, an underestimate over-compresses — both worse
-    than the default the proxy would otherwise use."""
+    HERMES_HOME/context_length_cache.yaml, and on a miss resolved by asking the host (see
+    host_context_length). Fail-open to None on any miss/error so the proxy falls back to its normal
+    window chain. A stage matching several DIFFERENT windows yields nothing rather than a guess: an
+    overestimate risks preflight overflow, an underestimate over-compresses — both worse than the
+    default the proxy would otherwise use."""
     name = str(model or "").strip()
     if not name:
         return None
     cache_file = hermes_home() / "context_length_cache.yaml"
+    data: Any = None
     try:
         data = _yaml_loader()(cache_file.read_text(encoding="utf-8"))
     except Exception:
-        return None
+        data = None
     if not isinstance(data, dict):
-        return None
+        data = None
+    # Hermes persists a NESTED document — {"context_lengths": {"<model>@<base_url>": tokens}} — via
+    # agent/model_metadata_cache._write_context_cache. Reading the top level alone matched NOTHING,
+    # so the plugin never reported a window and the proxy silently used its own chain. Unwrap the
+    # section, keeping the flat shape readable for older/legacy files.
+    sections: List[Dict[Any, Any]] = []
+    nested = data.get("context_lengths") if isinstance(data, dict) else None
+    if isinstance(nested, dict):
+        sections.append(nested)
+    if isinstance(data, dict) and any(isinstance(v, (int, float)) for v in data.values()):
+        sections.append(data)
     pairs: List[Tuple[str, int]] = []
-    for key, value in data.items():
-        k = str(key)
-        at = k.find("@")
-        if at <= 0 or k[:at].strip() != name:
-            continue
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-            continue
-        pairs.append((_norm_base_url(k[at + 1 :]), int(value)))
-    if not pairs:
-        return None
+    for section in sections:
+        for key, value in section.items():
+            k = str(key)
+            at = k.find("@")
+            if at <= 0 or k[:at].strip() != name:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                continue
+            pairs.append((_norm_base_url(k[at + 1 :]), int(value)))
 
     def sole(values: List[int]) -> Optional[int]:
         return values[0] if len(set(values)) == 1 else None
@@ -711,7 +896,13 @@ def context_window_for(model: Any, base_url: Any = None) -> Optional[int]:
             got = sole([v for u, v in pairs if stage(u)])
             if got is not None:
                 return got
-    return sole([v for _, v in pairs])
+    exact = sole([v for _, v in pairs])
+    if exact is not None:
+        return exact
+    # Nothing authoritative in the file (unregistered model, empty cache, or a multi-value conflict):
+    # resolve through the host and persist it, so a model the user just switched to needs no manual
+    # providers.* pin. An ambiguous file stays ambiguous only when the host cannot disambiguate.
+    return host_context_length(name, base_url)
 
 
 def _spawn_child(sidecar: Dict[str, str], port: int, token: str) -> Optional[subprocess.Popen]:

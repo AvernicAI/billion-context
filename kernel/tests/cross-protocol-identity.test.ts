@@ -240,3 +240,103 @@ test("cross-protocol golden: deleting one of two sibling tool calls only renumbe
   assert.equal(bothCalls[1]!.replace(/_1$/, ""), soloCall[0]!);
   assert.notEqual(bothCalls[1], soloCall[0], "suffix renumbers when the earlier twin disappears");
 });
+
+/**
+ * #3751 — payload-addressed image ids. Pre-#3751 every image shared one
+ * base id (the "[image]" marker hash) and ClusterCounter `_N` ordinals told
+ * them apart positionally: one image changing re-minted the whole family.
+ * Now the seed carries the image's own fingerprint (bytes hash, URL
+ * fallback), so family ordinals only disambiguate true duplicates.
+ */
+
+test("#3751: one image changing re-mints only its own core, never the sibling", () => {
+  const conv = (imgB: string) =>
+    openaiToCore({
+      model: "gpt-x",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image_url", image_url: { url: `data:image/png;base64,${IMG_DATA}` } },
+            { type: "image_url", image_url: { url: `data:image/png;base64,${imgB}` } },
+          ],
+        },
+      ],
+    }).msgs;
+
+  const before = conv("c2hvcA==");
+  const after = conv("c2hvcEch");
+  assert.equal(before.length, 2);
+  assert.equal(after.length, 2);
+  assert.equal(before[0]!.imageBase64, IMG_DATA);
+  // THE invariant: the untouched sibling keeps its id byte-identical.
+  assert.equal(after[0]!.id, before[0]!.id, "sibling image id stable");
+  assert.notEqual(after[1]!.id, before[1]!.id, "changed image re-mints only itself");
+  // No ordinals in either family (distinct fingerprints ⇒ distinct bases).
+  for (const m of [...before, ...after]) assert.match(m.id, /^h_[0-9a-f]+$/);
+});
+
+test("#3751: byte-identical images share the base id and split via the _N ordinal", () => {
+  const msgs = anthropicToCore({
+    model: "claude-x",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: "image/png", data: IMG_DATA } },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: IMG_DATA } },
+        ],
+      },
+    ],
+  }).msgs;
+  assert.equal(msgs.length, 2);
+  assert.match(msgs[0]!.id, /^h_[0-9a-f]+$/, "first duplicate: bare base");
+  assert.match(msgs[1]!.id, /^h_[0-9a-f]+_1$/, "second duplicate: _1 ordinal");
+});
+
+test("#3751: URL-referenced images degrade to the URL fingerprint (stable, distinct)", () => {
+  const conv = (url: string) =>
+    openaiToCore({
+      model: "gpt-x",
+      messages: [{ role: "user", content: [{ type: "image_url", image_url: { url } }] }],
+    }).msgs;
+  const a1 = conv("https://cdn.example.com/a.png");
+  const a2 = conv("https://cdn.example.com/a.png");
+  const b = conv("https://cdn.example.com/b.png");
+  assert.equal(a1[0]!.id, a2[0]!.id, "same URL ⇒ same id across turns");
+  assert.notEqual(a1[0]!.id, b[0]!.id, "different URL ⇒ different id");
+  // And a URL image never collides with the same-name data image (no bytes
+  // on the wire — the URL is the only identity we have).
+  const data = openaiToCore({
+    model: "gpt-x",
+    messages: [
+      { role: "user", content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${IMG_DATA}` } }] },
+    ],
+  }).msgs;
+  assert.notEqual(a1[0]!.id, data[0]!.id);
+});
+
+test("#3751: responses legacy single-image shape and split shape share one id", () => {
+  const legacy = responsesToCore({
+    model: "gpt-x",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_image", image_url: `data:image/png;base64,${IMG_DATA}` }] },
+    ],
+  }).msgs;
+  const split = responsesToCore({
+    model: "gpt-x",
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_text", text: "" },
+          { type: "input_image", image_url: `data:image/png;base64,${IMG_DATA}` },
+        ],
+      },
+    ],
+  }).msgs;
+  assert.equal(legacy.length, 1);
+  assert.equal(split.length, 1, "empty text part folds away");
+  assert.equal(legacy[0]!.id, split[0]!.id, "same logical image ⇒ same id via both paths");
+});

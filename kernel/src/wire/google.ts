@@ -4,6 +4,7 @@ import {
   CANONICAL_IMAGE_TEXT,
   canonicalToolArgs,
   deriveCanonicalMessageId,
+  imageMediaFingerprint,
 } from "./identity.js";
 import type { BiliMessage } from "./bili-message.js";
 
@@ -216,6 +217,10 @@ export function googleToCore(body: GoogleRequestBody): GoogleFlat {
           isModel ? "assistant" : "user",
           "text",
           CANONICAL_IMAGE_TEXT,
+          {
+            // #3751: payload-addressed ids — inlineData hashes its base64 payload.
+            mediaFingerprint: imageMediaFingerprint(inline.data),
+          },
         );
         msgs.push({
           id: clusters.next(base),

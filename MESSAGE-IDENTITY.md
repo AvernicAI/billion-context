@@ -238,6 +238,70 @@ migration, applies to old and new sessions alike, storage-independent
 (legacy JSON, shadow and full modes behave identically; bookkeeping rides
 session metadata). The kernel ledger's content-hash contract is untouched.
 
+## The snapshot render engine: outbound identity moves server-side (#3756)
+
+#3641 classified verdicts when no channel verifies. #3756 removes the
+dependence itself for the outbound path: with the `snapshotRender` rollout
+feature on (default 0%, `BILI_ROLLOUT_SNAPSHOT_RENDER`), the prepare layer
+no longer rebuilds history FROM the client's resent bytes — it renders the
+outbound prefix FROM the server's own unified-storage transcript
+(`src/server/snapshot-render.ts`):
+
+- **Identity ladder, final form.** Conversation identity = the session
+  binding (host-native session id whenever one exists — §"Prefer native
+  stable identifiers"). Message identity inside a live conversation = the
+  server snapshot row (`seq`), never re-minted. Content hashes/signatures
+  demote to **chain-fallback evidence only** — they locate the divergence
+  point where the client's verbatim tail hands over to the server prefix
+  (id fast path, `role|contentType|toolName|text` + image-length signature
+  fallback — the #3642 canonical form, so a full id re-mint still links).
+- **Coverage is self-owned by the engine.** Covered rows are suppressed by
+  the block's seq/signature coverage set; `acp_summary_*` anchors re-render
+  in place from block state. The engine does NOT trust the reconcile
+  ladder's re-keyed block ids for this — reconcile may legitimately re-key
+  blocks to freshly minted client ids (#3752's exact failure shape when a
+  16384-anchor cap then dropped them).
+- **The tail stays client-verbatim.** Everything above the join point is
+  forwarded byte-for-byte as the client sent it — the unfolded working set
+  remains the client's own words, and prefix-cache stability is preserved
+  turn-over-turn. Rewound-away rows sit below the join and never render.
+- **Degrade, never guess.** Feature off, no active blocks, storage
+  unreadable, or the chain cannot link — the whole turn falls back to the
+  legacy path unchanged. A client-side checkpoint of the head is adopted
+  with a one-turn lag (the view is the previous turn's observation) and can
+  never resurrect covered rows.
+- What this kills structurally: the #3752 anchor-cap cliff (MAX_ANCHORS ×
+  id re-mints × stateless resend) and the #3751 image `_N` family churn —
+  neither can drop or duplicate folded history anymore, because the
+  rendered prefix follows block seqs and content signatures, not client
+  bytes.
+
+The #3641 reconcile/verdict layers stay: they remain the safety net for
+the lanes where D is off, unavailable, or degraded — and the observation
+channel (`reconcileFoldCoverage`) still watches the CLIENT view (render and
+observation are deliberately separate inputs).
+
+## Images are payload-addressed, not family-numbered (#3751)
+
+The `_N` instance discipline above assumes the base id already separates
+*which content* this is. Images broke that assumption until #3751: every
+image core carried the same canonical text (`[image]`), so all images in a
+conversation hashed to ONE shared base and the `_N` ordinals did all the
+separating — positionally. One image changing (offload placeholder, re-encode,
+delete) shifted every sibling's ordinal, re-minting the whole family on every
+turn (the #3748 write-amplification feeder).
+
+The fix keeps the doctrine and closes the gap: the canonical seed grows a
+sixth slot, but only for media cores — `hash(imageBase64)` for data images
+(the bytes both codecs and the content CAS already hold), the URL string for
+URL-referenced images (no bytes on the wire — the URL is the only identity
+available), and the ordered join of part fingerprints for the rare legacy
+plural-sidecar core. Byte-identical images sharing a base id is intended:
+`_N` stays as the ordinal for *true duplicates* (the #459/#463 instance
+discipline, applied to what it was designed for). One image changing now
+re-mints only its own core. Text cores never gain the slot, so non-image ids
+stay byte-identical across the upgrade.
+
 ## Known cost of the hash axiom — and how it was fixed
 
 Same bytes ⇒ same identity has a cost face: #1476 — a user re-sends a short
@@ -307,12 +371,18 @@ byte-identical. Identity bookkeeping is never involved.
 
 If a future host or lane offers a genuinely stable client-side message id,
 it may be adopted **only as an additional join hint** — never as a replacement
-for the content-hash base. Until then: bytes are the anchor, hashes are the
-join, mNNNNN is the ledger, tags are the view.
+for the content-hash base of the LEDGER join. The OUTBOUND join is a
+different question and already has its answer: with `snapshotRender` on,
+the outbound prefix is keyed by server snapshot `seq` (#3756, above) and the
+content-hash ladder serves only as the chain-fallback that finds the join
+point. Summary: bytes are the anchor, hashes are the ledger join, `seq` is
+the render join (rollout-gated), mNNNNN is the ledger, tags are the view.
 
 Related: #1496 (this document's prompt), `SESSION-IDENTITY.md` (session
 granularity), #1476 + kernel #459/#463 (echo discrimination), #242/#1475
 (Responses id constraints), #206/#673 (tag echo), #1479/#1482 (strict-echo
 repair), #1039 (tool-call byte-exactness invariant), #2396 (host-rewritten tool-call ids across a provider switch), #2480 (positional fold coverage;
 `tests/identity-proof.test.ts` is its proof matrix), #2695/#3588/#3640/#3641
-(snapshot-as-session doctrine; `tests/fold-anchor-doctrine.test.ts`).
+(snapshot-as-session doctrine; `tests/fold-anchor-doctrine.test.ts`),
+#3642 (canonical cross-protocol identity — the chain-fallback's signature
+form), #3756 (the snapshot render engine; `tests/snapshot-render.test.ts`).

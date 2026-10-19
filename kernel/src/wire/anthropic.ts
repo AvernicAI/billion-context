@@ -4,6 +4,7 @@ import {
   CANONICAL_REDACTED_THINKING_TEXT,
   canonicalToolArgs,
   deriveCanonicalMessageId,
+  imageMediaFingerprint,
 } from "./identity.js";
 import { hashId } from "./util.js";
 import { ClusterCounter } from "./message-id.js";
@@ -192,20 +193,11 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
           break;
         }
         case "image": {
-          const base = deriveCanonicalMessageId(
-            m.role,
-            "text",
-            CANONICAL_IMAGE_TEXT,
-          );
-          // #3642: parse the base64 source into the shared media sidecars so
-          // every dialect presents the same image core (marker text +
-          // imageMediaType/imageBase64); the raw block keeps verbatim
-          // round-trip. Other source shapes keep the raw-only sidecar.
           const source =
             b.source &&
             typeof b.source === "object" &&
             !Array.isArray(b.source)
-              ? (b.source as { type?: unknown; media_type?: unknown; data?: unknown })
+              ? (b.source as { type?: unknown; media_type?: unknown; data?: unknown; url?: unknown })
               : undefined;
           const mediaSidecar =
             source?.type === "base64" &&
@@ -216,6 +208,17 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
                   imageBase64: source.data,
                 }
               : {};
+          const base = deriveCanonicalMessageId(m.role, "text", CANONICAL_IMAGE_TEXT, {
+            // #3751: payload-addressed ids — base64 source hashes its bytes,
+            // URL source degrades to the URL string, unknown shapes keep the
+            // shared legacy base.
+            mediaFingerprint:
+              source?.type === "base64" && typeof source.data === "string"
+                ? imageMediaFingerprint(source.data)
+                : typeof source?.url === "string"
+                  ? imageMediaFingerprint(source.url)
+                  : undefined,
+          });
           msgs.push({
             id: clusters.next(base),
             role: m.role,

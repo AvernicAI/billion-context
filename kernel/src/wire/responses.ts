@@ -6,6 +6,7 @@ import {
   canonicalOpaqueSeed,
   canonicalToolArgs,
   deriveCanonicalMessageId,
+  imageMediaFingerprint,
 } from "./identity.js";
 import type { ConversationIdentity } from "./util.js";
 import { hashId } from "./util.js";
@@ -309,12 +310,18 @@ export function responsesToCore(
                 part.type === "input_image" &&
                 typeof part.image_url === "string"
               ) {
+                const image = parseDataUrl(part.image_url);
                 const base = deriveCanonicalMessageId(
                   "user",
                   "text",
                   CANONICAL_IMAGE_TEXT,
+                  {
+                    // #3751: payload-addressed ids — base64 payload when present, else URL.
+                    mediaFingerprint: imageMediaFingerprint(
+                      image ? image.base64 : part.image_url,
+                    ),
+                  },
                 );
-                const image = parseDataUrl(part.image_url);
                 msgs.push({
                   id: clusters.next(base),
                   role: "user",
@@ -374,8 +381,30 @@ export function responsesToCore(
               role === "user"
                 ? userDisplayText(message.content, effText)
                 : effText;
+            // #3751: payload-addressed ids — every input_image in the merged
+            // shape contributes its fingerprint in order (single image ⇒ one
+            // fingerprint, byte-identical to the split path's image core so
+            // both forms of one logical message share one id; text-only legacy
+            // cores keep their ids verbatim).
+            const mediaFingerprint = Array.isArray(message.content)
+              ? message.content
+                  .flatMap((part) => {
+                    if (
+                      part?.type === "input_image" &&
+                      typeof part.image_url === "string"
+                    ) {
+                      const raw = part.image_url;
+                      const decoded = parseDataUrl(raw);
+                      return [imageMediaFingerprint(decoded ? decoded.base64 : raw)];
+                    }
+                    return [];
+                  })
+                  .join(",") || undefined
+              : undefined;
             coreId = clusters.next(
-              deriveCanonicalMessageId(role, "text", displayText),
+              deriveCanonicalMessageId(role, "text", displayText, {
+                mediaFingerprint,
+              }),
             );
             const imageUrl = Array.isArray(message.content)
               ? message.content.find(

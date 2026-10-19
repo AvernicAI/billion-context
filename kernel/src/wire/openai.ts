@@ -3,10 +3,29 @@ import {
   CANONICAL_IMAGE_TEXT,
   canonicalToolArgs,
   deriveCanonicalMessageId,
+  imageMediaFingerprint,
 } from "./identity.js";
 import { hashId } from "./util.js";
 import { ClusterCounter } from "./message-id.js";
 import { parseDataUrl, type BiliMessage } from "./bili-message.js";
+
+/** #3751: ordered image fingerprints for a legacy plural-sidecar part list —
+ *  data-URL images hash their base64 payload, URL images hash the URL,
+ *  non-image parts contribute nothing (the legacy id of an image-free opaque
+ *  core is preserved verbatim). */
+function imageFingerprintsOfParts(parts: unknown[]): string[] {
+  const out: string[] = [];
+  for (const part of parts) {
+    if (!part || typeof part !== "object") continue;
+    const p = part as { type?: unknown; image_url?: { url?: unknown } };
+    if (p.type !== "image_url") continue;
+    const url = typeof p.image_url?.url === "string" ? p.image_url.url : undefined;
+    if (!url) continue;
+    const parsed = parseDataUrl(url);
+    out.push(imageMediaFingerprint(parsed ? parsed.base64 : url));
+  }
+  return out;
+}
 
 export type OpenAIContentPart =
   | { type: "text"; text: string }
@@ -145,11 +164,13 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
               (part as { image_url?: { url?: unknown } }).image_url?.url;
             const parsed =
               typeof url === "string" ? parseDataUrl(url) : undefined;
-            const base = deriveCanonicalMessageId(
-              "user",
-              "text",
-              CANONICAL_IMAGE_TEXT,
-            );
+            const base = deriveCanonicalMessageId("user", "text", CANONICAL_IMAGE_TEXT, {
+              // #3751: payload-addressed ids — data images hash their bytes,
+              // URL images degrade to the URL string.
+              mediaFingerprint: imageMediaFingerprint(
+                parsed ? parsed.base64 : typeof url === "string" ? url : "",
+              ),
+            });
             msgs.push({
               id: clusters.next(base),
               role: "user",
@@ -196,7 +217,11 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
               ...(host.rawOpenaiContentParts ?? []),
             ];
           } else {
-            const base = deriveCanonicalMessageId("user", "text", "");
+            const base = deriveCanonicalMessageId("user", "text", "", {
+              // #3751: the legacy plural core gets the ordered join of its
+              // image fingerprints (if any) — zero images keeps the legacy id.
+              mediaFingerprint: imageFingerprintsOfParts(leadingOpaque).join(",") || undefined,
+            });
             msgs.push({
               id: clusters.next(base),
               role: "user",
