@@ -67,6 +67,7 @@ import { adminGateDenial, handleAdminRoute, isManagementPath } from "./admin.js"
 import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape, incrementalTurnsEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
 import { ccrPluginWireOk, storeEffectiveCcr, storeEffectiveImageRescale, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
+import { maybeRunInvariantJudge } from "../invariant-judge.js";
 import { BodyTooLargeError, buildForwardTarget, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, selfAddressedLocalPath, scrubAnthropicPck, scrubCompatDrop, vertexAnthropicModelFromPath, warnRouteMissIfNew, type Prepared } from "../server.js";
 import { normalizeVertexModelId } from "../vertex.js";
 
@@ -2360,6 +2361,10 @@ async function handleRequest(
                     return { body: forwardBody, prepared: null };
                 }
                 prepared = await runPrepare();
+                // #3842: reconcile inbound vs outbound core on the real path.
+                // Disarmed by default (zero cost); armed only in tests / once an
+                // owner-approved production knob exists. Advisory — never blocks.
+                if (prepared && protocol && !countTokens && !responsesCompact) maybeRunInvariantJudge(prepared);
                 // [#2926] anthropic Threads lane: prepare mirrored the turn and
                 // may have armed a reforge (mirror estimate crossed the window
                 // on a continue, rollout flag on). Execute it now — one summary
