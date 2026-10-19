@@ -7,6 +7,7 @@ import {
     stripComments,
     extractConfigLeaves,
     extractCliFlags,
+    extractStringSet,
     runChecks,
 } from "../scripts/config-surface-guard.mjs";
 
@@ -68,6 +69,19 @@ test("a planted undocumented CLI flag is caught", () => {
     const missing = flags.filter((f) => f.startsWith("--") && !(readme.includes(f) || cfgmd.includes(f))).sort();
     assert.ok(missing.includes("--sneaky-new-flag"), "planted flag must be flagged missing");
     assert.ok(!missing.includes("--port"), "documented flag must not be flagged");
+});
+
+test("extractStringSet anchors on the initializer, not an earlier mention (#3680)", () => {
+    // The route-root warning call site preceded the COMPRESS_SETTING_FIELDS
+    // declaration, and its message carries `[${…}]` — the old first-mention +
+    // first-`]` scan collapsed to one empty string there.
+    const src =
+        "function warnMisplaced(key: string): void {\n" +
+        '    const misplaced = Object.keys(key).filter((f) => f !== undefined && COMPRESS_SETTING_FIELDS.has(f));\n' +
+        '    log(`carries compress-block keys [${misplaced.join(", ")}] at the route root`);\n' +
+        "}\n" +
+        'const COMPRESS_SETTING_FIELDS = new Set([ "tiers", "modelContextLimit" ]);\n';
+    assert.deepEqual(extractStringSet(src, "COMPRESS_SETTING_FIELDS"), ["tiers", "modelContextLimit"]);
 });
 
 test("stripComments keeps string contents, drops comments", () => {

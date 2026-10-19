@@ -133,17 +133,36 @@ function namedTypeBodies(src) {
 }
 
 // Extract the quoted identifiers of `const <varName> = new Set([ ... ]);`.
+// Anchored on the initializer, NOT the first mention of the name: a
+// use-before-declaration earlier in the file would otherwise hijack the scan,
+// and the naive first-`]` stop then lands inside whatever bracketed text
+// follows (e.g. a template literal's `[${…}]`), producing phantom members
+// (#3680 review: the route-root warning call site preceded the declaration
+// and the extraction collapsed to one empty string).
 export function extractStringSet(src, varName) {
-    const i = src.indexOf(varName);
-    if (i < 0) throw new Error(varName + " not found");
-    const open = src.indexOf("[", i);
-    const close = src.indexOf("]", open);
-    const inner = src.slice(open + 1, close);
-    const out = [];
-    const re = /["']([^"']+)["']/g;
-    let m;
-    while ((m = re.exec(inner))) out.push(m[1]);
-    return out;
+    const m = new RegExp(`(?:const|let|var)\\s+${varName}\\s*=\\s*new\\s+Set\\s*\\(\\s*\\[`).exec(src);
+    if (!m) throw new Error(varName + " not found");
+    const open = m.index + m[0].length - 1;
+    let depth = 0;
+    let inStr = null;
+    for (let i = open; i < src.length; i++) {
+        const c = src[i];
+        if (inStr) { if (c === inStr && src[i - 1] !== "\\") inStr = null; continue; }
+        if (c === "'" || c === '"') { inStr = c; continue; }
+        if (c === "[") depth++;
+        else if (c === "]") {
+            depth--;
+            if (depth === 0) {
+                const inner = src.slice(open + 1, i);
+                const out = [];
+                const re = /["']([^"']+)["']/g;
+                let mm;
+                while ((mm = re.exec(inner))) out.push(mm[1]);
+                return out;
+            }
+        }
+    }
+    throw new Error("unbalanced Set literal for " + varName);
 }
 
 // ---- config-file leaf extraction --------------------------------------------
