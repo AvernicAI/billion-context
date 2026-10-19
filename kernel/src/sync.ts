@@ -46,6 +46,13 @@ export function syncBlocks(
     nextBlockId: state.nextBlockId,
     nextRunId: state.nextRunId,
     deadRefs: state.deadRefs ? [...state.deadRefs] : undefined,
+    // #3769 orphan-cleanup ledgers — same carry set as cloneState: dropping any
+    // of these here would wipe them before the hide-compress-calls node reads
+    // them (this node runs first), silently disabling both the fold-gated sweep
+    // and the legacy hiddenOrphanRefs upgrade-compat clause every turn.
+    hiddenOrphanRefs: state.hiddenOrphanRefs ? [...state.hiddenOrphanRefs] : undefined,
+    sweptOrphanCallIds: state.sweptOrphanCallIds ? [...state.sweptOrphanCallIds] : undefined,
+    pendingOrphanSweepMinRef: state.pendingOrphanSweepMinRef,
   };
 
   // Refs are additive (assignRefs never removes them from messageRefs), so
