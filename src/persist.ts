@@ -1148,16 +1148,20 @@ export class SessionStore {
     }
 
     /** Every on-disk file belonging to this session id, whatever namespace it
-     *  sits in. Explicit candidates first (when meta is known), then a shallow
-     *  tree walk with loadEnvelope's lazy hash-suffix predicate: a standalone
-     *  opener never ran a directory scan, and legacy lanes carry no index row
-     *  revealing the protocol, so the walk is the only complete answer there. */
+     *  sits in. Explicit candidates first (envelopes AND their content-store
+     *  siblings — kept even when the envelope is already gone, matching the old
+     *  removeLegacyFile coverage), then a shallow tree walk with loadEnvelope's
+     *  lazy hash-suffix predicate: a standalone opener never ran a directory
+     *  scan, and legacy lanes carry no index row revealing the protocol, so the
+     *  walk is the only complete answer there. */
     private async findSessionFiles(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Promise<string[]> {
         const rels = new Set<string>();
         for (const rel of [
             relPathFor(id, meta?.protocol, meta?.upstreamOrigin),
             relPathFor(id),
             flatFileNameFor(id),
+            contentStoreRelPathFor(id, meta?.protocol, meta?.upstreamOrigin),
+            contentStoreRelPathFor(id),
         ]) {
             if (existsSync(path.join(this.sessionsDir, rel))) rels.add(rel);
         }
