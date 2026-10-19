@@ -957,7 +957,12 @@ export class SessionStore {
                 this.shadow.importRecord(payload);
             }
             const view = this.shadow.viewFor(id);
-            if (view) return buildSession(viewToRecord(view));
+            // #3831: the unified view drops archived originals that have no
+            // state.blocks slot — when the payload we just parsed still
+            // carries them, the legacy build below is the faithful source.
+            if (view && !this.originalsLostInView(payload, view)) {
+                return buildSession(viewToRecord(view));
+            }
         }
         return buildSession(payload);
     }
@@ -1185,43 +1190,76 @@ export class SessionStore {
         if (!this.enabled) return null;
         if (this.shadow?.readsUnified) {
             const unified = this.loadUnified(id);
-            if (unified) return this.afterLoad(id, unified);
+            if (unified) {
+                // #3831: the unified view has no standalone blockContents
+                // carrier — when the legacy envelope still holds archived
+                // originals the view dropped (no state.blocks slot), serve
+                // the envelope so decompress can restore them.
+                const envelope = this.loadEnvelope(id, meta);
+                if (!(envelope && this.originalsLostInView(envelope.payload, unified))) {
+                    return this.afterLoad(id, unified);
+                }
+                this.log("warn", `[persist] ${id}: unified view dropped archived original(s) the legacy envelope still holds — serving the envelope instead (#3831)`);
+                return this.serveFromEnvelope(id, envelope);
+            }
             // Miss (or sidecar failure): organic import from the legacy file,
             // then serve from the index; fall back to the plain legacy load
-            // when even the import cannot run.
+            // when even the import cannot run — or when the imported view
+            // would drop originals the envelope still carries (#3831).
             const envelope = this.loadEnvelope(id, meta);
             if (!envelope) return null;
             const imported = this.shadow.importRecord(envelope.payload);
             if (imported) {
                 const view = this.shadow.viewFor(id);
-                if (view) return this.afterLoad(id, view);
+                if (view && !this.originalsLostInView(envelope.payload, view)) {
+                    return this.afterLoad(id, view);
+                }
             }
-            // Legacy fallback — same single-build semantics as plain legacy
-            // mode (see the note below on why no adapter round-trip here).
-            const session = buildSession(envelope.payload);
-            if (hasNegativePersistedTokens(envelope.payload)) {
-                this.scheduleSave(session);
-                this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
-            }
-            this.logColdLoad(id, "legacy file", session, envelope.payload.savedAt);
-            return session;
+            return this.serveFromEnvelope(id, envelope);
         }
         const envelope = this.loadEnvelope(id, meta);
         if (!envelope) return null;
-        // Legacy path — intentionally the ORIGINAL single buildSession(payload):
-        // wrapping this in the toLegacyLike/viewToRecord adapter (like the
-        // unified branch above) would run the record through a second
-        // normalization round-trip and reshape persisted-state bytes (the
-        // storage-render goldens catch exactly that).
+        return this.serveFromEnvelope(id, envelope);
+    }
+
+    /** Serve a session straight from its legacy envelope: the ORIGINAL single
+     *  buildSession(payload) — wrapping it in the toLegacyLike/viewToRecord
+     *  adapter would run the record through a second normalization round-trip
+     *  and reshape persisted-state bytes (the storage-render goldens catch
+     *  exactly that) — plus the #408 negative-token clamp rewrite and the
+     *  cold-load log. The one home for legacy single-build semantics: the
+     *  plain-legacy branch and the #3831 orphan-drop escape hatch both route
+     *  here. */
+    private serveFromEnvelope(id: string, envelope: PersistedEnvelope<PersistedSession>): Session {
         const session = buildSession(envelope.payload);
         if (hasNegativePersistedTokens(envelope.payload)) {
-            // #408: sync context — debounce the stale-file rewrite
-            // (buildSession already clamped the in-memory value).
+            // #408: debounce the stale-file rewrite (buildSession already
+            // clamped the in-memory value).
             this.scheduleSave(session);
             this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
         }
         this.logColdLoad(id, "legacy file", session, envelope.payload.savedAt);
         return session;
+    }
+
+    /** #3831: does the persisted record carry archived originals — blockContents
+     *  entries with NO state.blocks slot (zombie-reaped folds, #2695; compaction-
+     *  archive prunes) — that a unified view silently drops? The unified schema
+     *  has no standalone blockContents carrier: ingest rebuilds the map ONLY from
+     *  block rows (ingest.ts loadLegacyView), so any recorded key without a block
+     *  slot is lost on a unified read. The record is the authoritative source for
+     *  blockContents, so whenever it holds keys the view lacks, callers fall back
+     *  to the legacy build to restore the bytes. */
+    private originalsLostInView(
+        record: { blockContents?: Record<string, unknown> | null },
+        view: LegacySessionLike,
+    ): boolean {
+        const rec = record.blockContents;
+        if (!rec) return false;
+        const recKeys = Object.keys(rec);
+        if (recKeys.length === 0) return false;
+        const viewKeys = new Set(view.blockContents.keys());
+        return recKeys.some((k) => !viewKeys.has(k));
     }
 
     /** Shared post-load fixups for the unified read path: rebuilds the
