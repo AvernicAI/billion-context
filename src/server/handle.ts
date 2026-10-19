@@ -2361,10 +2361,6 @@ async function handleRequest(
                     return { body: forwardBody, prepared: null };
                 }
                 prepared = await runPrepare();
-                // #3842: reconcile inbound vs outbound core on the real path.
-                // Disarmed by default (zero cost); armed only in tests / once an
-                // owner-approved production knob exists. Advisory — never blocks.
-                if (prepared && protocol && !countTokens && !responsesCompact) maybeRunInvariantJudge(prepared);
                 // [#2926] anthropic Threads lane: prepare mirrored the turn and
                 // may have armed a reforge (mirror estimate crossed the window
                 // on a continue, rollout flag on). Execute it now — one summary
@@ -2503,6 +2499,12 @@ async function handleRequest(
                     }
                     prepared = outcome;
                 }
+                // #3842: reconcile inbound vs outbound core on the FINAL body —
+                // after preflight, because a fold-creating request rebuilds
+                // `prepared` there and only the rebuilt bytes cross the wire.
+                // Disarmed by default (zero cost); armed only in tests / once an
+                // owner-approved production knob exists. Advisory — never blocks.
+                if (prepared && protocol && !countTokens && !responsesCompact) maybeRunInvariantJudge(prepared);
                 // #1266: capture the CLIENT's raw incoming wire AFTER session
                 // binding so the filename carries the session id — INCOMING↔REQ
                 // dumps pair by id for `bili acp-cache diff`. Moved from the

@@ -121,3 +121,54 @@ test("I2 fold boundary drift: frozen-prefix element altered before the summary -
   assert.equal(v.ok, false);
   assert.equal(v.folded, true);
 });
+
+test("I1 stateful-host echo: inbound acp_summary carrier matches its twin (entry==exit) -> green", () => {
+  const a = [
+    mk("user", "text", "hello"),
+    mk("user", "text", "[Compressed conversation section]\nold stuff", { summaryOfBlockId: "b3" }),
+    mk("assistant", "text", "still here"),
+  ];
+  const v = judgeInboundOutbound(a, a);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+});
+
+test("I1 stateful-host echo: inbound chain-checkpoint carrier matches its twin -> green", () => {
+  const a = [
+    mk("user", "text", "hello"),
+    mk("user", "text", "\x3cbili-chain \"abc\"/>\x3c/bili-chain>"),
+    mk("assistant", "text", "hi"),
+  ];
+  const v = judgeInboundOutbound(a, a);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+});
+
+test("I1 five consecutive injected carriers before the next stable match stay exempt (gap counts non-carriers)", () => {
+  const ck = (t: string) => mk("user", "text", t);
+  const entry = [mk("user", "text", "A"), mk("assistant", "text", "B")];
+  const exit = [
+    entry[0]!,
+    ck("\x3cbili-chain \"c1\"/>\x3c/bili-chain>"),
+    ck("\x3cbili-chain \"c2\"/>\x3c/bili-chain>"),
+    ck("\x3cbili-chain \"c3\"/>\x3c/bili-chain>"),
+    ck("\x3cbili-chain \"c4\"/>\x3c/bili-chain>"),
+    ck("\x3cbili-chain \"c5\"/>\x3c/bili-chain>"),
+    entry[1]!,
+  ];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+});
+
+test("carrier text drift in place stays green: inbound elements at/after the fold point live in bili's owned render region (host edits to persisted summaries are normalized by the canonical re-render, so they are not attributable to the host)", () => {
+  const entry = [
+    mk("user", "text", "hello"),
+    mk("user", "text", "[Compressed conversation section]\nold stuff", { summaryOfBlockId: "b3" }),
+  ];
+  const exit = [
+    mk("user", "text", "hello"),
+    mk("user", "text", "[Compressed conversation section]\nDIFFERENT CONTENT", { summaryOfBlockId: "b3" }),
+  ];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.folded, true);
+  assert.equal(v.matched, 1);
+});

@@ -8,8 +8,10 @@
 // Invariants (owner design, #3842):
 //   I1 (no fold): every inbound stable message appears at the outbound in
 //     order, normalized-equal. Only legal diffs: (a) tail appends, (b) the
-//     named, count-bounded exemption list — chain checkpoint, NOTE/nudge
-//     carriers, acp_summary carriers, policy reasoning drops, crush envelopes.
+//     named, count-bounded exemption list — chain checkpoint / acp_summary
+//     carriers (outbound-injected, or inbound-ECHOED by stateful hosts, which
+//     match their own twin by identity), policy reasoning drops, crush
+//     envelopes.
 //   I2 (fold): all divergence is confined to [earliest-fold-start, end); the
 //     bytes before the fold point stay identical, and the fold carrier stays
 //     pinned (anchor drift is a violation too).
@@ -44,14 +46,14 @@ const SUMMARY_MARKER = "[Compressed conversation section]";
 // key was legitimately crushed (lossless, deterministic), not rewritten.
 const CRUSH_KEY = "__acp_crush";
 
-export type ViolationKind =
+type ViolationKind =
   | "mid-history-rewrite"
   | "mid-history-drop"
   | "mid-insertion"
   | "fold-boundary-drift"
   | "carrier-drift";
 
-export interface Violation {
+interface Violation {
   kind: ViolationKind;
   /** Inbound index implicated (-1 when the finding is positional on the exit side). */
   index: number;
@@ -67,7 +69,7 @@ export interface JudgeVerdict {
   violations: Violation[];
 }
 
-export interface JudgeOptions {
+interface JudgeOptions {
   // Carriers are few per request; a wider gap than this before the next stable
   // match reads as a rewrite, not an injection. Default 4.
   maxCarrierGap?: number;
@@ -151,12 +153,21 @@ export function judgeInboundOutbound(
     if (folded && j >= freezeEnd) { foldStart = i; break; } // remainder is the folded region
     total++;
 
+    // Stateful hosts re-send previously-injected carriers in their inbound
+    // history; such an entry must match its own twin by identity — skipping
+    // exit carriers for it would false-positive every steady-state post-fold
+    // turn. The gap budget counts NON-carrier elements only: a stack of
+    // injected carriers between stable messages is exempt volume, not drift.
+    const eCarrier = isCarrier(e);
     let found = -1;
     let nearTwin = false;
+    let scanned = 0;
     for (let k = j; k < freezeEnd; k++) {
-      if (k - j > maxGap) break;
       const x = exit[k];
-      if (isCarrier(x) || isReasoning(x)) continue;
+      if (isReasoning(x)) continue;
+      if (!eCarrier && isCarrier(x)) continue;
+      scanned++;
+      if (scanned > maxGap) break;
       if (stableEqual(e, x)) { found = k; break; }
       if (x.role === e.role && x.contentType === e.contentType && (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
     }
@@ -208,7 +219,7 @@ export function judgeInboundOutbound(
 // (production enablement/sampling/counters is an owner decision, #3842). While
 // armed it reconciles every request through the real path and reports verdicts
 // to the sink; it never mutates the body or throws out.
-export interface InvariantJudgeInput {
+interface InvariantJudgeInput {
   /** Inbound cores (what the client sent) — already computed by prepare. */
   originalMessages?: readonly CoreMessage[];
   /** Outbound request body (the exact bytes forwarded) — re-parsed to core here. */
@@ -264,7 +275,10 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
     if (!exitCores0) return; // unparseable/unknown wire → skip, never false-positive
     const exitCores = fault ? fault([...exitCores0]) : exitCores0;
     const v = judgeInboundOutbound(entry, exitCores);
-    if (!v.ok && sink) sink(v);
+    // Every judged request reports its verdict (ok or not): consumers must be
+    // able to see folded-but-clean traffic too, not just violations — that is
+    // how the live I2 path proves a real fold stayed green (#3842).
+    if (sink) sink(v);
   } catch {
     // advisory layer: a judge failure must never disturb the request
   }
