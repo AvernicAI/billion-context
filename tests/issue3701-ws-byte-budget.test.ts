@@ -18,7 +18,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import { ResponsesWsUpstream, ResponsesWsUpstreamError } from "../src/responses-ws.ts";
 import { shedWireImages, shedEgressIfOverBudget, extractWsOversizeError } from "../src/egress-shed.ts";
-import { withFetchTransport } from "../src/fetch-transport.ts";
+import { markWsLaneTransport, withFetchTransport } from "../src/fetch-transport.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { createSession, peekSession } from "../src/session.ts";
 import { BILI_ACP_TOOLS_RESPONSES, READ_ORIGINAL_IMAGE_TOOL_NAME } from "../src/compress-tool.ts";
@@ -205,7 +205,10 @@ test("#3701 shedEgressIfOverBudget: WS-lane only, records metadata, honors disab
     process.env.BILI_WS_OUTBOUND_BYTES = String(1_000_000);
     try {
         const logs: string[] = [];
-        const out = await withFetchTransport(async () => new Response("unused"), () =>
+        // markWsLaneTransport: only a WS-tagged transport triggers the shed (#3701
+        // Finding 1 — the gate used to fire for ANY managed transport, shedding
+        // dsh-inline's large-but-deliverable HTTP requests).
+        const out = await withFetchTransport(markWsLaneTransport(async () => new Response("unused")), () =>
             shedEgressIfOverBudget(big, "responses", { sessionId: session.id, session, log: (level, msg) => logs.push(`${level}:${msg}`), phase: "unit" }));
         assert.ok(out.stats.changed);
         assert.equal(out.stats.archived, 4, "entries 0..3 are the only archivable ones (tail of 8 protected)");
@@ -217,11 +220,20 @@ test("#3701 shedEgressIfOverBudget: WS-lane only, records metadata, honors disab
         assert.ok(logs.some(l => l.includes("[ws-byte-shed]") && l.includes("still over budget")), "protected tail overage is warned, not silent");
 
         const httpOut = await shedEgressIfOverBudget(big, "responses", { sessionId: session.id, session });
-        assert.equal(httpOut.body, big, "HTTP lane passes through untouched");
+        assert.equal(httpOut.body, big, "HTTP lane (no transport) passes through untouched");
         assert.equal(httpOut.stats.changed, false);
 
+        // #3701 Finding 1 regression pin: a MANAGED-but-HTTP transport (the dsh-inline
+        // shape, inline-engine.ts) must also pass through untouched — the shed keys on
+        // the WS tag, not on "any managed transport".
+        const managedHttp = await withFetchTransport(async () => new Response("unused"), () =>
+            shedEgressIfOverBudget(big, "responses", { sessionId: session.id, session }));
+        assert.equal(managedHttp.body, big, "managed HTTP transport (dsh-inline shape) passes through untouched");
+        assert.equal(managedHttp.stats.changed, false);
+        assert.equal(managedHttp.stats.archived, 0);
+
         process.env.BILI_WS_OUTBOUND_BYTES = "0";
-        const off = await withFetchTransport(async () => new Response("unused"), () => shedEgressIfOverBudget(big, "responses", {}));
+        const off = await withFetchTransport(markWsLaneTransport(async () => new Response("unused")), () => shedEgressIfOverBudget(big, "responses", {}));
         assert.equal(off.body, big, "budget 0 disables shedding");
     } finally {
         delete process.env.BILI_WS_OUTBOUND_BYTES;

@@ -2,7 +2,7 @@ import http from "node:http";
 import { WebSocket as UpstreamWebSocket, type Dispatcher } from "undici";
 import WebSocket from "ws";
 import { MAX_REQUEST_BYTES, fetchWithTimeout, type FetchOptions } from "./fetch-util.js";
-import { withFetchTransport } from "./fetch-transport.js";
+import { markWsLaneTransport, withFetchTransport } from "./fetch-transport.js";
 import { BILI_HOP_HEADER } from "./server/context-window.js";
 import { connectionNamedHeaders, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { BILI_TUNNEL_HEADER } from "./tunnel-guard.js";
@@ -726,7 +726,9 @@ class ResponsesWsSession implements WsBridgeSession {
         const res = new ResponsesWsResponse(req, peer);
         res.on("error", () => {});
         this.active = res;
-        void withFetchTransport((url, options) => this.transport.fetch(url, options), async () => {
+        // markWsLaneTransport (#3701 Finding 1): the egress-shed byte budget keys on
+        // this tag — managed HTTP transports (dsh-inline) stay out of the shed.
+        void withFetchTransport(markWsLaneTransport((url, options) => this.transport.fetch(url, options)), async () => {
             try {
                 await this.context.dispatch(req, res);
                 if (res.response) {

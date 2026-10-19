@@ -8,6 +8,7 @@ import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBilli
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
+import { maybeSnapshotView } from "./snapshot-render.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
@@ -120,10 +121,19 @@ export async function prepareGoogle(
             googleClientSystem = outcome.outbound;
         }
         originalMessages = msgs;
+        // #3756 snapshot render: the outbound prefix renders from the unified
+        // transcript (server-authoritative, fold-time ids — immune to identity
+        // re-mints #3752); only the live tail keeps the client's bytes.
+        // No-op returns `msgs` when the lane is inactive/degraded.
+        // reconcileFoldCoverage below still observes the CLIENT view.
+        // (#651 keeps reasoning-drop off this wire — Gemini validates
+        // thoughtSignature — so only tokenCount + processTurn consume the
+        // render view, unlike the openai/responses lanes' third consumer.)
+        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, log });
         // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
         // previously-unknown id, which would make rewrite detection read 1.0.
         const knownRefsBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
-        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageReserveFor(session, "google", parsed, opts, upstreamOrigin));
+        const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, renderMsgs, imageReserveFor(session, "google", parsed, opts, upstreamOrigin));
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
         const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
@@ -166,7 +176,7 @@ export async function prepareGoogle(
         const foldCoveredBefore = session.stats.pendingFoldUsage === true
             ? coveredRealHistoryIds(session.state.blocks)
             : null;
-        const turn = processTurnWithHold(session, core, { messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) }, { limit: loopConfig.modelContextLimit, log: (m) => log("info", `[${sessionId}] ${m}`) });
+        const turn = processTurnWithHold(session, core, { messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, renderTags: renderStrategy, contentStore: contentStoreOf(session) }, { limit: loopConfig.modelContextLimit, log: (m) => log("info", `[${sessionId}] ${m}`) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —

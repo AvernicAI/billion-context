@@ -7,6 +7,8 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ### Changes
 
+- **WS 摘图门收窄到真 WebSocket 传输（#3701 Finding 1）**：`network.wsOutboundBytes` 的发送前摘图门原先对「任何受管自定义传输」生效——dsh-inline 的受管 HTTP fetch 也被卷入，超 10 MiB 的 HTTP 请求会被无谓摘图（同一载荷走 HTTP 曾观测 16 MiB 正常送达，从无 1009 门限）。现在门只认 `markWsLaneTransport` 打标的 Responses-WS 传输（responses-ws.ts）；文档「仅 WS 车道生效」的表述自此为真。回归钉：受管 HTTP 传输形状原样透传、零摘图。
+
 - **图片消息 id 按载荷寻址(#3751)**:图片 core 的身份种子增加媒体指纹槽——数据图取其字节的 sha256(URL 引用图取 URL 字符串),一张图变化只重铸它自己那条 core,不再把全族 `_N` 序号整体位移(该位移曾是每轮断缓存与 #3748 写放大事故的喂数机)。`_N` 序号回归本职:仅区分字节完全相同的重复图。文本/工具消息种子不变,id 逐字节保持;跨协议同图同 id、responses legacy 单图形状与拆分形状同 id(金桩钉死)。存量图片会话一次性 re-key,由 #3641 判决分类与 #3756 快照渲染兜底吸收。
 
 - **Fork 子会话不再因前缀漂移永久 409(#3741,owner 决策:门降 advisory)**:dsh/客户端 fork 出的子会话,其首个请求如果与继承的有序前缀不匹配(升级换代重排消息 id、宿主改写 body 等),过去直接 409 且被拒请求不计数——重试永远撞同一扇门,子会话确定性卡死、无任何自愈或清除路径。现在改为**照常收养**:session-id 绑定本来就是真正的唤醒路由,折叠覆盖差异由 reconcile(#3641 order-over-hash)兜底修复;漂移首请求付出一次性未折叠 token 峰,正确性无损。每次收养打一条带分类的 warn(reason 沿用 #3743 诊断:id-drift / hash-drift-under-same-id / prefix-longer-than-incoming 等),`publicForkPrefix` 在漂移时保持 false,side-lane 降级启发照常发言。测试:三种漂移形态全部 200+转发+父会话不动+恰一条 warn(one-shot:首请求后 stats.requests>0 绕过检查)。

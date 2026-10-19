@@ -32,7 +32,9 @@ defineConfig({
     },
     outDir: "dist",
     clean: true,
-    sourcemap: true,
+    // #3777: maps used to ship in the npm tarball (~109 MiB) with no runtime
+    // consumer; keep off — local debugging only, do not commit.
+    sourcemap: false,
     splitting: false,
     shims: false,
     // acp-kernel is a BUILD-TIME dependency: tsup inlines it into dist so the

@@ -14,7 +14,7 @@
 import { parseDataUrl } from "acp-kernel/wire";
 import type { Session } from "./session.js";
 import type { WireProtocol } from "./util.js";
-import { currentFetchTransport } from "./fetch-transport.js";
+import { currentFetchTransport, isWsLaneTransport } from "./fetch-transport.js";
 import { limitsWsOutboundBytes } from "./knobs.js";
 import { decodeImageDims } from "./image-tokens.js";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "./compress-tool.js";
@@ -315,7 +315,10 @@ interface ShedContext {
 }
 
 /** WS-lane pre-send gate (#3701): passthrough unless the request actually rides the
- *  WebSocket transport AND exceeds network.wsOutboundBytes. On a shed, records
+ *  WebSocket transport AND exceeds network.wsOutboundBytes. #3701 Finding 1: the
+ *  gate matches ONLY transports tagged markWsLaneTransport (responses-ws.ts) — a
+ *  managed-but-HTTP transport (dsh-inline via inline-engine.ts) delivers large
+ *  bodies fine (16 MiB observed) and must never be shed. On a shed, records
  *  session.metadata.wsByteShed and logs the exact before→after bytes. */
 export async function shedEgressIfOverBudget(
     body: string,
@@ -324,7 +327,7 @@ export async function shedEgressIfOverBudget(
 ): Promise<{ body: string; stats: ShedStats }> {
     const budget = limitsWsOutboundBytes();
     const originalBytes = byteLen(body);
-    if (budget <= 0 || currentFetchTransport() === undefined || originalBytes <= budget) {
+    if (budget <= 0 || !isWsLaneTransport(currentFetchTransport()) || originalBytes <= budget) {
         return { body, stats: { originalBytes, finalBytes: originalBytes, archived: 0, downscaled: 0, changed: false } };
     }
     const { body: next, stats } = await shedWireImages(body, protocol, budget, {
