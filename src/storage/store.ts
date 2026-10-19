@@ -912,7 +912,9 @@ export class UnifiedStore {
     /** #3830: per-session storage footprint for `bili sessions ls --with-sizes`.
      *  Counts never cascade into each other: inline bytes cover only JSON
      *  columns, CAS bytes only content-addressed blobs; the CAS split by
-     *  refcount mirrors exactly what deleteSession frees. */
+     *  refcount mirrors exactly what deleteSession frees — so pinned checkpoint
+     *  state blobs are excluded (they survive deletion by design, #2671 Phase 2;
+     *  their count stays visible via rows.pinnedCheckpoints). */
     sessionStorageStats(sessionId: string): SessionStorageStats {
         const counts = this.db
             .prepare(
@@ -954,7 +956,7 @@ export class UnifiedStore {
                     "UNION SELECT summary_hash FROM blocks WHERE session_id = ? " +
                     "UNION SELECT one_hash FROM blocks WHERE session_id = ? AND one_hash IS NOT NULL " +
                     "UNION SELECT content_hash FROM ccr_entries WHERE session_id = ? " +
-                    "UNION SELECT state_hash FROM checkpoints WHERE session_id = ?)",
+                     "UNION SELECT state_hash FROM checkpoints WHERE session_id = ? AND pinned = 0)",
             )
             .get(sessionId, sessionId, sessionId, sessionId, sessionId) as { exclusiveBytes: number; sharedBlobs: number };
         return {
