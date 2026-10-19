@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { resolveZonePortBase } from "./config.js";
 import { stateDir } from "./paths.js";
@@ -134,6 +135,21 @@ export function writeZonePort(lane: string, port: number, file: string = portZon
  *  base (BILI_ZONE_PORT override). Explicit user overrides
  *  (BILI_CLAUDE_NATIVE_PORT / BILI_ZCODE_PORT) are resolved separately by
  *  the lanes and imply strict-port launches. */
+/** #3654/#3116: append a diagnostic line to the spawner-owned per-port log
+ *  (%TMPDIR%/bili-proxy-<port>.log) — the exact file a spawner failure message
+ *  points users at. Post-#2864 the child mutes its stderr leg into bili.log as
+ *  soon as its logger is live, so a child that dies during listen setup leaves
+ *  that file EMPTY (the "0 bytes" dead-end); this writes the child-side truth
+ *  there. Named by the PREFERRED port (what the spawner uses for the file
+ *  name); the line itself names the port actually tried. Line grammar mirrors
+ *  logger.ts so mixed writers stay greppable. Best-effort: a failed append
+ *  never affects the exit. */
+export function writeSpawnPortLog(preferredPort: number, line: string): void {
+    try {
+        fs.appendFileSync(path.join(os.tmpdir(), `bili-proxy-${preferredPort}.log`), `${line}\n`, "utf8");
+    } catch {}
+}
+
 export function lanePreferredPort(lane: string, env: NodeJS.ProcessEnv = process.env, file: string = portZoneFilePath()): number {
     return readZonePort(lane, file) ?? resolveZonePortBase(env);
 }

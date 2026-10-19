@@ -737,6 +737,24 @@ export class UnifiedStore {
         return { seq, tailSeqs: seqs };
     }
 
+    /** #3756 snapshot render: the sessions row's tail_json view — the seq
+     *  pointer list of the logical transcript view (lastMessages order at
+     *  save time). Unlike ingestWatermark this does NOT require a trusted
+     *  watermark; it just reads the pointer list. Null when absent/malformed
+     *  — the render lane degrades to legacy. */
+    tailSeqs(sessionId: string): number[] | null {
+        const row = this.db
+            .prepare("SELECT tail_json FROM sessions WHERE session_id = ?")
+            .get(sessionId) as { tail_json: string } | undefined;
+        if (!row) return null;
+        try {
+            const tail = JSON.parse(row.tail_json) as { tailSeqs?: number[] | null };
+            return Array.isArray(tail.tailSeqs) ? tail.tailSeqs : null;
+        } catch {
+            return null;
+        }
+    }
+
     /** #3166 review (heal half of the sampled-verify backstop): drop the
      *  durable watermark so the next save takes the exact full path and
      *  re-points every tail slot. Called when the read-back digest proves

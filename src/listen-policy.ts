@@ -18,6 +18,24 @@
  *  (#3044): the marked process must bind-or-die on exactly the freed port. */
 export const UPGRADE_REPLACEMENT_ENV = "BILI_UPGRADE_REPLACEMENT";
 
+/** #3654: the exit code a twin-collision loser reports to its spawner. The
+ *  duplicate still LOSES (#3044 — it cannot bind the port the serving twin
+ *  holds), but the code says WHY it died: the spawner reads it as an adopt
+ *  signal and attaches to the serving twin instead of failing the bring-up —
+ *  closing the #3654 contradiction where discovery judged the holder dead
+ *  (busy) while the twin rule proved it alive. Every other listen failure
+ *  keeps exit 1. */
+export const TWIN_ADOPT_EXIT_CODE = 3;
+
+export type FailFastReason = "upgrade-replacement" | "strict-port" | "port-busy" | "twin-collision";
+
+/** Pure exit-code mapping for a terminal EADDRINUSE decision — extracted so
+ *  the server (which calls process.exit) and its tests share one definition
+ *  without booting a listener (#3654). */
+export function eaddrinuseExitCode(reason: FailFastReason | undefined): number {
+    return reason === "twin-collision" ? TWIN_ADOPT_EXIT_CODE : 1;
+}
+
 type EaddrinuseAction =
     | { kind: "wait-predecessor"; port: number }
     /** nextPort 0 = ask the OS for an ephemeral port (ladder exhausted). */

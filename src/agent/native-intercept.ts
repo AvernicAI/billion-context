@@ -10,6 +10,7 @@ import { installFetchChain, isDeadClosureError, resetFetchChainForTest } from ".
 import { logHostEvent } from "./host-log.js";
 
 import { envMillis } from "./native-bootstrap.js";
+import { probeLiveness, type LivenessVerdict } from "../liveness.js";
 import { BILI_PASSTHROUGH_HEADER } from "../util.js";
 import { DSH_COMPACTION_MARKER_SNIFF } from "../server/dsh-compaction-guard.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, clearSignedRefusal, encodeApigCredential, inboundSignedScheme, recordSignedRefusal, resignEnabled, resignPassthroughEnabled, signedRefusal } from "../apig-resign.js";
@@ -29,6 +30,11 @@ export type DirectSendPrep =
     | { outcome: "restored"; body: string }
     | { outcome: "unrestorable" };
 
+/** #3654: why createLiveOriginResolver found nothing to route to — the
+ *  refusal wording must tell a live-but-saturated proxy (the busy wait window
+ *  exhausted) apart from a dead one or a failed bootstrap. */
+export type UnavailableReason = "busy-exhausted" | "dead" | "bootstrap-failed";
+
 export interface NativeInterceptState {
     /** Proxy origin ("http://127.0.0.1:PORT") once the bootstrap resolved.
      *  Written by the owner (pi-native.ts); read synchronously on each call. */
@@ -42,6 +48,11 @@ export interface NativeInterceptState {
      *  BILLION_CONTEXT_PROXY env) so event-time ownership checks disarm with
      *  the traffic. */
     onGiveUp?: () => void;
+    /** #3654: set before createLiveOriginResolver returns undefined — why
+     *  nothing was routable ("busy-exhausted" | "dead" | "bootstrap-failed");
+     *  cleared on the next successful resolution. The refusal builder reads it
+     *  to keep a live-but-saturated proxy out of "proxy unavailable" wording. */
+    lastUnavailableReason?: UnavailableReason;
     /** Attach mode (#809): route through a user-supplied external proxy at
      *  state.origin instead of a spawned one. Set by the host entry when a
      *  BILLION_CONTEXT_ATTACH / launcher-preset BILLION_CONTEXT_PROXY is
@@ -512,57 +523,80 @@ export async function observeRoutedOrigin(state: NativeInterceptState): Promise<
 // ———— Live-origin resolution (#1135) ——————————————————————————————
 // Shared by BOTH OpenCode lanes (the native entry's V2 route and the
 // launcher plugin's V2 route): each outgoing request resolves the LIVE proxy
-// origin — fast-path the held origin through a TTL-cached health probe, and
+// origin — fast-path the held origin through a TTL-cached liveness probe, and
 // when it is dead drive state.respawn (cooldown-gated unless we just lost an
 // origin we were actively routing to) and adopt whatever replacement lands.
-// A transient blip that recovers to the SAME origin costs nothing (the
-// session never migrates); a genuinely dead origin falls back to whatever the
-// owner's respawn produces (a self-spawned proxy, or another healthy shared
-// instance via discovery). Returns undefined when nothing is alive — callers
-// MUST degrade to direct sends, not fail-closed.
+// #3654: the probe is THREE-state (src/liveness.ts). Connect-refused = dead
+// (instant, unchanged fast path). Connected-but-no-health-answer = busy —
+// the event loop is saturated (a large compression in flight), NOT dead:
+// dropping a busy HELD origin would respawn into the SAME process
+// (twin-collision, #3044), so instead the origin is held and re-probed at a
+// jittered cadence inside a bounded wait window. A busy REPLACEMENT (just
+// respawned or adopted) is routed to anyway — its loop drains and the request
+// queues instead of failing for nothing. A transient blip that recovers to
+// the SAME origin costs nothing (the session never migrates); a genuinely
+// dead origin falls back to whatever the owner's respawn produces (a
+// self-spawned proxy, or another healthy shared instance via discovery).
+// Returns undefined when nothing is alive — callers MUST degrade to direct
+// sends, not fail-closed.
 
 const HEALTH_TIMEOUT_MS = 1500;
+/** #3654: total budget for re-probing a BUSY held origin before declaring it
+ *  lost. Deliberately far above HEALTH_TIMEOUT_MS: the point is to ride out
+ *  multi-second event-loop saturation (large compressions), not to widen the
+ *  single-shot probe. */
+const BUSY_WAIT_CAP_MS = 10_000;
+/** #3654: base interval between busy re-probes (jittered 0.5x–1.5x). */
+const BUSY_REPROBE_BASE_MS = 1_000;
 /** Probe-verdict trust window (#928). Far below RESPAWN_COOLDOWN_MS: that
  *  cooldown already assumes multi-second proxy stability, so a few-second
  *  detection horizon is consistent with it while removing the per-request RTT. */
 const HEALTH_PROBE_TTL_MS = 2_000;
 const RESPAWN_COOLDOWN_MS = 15_000;
 
-export async function probeHealth(origin: string): Promise<boolean> {
-    try {
-        const res = await fetch(`${origin}/__bili/health`, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
-        return res.ok;
-    } catch {
-        return false;
-    }
+/** Default liveness probe: GET /__bili/health under the single-shot budget —
+ *  now three-state (#3654): TCP connect refused classifies dead in
+ *  milliseconds instead of eating the whole budget. */
+async function probeOriginHealth(origin: string): Promise<LivenessVerdict> {
+    return probeLiveness(origin, HEALTH_TIMEOUT_MS);
 }
 
-/** Wrap a probe in a per-origin TTL cache (#928). Both verdicts are cached: a
- *  healthy hit skips the steady-state loopback RTT; a dead hit avoids re-paying
- *  the full HEALTH_TIMEOUT_MS on every request across the death+cooldown window.
- *  Stale entries for other origins are evicted on insert, keeping the map bounded. */
-function withProbeTtl(probe: (origin: string) => Promise<boolean>, ttlMs: number): (origin: string) => Promise<boolean> {
-    const cache = new Map<string, { ok: boolean; at: number }>();
+/** Wrap a probe in a per-origin TTL cache (#928). Only DEFINITE verdicts are
+ *  cached: alive skips the steady-state loopback RTT; dead avoids re-paying
+ *  the full HEALTH_TIMEOUT_MS on every request across the death+cooldown
+ *  window. BUSY is never cached — a saturation episode ends within seconds and
+ *  caching it would solidify "slow" into "dead" (#3654). Stale entries for
+ *  other origins are evicted on insert, keeping the map bounded. */
+function withProbeTtl(probe: (origin: string) => Promise<LivenessVerdict>, ttlMs: number): (origin: string) => Promise<LivenessVerdict> {
+    const cache = new Map<string, { verdict: LivenessVerdict; at: number }>();
     return (origin) => {
         const now = Date.now();
         const hit = cache.get(origin);
-        if (hit !== undefined && now - hit.at < ttlMs) return Promise.resolve(hit.ok);
-        return probe(origin).then((ok) => {
+        if (hit !== undefined && now - hit.at < ttlMs) return Promise.resolve(hit.verdict);
+        return probe(origin).then((verdict) => {
             const t = Date.now();
             for (const [key, entry] of cache) if (t - entry.at >= ttlMs) cache.delete(key);
-            cache.set(origin, { ok, at: t });
-            return ok;
+            if (verdict.state !== "busy") cache.set(origin, { verdict, at: t });
+            return verdict;
         });
     };
 }
 
 export interface LiveOriginResolverDeps {
-    /** Injectable health probe (tests); defaults to GET /__bili/health. */
-    probe?: (origin: string) => Promise<boolean>;
+    /** Injectable liveness probe (tests); defaults to probeLiveness over
+     *  /__bili/health under HEALTH_TIMEOUT_MS. Legacy boolean probes stay
+     *  accepted (true → alive, false → dead). */
+    probe?: (origin: string) => Promise<LivenessVerdict | boolean>;
     /** Bootstrap retry interval when no live origin is held (tests shrink it). */
     respawnCooldownMs?: number;
     /** Probe-verdict cache TTL; defaults to HEALTH_PROBE_TTL_MS (tests shrink it). */
     probeTtlMs?: number;
+    /** #3654: busy-wait budget for a saturated HELD origin; defaults to
+     *  BUSY_WAIT_CAP_MS (tests shrink it). */
+    busyWaitCapMs?: number;
+    /** #3654: base interval between busy re-probes; defaults to
+     *  BUSY_REPROBE_BASE_MS (tests shrink it). */
+    busyReprobeBaseMs?: number;
 }
 
 /** Build the per-request live-origin resolver over a shared intercept state.
@@ -578,27 +612,89 @@ export function createLiveOriginResolver(state: NativeInterceptState, deps: Live
     // cache is rebuilt (kills cached verdicts) and `generation` advances
     // (kills in-flight verdicts, which must not clear a healthy
     // replacement that already landed).
-    const healthProbe = deps.probe ?? probeHealth;
+    const rawProbe = deps.probe ?? probeOriginHealth;
+    const probeFn = (origin: string): Promise<LivenessVerdict> => rawProbe(origin).then((v) => typeof v === "boolean" ? { state: v ? "alive" : "dead" } : v);
     const probeTtlMs = deps.probeTtlMs ?? HEALTH_PROBE_TTL_MS;
-    let probe = withProbeTtl(healthProbe, probeTtlMs);
+    let probe = withProbeTtl(probeFn, probeTtlMs);
     let generation = 0;
     const respawnCooldownMs = deps.respawnCooldownMs ?? RESPAWN_COOLDOWN_MS;
+    const busyWaitCapMs = deps.busyWaitCapMs ?? BUSY_WAIT_CAP_MS;
+    const busyReprobeBaseMs = deps.busyReprobeBaseMs ?? BUSY_REPROBE_BASE_MS;
     let lastRespawn = 0;
+    // #3654: one entry per busy episode per origin (attempt count) so the log
+    // announces an episode ONCE (the first caller that sees it) and concurrent
+    // callers in the same episode only count attempts.
+    const busyEpisodes = new Map<string, { attempts: number }>();
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
     return async (): Promise<string | undefined> => {
         let ownedThenLost = false;
+        let lossReason: UnavailableReason | undefined;
         const held = state.origin;
         const gen = generation;
         if (held !== undefined) {
-            const ok = await probe(held);
+            const v = await probe(held);
             // Act on the verdict only if the world didn't move while it was
             // in flight: a concurrent caller's respawn (generation bump) or
             // any origin change underneath us voids it — re-resolve instead.
             if (gen === generation && state.origin === held) {
-                if (ok) return held;
-                // Proxy died mid-session. Clearing origin first makes concurrent
-                // callers share the same state.ready (dedup).
-                ownedThenLost = true;
-                state.origin = undefined;
+                if (v.state === "alive") {
+                    state.lastUnavailableReason = undefined;
+                    return held;
+                }
+                if (v.state === "dead") {
+                    logHostEvent("info", "[native-client]", `bili-native: liveness: ${held} dead (${v.detail ?? "no answer"}) — clearing origin`);
+                    // Proxy died mid-session. Clearing origin first makes concurrent
+                    // callers share the same state.ready (dedup).
+                    ownedThenLost = true;
+                    lossReason = "dead";
+                    state.origin = undefined;
+                } else {
+                    // #3654: BUSY — TCP connect succeeded but /__bili/health never
+                    // answered within the budget: the event loop is saturated
+                    // (typically a large compression), not dead. Dropping this
+                    // origin would respawn into the SAME process (twin-collision,
+                    // #3044); ride out the episode instead.
+                    const freshEpisode = !busyEpisodes.has(held);
+                    const ep = busyEpisodes.get(held) ?? { attempts: 0 };
+                    busyEpisodes.set(held, ep);
+                    if (freshEpisode) {
+                        logHostEvent("info", "[native-client]", `bili-native: liveness: ${held} BUSY (${v.detail ?? "no health answer"}) — holding origin, re-probing (budget ${busyWaitCapMs}ms) (#3654)`);
+                    }
+                    const deadline = Date.now() + busyWaitCapMs;
+                    for (;;) {
+                        if (Date.now() >= deadline) break;
+                        const jitter = 0.5 + Math.random(); // 0.5x–1.5x
+                        await sleep(Math.min(busyReprobeBaseMs * jitter, Math.max(0, deadline - Date.now())));
+                        if (gen !== generation || state.origin !== held) break;
+                        ep.attempts += 1;
+                        const again = await probe(held);
+                        if (gen !== generation || state.origin !== held) break;
+                        if (again.state === "alive") {
+                            busyEpisodes.delete(held);
+                            logHostEvent("info", "[native-client]", `bili-native: liveness: ${held} alive again after ${ep.attempts} busy re-probe(s)`);
+                            state.lastUnavailableReason = undefined;
+                            return held;
+                        }
+                        if (again.state === "dead") {
+                            busyEpisodes.delete(held);
+                            logHostEvent("info", "[native-client]", `bili-native: liveness: ${held} dead during busy episode (${again.detail ?? "no answer"}, attempt ${ep.attempts}) — respawning`);
+                            ownedThenLost = true;
+                            lossReason = "dead";
+                            state.origin = undefined;
+                            break;
+                        }
+                        logHostEvent("info", "[native-client]", `bili-native: liveness: ${held} still busy — re-probe attempt ${ep.attempts}`);
+                    }
+                    if (state.origin === held && gen === generation) {
+                        // Window exhausted while still busy: lost-for-this-request,
+                        // but record WHY so the refusal says "saturated", not "dead".
+                        busyEpisodes.delete(held);
+                        logHostEvent("warn", "[native-client]", `bili-native: liveness: ${held} still busy after ${ep.attempts} re-probe(s) over ${busyWaitCapMs}ms — letting go, respawning (#3654)`);
+                        ownedThenLost = true;
+                        lossReason = "busy-exhausted";
+                        state.origin = undefined;
+                    }
+                }
             }
         }
         // Retry bootstrap whenever no live origin is held — either just lost
@@ -608,11 +704,31 @@ export function createLiveOriginResolver(state: NativeInterceptState, deps: Live
         if (state.respawn !== undefined && (ownedThenLost || Date.now() - lastRespawn >= respawnCooldownMs)) {
             lastRespawn = Date.now();
             generation += 1;
-            probe = withProbeTtl(healthProbe, probeTtlMs);
+            probe = withProbeTtl(probeFn, probeTtlMs);
+            // Same generation boundary as the verdict-cache rebuild above: a
+            // post-respawn busy episode behind the same origin must announce
+            // itself instead of inheriting a stale pre-respawn episode entry.
+            busyEpisodes.clear();
             state.ready = state.respawn();
         }
         const o = await readyOrigin(state);
-        if (o !== undefined && (await probe(o))) return o;
+        if (o !== undefined) {
+            const v = await probe(o);
+            if (v.state === "alive") {
+                state.lastUnavailableReason = undefined;
+                return o;
+            }
+            if (v.state === "busy") {
+                // #3654: a just-landed replacement that is already busy is still
+                // ALIVE — routing to it queues the request behind the saturating
+                // fold; refusing here would fail the very request the adoption
+                // existed to save.
+                logHostEvent("info", "[native-client]", `bili-native: liveness: replacement ${o} BUSY (${v.detail ?? "no health answer"}) — routing anyway, the request will queue (#3654)`);
+                state.lastUnavailableReason = undefined;
+                return o;
+            }
+        }
+        state.lastUnavailableReason = lossReason ?? "bootstrap-failed";
         if (ownedThenLost) state.onGiveUp?.();
         return undefined;
     };

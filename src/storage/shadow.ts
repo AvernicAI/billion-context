@@ -28,6 +28,7 @@ import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSumma
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
+import type { MessageRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 export const MAX_CONSECUTIVE_FAILURES = 3;
@@ -381,6 +382,24 @@ export class UnifiedShadow {
     rawMessages(sessionId: string): { seq: number; content: string }[] {
         this.assertLive();
         return this.store.getMessages(sessionId).map((m) => ({ seq: m.seq, content: m.content }));
+    }
+
+    /** #3756 snapshot render: the logical view's seq pointer list
+     *  (tail_json.tailSeqs). Null when absent/malformed. */
+    tailSeqs(sessionId: string): number[] | null {
+        this.assertLive();
+        return this.store.tailSeqs(sessionId);
+    }
+
+    /** #3756 snapshot render: full row view (id/ref/hash included) of the
+     *  unified transcript in seq order — the render source for the outbound
+     *  prefix. Same rows as rawMessages, plus the identity columns the
+     *  coverage matcher needs (msgId for fast path, ref for the
+     *  upgrade-tolerant interval path, contentHash for the exact-content
+     *  dedup path). */
+    tailViewRows(sessionId: string): MessageRow[] {
+        this.assertLive();
+        return this.store.getMessages(sessionId);
     }
 
     sessionSummaries(): SessionSummaryRow[] {

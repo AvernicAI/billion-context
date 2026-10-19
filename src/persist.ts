@@ -1294,6 +1294,30 @@ export class SessionStore {
         }
     }
 
+    /** #3756 snapshot render: the logical transcript view's seq pointers
+     *  (tail_json.tailSeqs). Null when the unified store is unavailable. */
+    unifiedTailSeqs(sessionId: string): number[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.tailSeqs(sessionId);
+        } catch {
+            return null;
+        }
+    }
+
+    /** #3756 snapshot render: full-identity row view of the unified
+     *  transcript (msgId/ref/refNum/contentHash included) in seq order.
+     *  Null when the unified store is unavailable — the render lane must
+     *  degrade to the legacy path, never guess. */
+    unifiedTailViewRows(sessionId: string): import("./storage/store.js").MessageRow[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.tailViewRows(sessionId);
+        } catch {
+            return null; // sidecar degraded mid-call: treat as unavailable
+        }
+    }
+
     /** #2960 R2.1: summary rows for list surfaces (CLI export, web exposure
      *  tick). Full mode only — in shadow the JSON tree is the truth base and
      *  rows may lag files never yet recorded, so list surfaces must walk.
