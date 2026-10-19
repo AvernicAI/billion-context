@@ -34,7 +34,9 @@ function rangeKey(startRef: string, endRef: string): string {
 
 // Numeric position of a padded ref (mNNNNN -> NNNNN); null when unmapped/blocked
 // so the caller treats it as "position unknown" and never sweeps on a guess.
-function refNum(ref: string | undefined): number | null {
+// Exported: applyCompression derives the fold sweep marker from covered message
+// refs through the same helper so both sides agree on "unknown" (#3769).
+export function refNum(ref: string | undefined): number | null {
   if (!ref || ref === BLOCKED_REF) return null;
   const n = Number(ref.replace(/\D/g, ""));
   return Number.isFinite(n) ? n : null;

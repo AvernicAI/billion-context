@@ -187,3 +187,48 @@ test("a real fold writes the sweep marker and the next pass removes the orphan b
   assert.deepEqual(r.newlySweptCallIds, ["f1"], "orphan behind the fold is swept");
   assert.ok(!r.messages.some((m) => m.toolCallId === "f1"), "swept orphan removed from outbound");
 });
+
+test("a block-boundary fold marks the sweep by covered message refs, not the block number (#3769)", () => {
+  const core = createCore();
+  const messages: CoreMessage[] = [
+    msg("p1", "early cached prefix alpha"),
+    ...failPair("f1"),
+    msg("p2", "mid detailed work item beta content"),
+    msg("p3", "mid detailed work item gamma content"),
+    msg("p4", "mid detailed work item delta content"),
+    msg("p5", "mid detailed work item epsilon content"),
+    msg("p6", "latest user intent theta"),
+  ];
+  const state = createInitialState();
+  state.messageRefs = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+  }).map;
+  // refs: p1=1 c-f1=2 r-f1=3 p2=4 p3=5 p4=6 p5=7 p6=8
+
+  const first = core.applyCompression({
+    ranges: [{ startRef: "m00004", endRef: "m00005", summary: "fold the mid pair", topic: "mid" }],
+    messages,
+    state,
+    config: config(),
+  });
+  assert.equal(first.result.errors.length, 0, `unexpected errors: ${first.result.errors.join("; ")}`);
+  assert.ok(first.result.blocksCreated >= 1, "the mid pair folds");
+  const blockId = first.state.blocks[first.state.blocks.length - 1].blockId;
+
+  const out = core.applyCompression({
+    ranges: [{ startRef: blockId, endRef: "m00006", summary: "distill the block plus its tail", topic: "distill" }],
+    messages,
+    state: first.state,
+    config: config(),
+  });
+  assert.equal(out.result.errors.length, 0, `unexpected errors: ${out.result.errors.join("; ")}`);
+  assert.ok(out.result.blocksCreated >= 1, "the block-boundary range folds");
+  // Parsing the new block's startRef string ("b1") yields the BLOCK number 1, which
+  // would sweep the cached-prefix orphan f1 (ref 2). Covered-ref derivation must say 4.
+  assert.equal(out.state.pendingOrphanSweepMinRef, 4, "marker sits at the earliest covered message ref");
+
+  const r = hideConsumedCompressCalls(out.state, messages, isMcp);
+  assert.deepEqual(r.newlySweptCallIds, [], "cached-prefix orphan before the fold is untouched");
+  assert.ok(r.messages.some((m) => m.toolCallId === "f1"), "f1 remains visible");
+});

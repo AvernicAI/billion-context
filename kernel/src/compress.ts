@@ -14,7 +14,7 @@ import {
 import type { ResolvedRange } from "./boundaries.js";
 import { truncateLargeToolOutputs } from "./truncate-tools.js";
 import { scrubLoneSurrogates } from "./truncate.js";
-import { hideConsumedCompressCalls } from "./hide-consumed.js";
+import { hideConsumedCompressCalls, refNum } from "./hide-consumed.js";
 import { appendAbsorbPrompts, hideAbsorbedMessages } from "./absorb.js";
 import { applyCrushToMessages } from "./crush.js";
 import { applyRetrieve, ccrStoreNode, RETRIEVED_ID_PREFIX } from "./ccr.js";
@@ -674,16 +674,24 @@ export function createCore(ports: Ports = {}): CompressionCore {
     state.stats.tokensCompressed += tokensCompressed;
 
     if (blocksCreated > 0) {
-      // #3769: record where THIS fold starts (min over the newly-created
-      // blocks' startRef) so the next processTurn sweeps orphan failures at/after
-      // it cache-neutrally, leaving orphans before it in the still-cached prefix.
-      // Kept as the running min across folds that commit before a sweep consumes it.
+      // #3769: record where THIS fold starts so the next processTurn sweeps
+      // orphan failures at/after it cache-neutrally, leaving orphans before it
+      // in the still-cached prefix. Kept as the running min across folds that
+      // commit before a sweep consumes it. The position comes from the covered
+      // message refs of each new block, NOT its startRef string: a block-boundary
+      // spec stores startRef="bN", whose digits are a BLOCK number, not a message
+      // position — parsing it would mark the sweep far too early and rewrite the
+      // still-cached prefix (#3769 again). refNum returns null for unmapped/blocked
+      // ids, so a fully-pruned coverage simply sets no marker (under-sweep is safe;
+      // over-sweep is not).
       let foldStartRef: number | undefined;
       for (const b of state.blocks) {
         if (preFoldBlockIds.has(b.blockId)) continue;
-        const n = Number((b.startRef ?? "").replace(/\D/g, ""));
-        if (Number.isFinite(n) && (foldStartRef === undefined || n < foldStartRef)) {
-          foldStartRef = n;
+        for (const id of b.effectiveMessageIds) {
+          const num = refNum(state.messageRefs.byRaw[id]);
+          if (num !== null && (foldStartRef === undefined || num < foldStartRef)) {
+            foldStartRef = num;
+          }
         }
       }
       if (foldStartRef !== undefined) {
