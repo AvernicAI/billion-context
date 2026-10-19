@@ -262,6 +262,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.reasoningGuard` | object | off | — | Auto-repair of reasoning-lattice truncation on gpt-5.x/6.x (up to 3 continue-nudge rounds). |
 | `compress.outputSteering` | object { enabled?, verbosityLevel?, effortRouting? } | enabled false · verbosityLevel 2 | — | Appends a conciseness directive to the system-prompt tail; clamps mechanical continuation requests. |
 | `compress.priceProfile` | { w?, r?, q? } | unset (registry, kernel fallback {1, 0.1, 4}) | — | w/r/q ratios normalized to the input price (write/cache-read/output); report-only — never affects triggers or the wire. |
+| `compress.externalSummary` | object | opt-in (disabled) | — | Sends compression summaries to separately configured models referenced from the providers table; whole-chain replace semantics at all three compress levels. |
 | `compress.acknowledgePromptsRisk` | boolean | false | — | Must be true before custom prompts take effect. |
 | `compress.absorb.enabled` | boolean | false | — | Enable the absorb distillation block. |
 | `compress.absorb.minToolTokens` | number | 1000 | — | Minimum estimated token size of a tool result eligible for absorption. |

@@ -262,6 +262,7 @@
 | `compress.reasoningGuard` | object | off | — | gpt-5.x/6.x 推理格截断自动修复（最多 3 轮继续提示）。 |
 | `compress.outputSteering` | object { enabled?, verbosityLevel?, effortRouting? } | enabled false · verbosityLevel 2 | — | 向系统提示词尾部附加简洁度指令；只收紧机械延续请求。 |
 | `compress.priceProfile` | { w?, r?, q? } | unset (registry, kernel fallback {1, 0.1, 4}) | — | w/r/q 相对输入价的比率（写入/缓存读/输出）；仅供报告，不影响触发条件或线上行为。 |
+| `compress.externalSummary` | object | opt-in (disabled) | — | 把压缩摘要交给 providers 表引用的独立配置模型；三级 compress 均为整链替换语义。 |
 | `compress.acknowledgePromptsRisk` | boolean | false | — | 必须先置 true，自定义 prompts 才会生效。 |
 | `compress.absorb.enabled` | boolean | false | — | 启用 absorb 蒸馏块。 |
 | `compress.absorb.minToolTokens` | number | 1000 | — | 可被吸收的工具结果的最小估算 token 大小。 |
