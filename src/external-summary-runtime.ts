@@ -41,7 +41,11 @@ export class ConfiguredSummaryPlan {
         // instead of a credentialRef.
         this.settings = parseExternalSummarySettings(raw, { inlineKeys: true });
         this.sessionId = sessionId;
-        this.fingerprint = externalSummaryFingerprint(this.settings);
+        // Fingerprint the RAW chain, not the parsed settings: the latch
+        // consumers (catch paths, lane nudge render) see the unresolved rail
+        // chain, and parseExternalSummarySettings fills defaults / normalizes
+        // URLs, which would make the two fingerprints disagree (#3638 review).
+        this.fingerprint = externalSummaryFingerprint(raw);
         this.targetLabels = this.settings.targets.map((target) => ({ name: target.name, protocol: target.protocol, model: target.model }));
         this.onBatch = options?.onBatch;
         const proxyUrl = env.BILI_UPSTREAM_PROXY?.trim() || undefined;
