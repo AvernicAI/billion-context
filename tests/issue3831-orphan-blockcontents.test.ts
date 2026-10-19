@@ -43,14 +43,29 @@ test("full-mode reload restores archived originals the unified view drops (#3831
     session.blockContents.set("b1", { one: null, full: { text: "archived original\r\n", count: 1 } });
     await store.writeNow(session);
     const booted = await store.boot({ maxSessions: 8, maxBytes: 40000 });
-    // Boot warm path (buildForLoadAll): the warmed session must carry the
-    // original bytes, not the lossy view.
+    // Bounded-boot warm loop (loadSync per warmed id — production boot always
+    // passes limits): the warmed session must carry the original bytes, not
+    // the lossy view.
     assert.deepEqual(booted.get("ses_orphan")?.blockContents.get("b1"), session.blockContents.get("b1"));
     // Cold path (loadSync): same guarantee after the index row exists.
     const loaded = store.loadSync("ses_orphan");
     assert.equal(loaded?.id, "ses_orphan");
     assert.deepEqual(loaded?.state.messageRefs, session.state.messageRefs);
     assert.deepEqual(loaded?.blockContents.get("b1"), { one: null, full: { text: "archived original\r\n", count: 1 } });
+}));
+
+test("full-mode unlimited boot/export (buildForLoadAll) restores archived originals (#3831)", async () => fullFixture(async (_dir, store) => {
+    // Third serving leg: no-limits boot (and the session export that shares
+    // loadAll) imports the parsed envelope and serves the view — the same
+    // orphan-drop exposure, pinned separately because production boot always
+    // passes limits (bootBounded → loadSync).
+    const session = createSession("ses_orphan_ub", { label: "ses_orphan_ub" });
+    session.state.messageRefs.byRaw["old-message"] = "m00001";
+    session.state.messageRefs.byRef["m00001"] = "old-message";
+    session.blockContents.set("b1", { one: null, full: { text: "archived original\r\n", count: 1 } });
+    await store.writeNow(session);
+    const booted = await store.boot();
+    assert.deepEqual(booted.get("ses_orphan_ub")?.blockContents.get("b1"), { one: null, full: { text: "archived original\r\n", count: 1 } });
 }));
 
 test("full mode without orphaned originals keeps serving the unified index (#3831 negative)", async () => fullFixture(async (dir, store) => {
