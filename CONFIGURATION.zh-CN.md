@@ -1959,7 +1959,7 @@ launcher 命令里 `--` 之后的参数原样透传给客户端（`bili pi -- pr
 
 ### 会话清理（`bili sessions`）(#3830)
 
-sessions 目录会无界增长：默认 `shadow` 双写下每个会话同时存在于 JSON 信封与 `index.db` 行（共享内容 CAS），且没有任何自动删除或自动 VACUUM。`bili sessions` 是受支持的减重入口，**独立运行**——直接对 sessions 目录开 store，不需要代理在跑——也不触碰其他会话的状态。
+sessions 目录会无界增长：统一存储双写下（默认——`full` + `jsonWriter` on，或 `shadow`）每个会话同时存在于 JSON 信封与 `index.db` 行（共享内容 CAS），且没有任何自动删除或自动 VACUUM。`bili sessions` 是受支持的减重入口，**独立运行**——直接对 sessions 目录开 store，不需要代理在跑——也不触碰其他会话的状态。
 
 - **`bili sessions ls [--with-sizes]`** —— 列出所有可枚举会话（统一索引 ∪ JSON 树）。`--with-sizes` 时附带：每会话 JSON 信封字节、`index.db` 行数、内联 JSON 列字节、独占 CAS blob 字节（与他会话共享的 blob 只计一次，不重复归属）、`index.db` + WAL 总大小。
 - **`bili sessions rm <id> [--force] [--no-vacuum]`** —— 走启动期 rekey/去重同一条受支持路径删除单个会话：先删统一边车（`deleteSession` 级联删全部相关表并释放内容 CAS 引用计数），再删信封文件（无论它在命名空间、`_unknown/` 还是平铺位置）。默认随后缩小 `index.db`（WAL 模式顺序：先 VACUUM 再 checkpoint-TRUNCATE——顺序反了文件大小不会变小）；`--no-vacuum` 跳过。成功退出码 0，拒绝/未找到为 1。
