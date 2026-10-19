@@ -963,6 +963,7 @@ export class SessionStore {
             if (view && !this.originalsLostInView(payload, view)) {
                 return buildSession(viewToRecord(view));
             }
+            if (view) this.logOrphanFallback(id);
         }
         return buildSession(payload);
     }
@@ -1199,7 +1200,7 @@ export class SessionStore {
                 if (!(envelope && this.originalsLostInView(envelope.payload, unified))) {
                     return this.afterLoad(id, unified);
                 }
-                this.log("warn", `[persist] ${id}: unified view dropped archived original(s) the legacy envelope still holds — serving the envelope instead (#3831)`);
+                this.logOrphanFallback(id);
                 return this.serveFromEnvelope(id, envelope);
             }
             // Miss (or sidecar failure): organic import from the legacy file,
@@ -1214,6 +1215,7 @@ export class SessionStore {
                 if (view && !this.originalsLostInView(envelope.payload, view)) {
                     return this.afterLoad(id, view);
                 }
+                if (view) this.logOrphanFallback(id);
             }
             return this.serveFromEnvelope(id, envelope);
         }
@@ -1260,6 +1262,14 @@ export class SessionStore {
         if (recKeys.length === 0) return false;
         const viewKeys = new Set(view.blockContents.keys());
         return recKeys.some((k) => !viewKeys.has(k));
+    }
+
+    /** One warn per #3831 escape-hatch firing — all three full-mode serving
+     *  paths (loadSync unified hit, loadSync import miss, buildForLoadAll
+     *  boot/export warm-up) route through it so a grep for the marker finds
+     *  every session served from the envelope for orphan-drop reasons. */
+    private logOrphanFallback(id: string): void {
+        this.log("warn", `[persist] ${id}: unified view dropped archived original(s) the legacy envelope still holds — serving the envelope instead (#3831)`);
     }
 
     /** Shared post-load fixups for the unified read path: rebuilds the
