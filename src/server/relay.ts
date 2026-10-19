@@ -19,13 +19,15 @@ import { buildAbsorbSystemPrompt, buildCompressHybridSystemPrompt, buildCompress
 import { findRoute, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { makeContinuationRefetch } from "../degenerate-retry.js";
 import { dumpRejectedBody } from "../error-dump.js";
+import { extractWsOversizeError, formatMiB, shedEgressIfOverBudget, shedWireImages, type ShedStats } from "../egress-shed.js";
 import { externalSummaryEnabled } from "../external-summary-surface.js";
 import { fakeBufCap, injectFakeCompletionHint, isFakeCompletion, maxFakeCompletionRetries } from "../fake-completion.js";
 import { fetchWithTimeout, fetchWithTransportRetry } from "../fetch-util.js";
 import { currentFetchTransport } from "../fetch-transport.js";
+import { refForItemBytes } from "../image-rescale.js";
 import { countImagesInRawBody, upstreamHost } from "../image-tokens.js";
 import { log as loggerLog } from "../logger.js";
-import { dumpReqAllowed as knobDumpReqAllowed, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { dumpReqAllowed as knobDumpReqAllowed, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
 import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskUrlForLog } from "../log-mask.js";
@@ -167,6 +169,17 @@ function armFailureShrink(prepared: Prepared, log: (level: string, msg: string) 
         markDirty(s);
         log("warn", `[${s.id}] ${reason} with no usage report — armed emergency shrink with local estimate ${est} tokens`);
     }
+}
+
+/** #3701: user-visible diagnosis for an unrecoverable WS size rejection — names the
+ *  exact bytes, why shedding could not fit, and the current budget for context.
+ *  Deliberately does NOT suggest raising the budget: the gateway just proved it
+ *  rejects this size, so a bigger budget would only send the fat frame again. */
+function wsOversizeDiagnosis(sentBytes: number, stats: ShedStats | undefined, budget: number): string {
+    const why = !stats || (!stats.archived && !stats.downscaled)
+        ? "no sheddable images outside the protected recent messages"
+        : `shedding removed ${formatMiB(Math.max(0, sentBytes - stats.finalBytes))} MiB but the remainder is protected recent content`;
+    return `WS upstream rejected the ${formatMiB(sentBytes)} MiB request with close 1009 (zero events received) and the payload cannot be reduced further (${why}). Trim older images/history so the frame fits under the wire limit (current pre-send budget: ${budget > 0 ? `${formatMiB(budget)} MiB` : "disabled"} — network.wsOutboundBytes / BILI_WS_OUTBOUND_BYTES).`;
 }
 
 // #3434: upstream accepted the request then sent no bytes — the log shows
@@ -527,6 +540,15 @@ export async function forward(
         } catch (err) { logDumpFailure("REQ dump", err); }
     }
     const dispatcher = proxyDispatcher(proxyUrl);
+    // #3701: WS-lane soft byte budget — shed older images from the OUTBOUND COPY before
+    // signing, so an oversized frame never reaches the gateway (it answers close 1009 with
+    // zero events, and no retry can fix a size rejection without a smaller payload). Runs
+    // only when this request actually rides the WebSocket transport and only above
+    // network.wsOutboundBytes; HTTP lanes are untouched.
+    if (prepared && !prepared.sidePassthrough && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
+        const shed = await shedEgressIfOverBudget(wireBody, prepared.protocol, { sessionId: prepared.session.id, session: prepared.session, log, phase: "pre-send" });
+        wireBody = shed.body;
+    }
     // #1884: sign the FINAL wire body right before the send — everything
     // upstream of this point (prepare* injection, compat, steering) already
     // mutated it, so any inbound signature is stale here.
@@ -657,6 +679,10 @@ export async function forward(
         throw new Error(`upstream circuit open: ${circuitBlock}`);
     }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
+    // #3701: the catch below replaces upstreamResult on a shrunken resend; capture the
+    // FIRST attempt's timer handle separately because upstreamResult may never have been
+    // assigned by the time a send failure lands in the catch.
+    let firstAttemptClear: (() => void) | undefined;
     try {
         const lane = prepared?.sidePassthrough ? "side" : prepared ? "main" : "passthrough";
         const fetchPromise = fetchWithTransportRetry(upstreamUrl, init, undefined, clientAbort.signal, (info) => {
@@ -665,6 +691,7 @@ export async function forward(
         const firstByteTimer = armFirstByteWatchdog({ url: upstreamUrl, method: req.method ?? "UNKNOWN", lane, sessionId: prepared?.session.id ?? "passthrough", log, signal: clientAbort.signal });
         try {
             upstreamResult = await fetchPromise;
+            firstAttemptClear = upstreamResult.clearTimer;
         } finally {
             clearTimeout(firstByteTimer);
         }
@@ -673,17 +700,76 @@ export async function forward(
         clearUpstreamAlertsForHost(upstreamUrl);
         recordUpstreamCircuitSuccess(upstreamUrl);
     } catch (error) {
+        const oversize = extractWsOversizeError(error);
+        if (oversize === undefined) {
+            recordUpstreamConnection(upstreamUrl, proxyUrl, error, skippedProxy);
+            recordUpstreamAlert(upstreamUrl, error, proxyUrl !== undefined, skippedProxy);
+            const failureDetail = formatUpstreamError(error, upstreamUrl, proxyUrl, skippedProxy);
+            recordUpstreamCircuitFailure(upstreamUrl, error, proxyUrl !== undefined, failureDetail);
+            // #604: a network-level failure (socket reset, timeout abort) also never
+            // reports usage — arm the emergency shrink like the 5xx branch below.
+            if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
+            // [#1343] no response means the attached full text never reached the model —
+            // drop-and-log it (a corrective note surfaces on the next qualifying request).
+            if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
+            throw new Error(`upstream request failed: ${failureDetail}`, { cause: error });
+        }
+        // #3701: close 1009 with ZERO events received is a verdict on our frame SIZE, not
+        // on endpoint health — the same gateway answers smaller frames fine. Deliberately
+        // NOT counted as an alert/circuit failure (legacy behavior bricked a healthy
+        // endpoint over one oversized session; behavior change, see PR notes). Arm the
+        // token-space shrink for visibility, then try ONE bounded byte-shrink resend that
+        // must be strictly smaller than what was just rejected.
         recordUpstreamConnection(upstreamUrl, proxyUrl, error, skippedProxy);
-        recordUpstreamAlert(upstreamUrl, error, proxyUrl !== undefined, skippedProxy);
-        const failureDetail = formatUpstreamError(error, upstreamUrl, proxyUrl, skippedProxy);
-        recordUpstreamCircuitFailure(upstreamUrl, error, proxyUrl !== undefined, failureDetail);
-        // #604: a network-level failure (socket reset, timeout abort) also never
-        // reports usage — arm the emergency shrink like the 5xx branch below.
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
-        // [#1343] no response means the attached full text never reached the model —
-        // drop-and-log it (a corrective note surfaces on the next qualifying request).
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
-        throw new Error(`upstream request failed: ${failureDetail}`, { cause: error });
+        const sentBytes = typeof wireBody === "string" ? Buffer.byteLength(wireBody) : 0;
+        const budget = limitsWsOutboundBytes();
+        const target = Math.min(sentBytes * 0.85, budget > 0 ? budget : Number.MAX_SAFE_INTEGER);
+        if (prepared === null || prepared === undefined || prepared.sidePassthrough || prepared.protocol === undefined || typeof wireBody !== "string" || sentBytes <= 0 || !res.writable || res.writableEnded || res.destroyed) {
+            throw new Error(wsOversizeDiagnosis(sentBytes, undefined, budget));
+        }
+        const shedSession = prepared.session;
+        const { body: shrunk, stats } = await shedWireImages(wireBody, prepared.protocol, target, { resolveRef: (mt, b64) => refForItemBytes(shedSession, mt, b64) });
+        if (!stats.changed || stats.finalBytes >= sentBytes) throw new Error(wsOversizeDiagnosis(sentBytes, stats, budget));
+        log("info", `[${prepared.session.id}] [ws-byte-shed] upstream closed 1009 with zero events at ${formatMiB(sentBytes)} MiB — shed to ${formatMiB(stats.finalBytes)} MiB (archived=${stats.archived} downscaled=${stats.downscaled}), resending once within this request`);
+        try {
+            const shrunkWire = scrubLoneSurrogatesOnWire(shrunk);
+            applyResign(headers, shrunkWire);
+            const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(shrunkWire) }, undefined, clientAbort.signal);
+            if (retried.response.ok) {
+                firstAttemptClear?.();
+                wireBody = shrunkWire;
+                upstreamResult = retried;
+                prepared.session.metadata.wsByteShed = { at: Date.now(), phase: "post-1009", fromBytes: sentBytes, toBytes: stats.finalBytes, archived: stats.archived, downscaled: stats.downscaled };
+                markDirty(prepared.session);
+                log("info", `[${prepared.session.id}] [ws-byte-shed] 1009 recovered: shrunken resend accepted within the same request (${formatMiB(sentBytes)} -> ${formatMiB(stats.finalBytes)} MiB)`);
+            } else {
+                let retryErrText: string | null = null;
+                if (retried.response.body) {
+                    try {
+                        retryErrText = (await readStreamToBuffer(retried.response.body)).toString("utf8");
+                    } catch {
+                        retryErrText = null;
+                    }
+                }
+                // Answer with the retry's own verdict, not the lost first frame (#1195 shape).
+                firstAttemptClear?.();
+                upstreamResult = {
+                    response: new Response(retryErrText ?? "", {
+                        status: retried.response.status,
+                        statusText: retried.response.statusText,
+                        headers: new Headers(retried.response.headers),
+                    }),
+                    clearTimer: retried.clearTimer,
+                    stopIdleTimer: retried.stopIdleTimer,
+                };
+                log("warn", `[${prepared.session.id}] [ws-byte-shed] shrunken resend still rejected (HTTP ${retried.response.status}); passing the retry response through`);
+            }
+        } catch (retryErr) {
+            log("warn", `[${prepared?.session.id ?? "unknown"}] [ws-byte-shed] shrunken resend failed: ${formatUpstreamError(retryErr, upstreamUrl, proxyUrl, skippedProxy)}`);
+            throw new Error(wsOversizeDiagnosis(sentBytes, stats, budget), { cause: retryErr });
+        }
     }
     // #552 learn-on-failure: a converting upstream that rejects a role (codex
     // ≥0.153 sends "developer"; vLLM/SGLang-style backends answer 400

@@ -1888,6 +1888,8 @@ type FileConfig = {
         decodedBodyBytes?: number;
         /** Per-request rebuilt-outbound byte budget forwarded upstream (#3128; default 5 GiB). Env BILI_OUTBOUND_BODY_BYTES wins. */
         outboundBodyBytes?: number;
+        /** Soft egress byte budget for the WebSocket lane (#3701; default 10 MiB, 0 disables). Above it, older non-protected images are shed from the outbound copy before sending. Env BILI_WS_OUTBOUND_BYTES wins. */
+        wsOutboundBytes?: number;
     };
     /** Session persistence knobs (#2030) — was BILI_PERSIST_* env-only. */
     persist?: {

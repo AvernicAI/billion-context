@@ -131,6 +131,13 @@ entries:
     group: process
     desc_en: "Max rebuilt request bytes forwarded upstream (forward-stage 413), counted as UTF-8 bytes of the final body string. Checked before the fetch so an over-budget rebuild never reaches the upstream watchdog allocation."
     desc_zh: "转发到上游的重建请求字节上限（forward 阶段 413），按最终 body 字符串的 UTF-8 字节计。在 fetch 之前检查，超预算的重建不会触发上游看门狗分配。"
+  - key: network.wsOutboundBytes
+    type: number
+    default: "10485760"
+    env: BILI_WS_OUTBOUND_BYTES
+    group: process
+    desc_en: "Soft byte budget for the WebSocket lane only (#3701): when the final serialized Responses WS frame exceeds it, older images are shed from the OUTBOUND COPY first (archived as placeholder notes — originals stay in session storage, recoverable via read_original_image / decompress), then whatever remains is boundedly downscaled through the jimp maxDim ladder. If the frame still does not fit and the upstream closes with 1009 before any event, one strictly smaller resend is attempted within the same request. Set 0 to disable shedding (previous send-as-is behavior). HTTP lanes are unaffected — the hard refusal cap stays network.outboundBodyBytes."
+    desc_zh: "仅针对 WebSocket 通道的软字节预算（#3701）：当最终序列化的 Responses WS 帧超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。若帧仍超出限制且上游在任何事件发出前即以 1009 关闭连接，则在同一请求内尝试一次严格更小的重发。设为 0 可禁用裁减（即恢复此前的原样发送行为）。HTTP 通道不受影响——硬性拒绝上限仍为 network.outboundBodyBytes。"
   - key: guardrails
     type: object
     default: "{} (all defaults)"

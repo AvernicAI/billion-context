@@ -191,6 +191,7 @@ export function mitmHandshakeTimeoutMs(): number {
 const DEFAULT_LIMITS_RECEIVE_BYTES = 5 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_DECODED_BYTES = 10 * 1024 * 1024 * 1024;
 const DEFAULT_LIMITS_OUTBOUND_BYTES = 5 * 1024 * 1024 * 1024;
+const DEFAULT_WS_OUTBOUND_BYTES = 10 * 1024 * 1024;
 
 /** BILI_RECEIVE_BODY_BYTES > network.receiveBodyBytes > 5 GiB. Max inbound wire bytes
  *  read into memory per request. #3128: these were hardcoded 100 MiB constants; the
@@ -214,6 +215,19 @@ export function limitsDecodedBytes(): number {
 export function limitsOutboundBytes(): number {
     const v = tInt("BILI_OUTBOUND_BODY_BYTES", loadConfigFile().network?.outboundBodyBytes);
     return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LIMITS_OUTBOUND_BYTES;
+}
+
+/** BILI_WS_OUTBOUND_BYTES > network.wsOutboundBytes > 10 MiB. Soft egress byte budget for the
+ *  WebSocket lane (#3701): above it, older non-protected images are archived/downscaled from
+ *  the OUTBOUND COPY before sending, because the observed WS gateway rejects oversized frames
+ *  with close 1009 and zero events regardless of token usage. The default sits below the
+ *  smallest failing observation (16.1 MiB) with margin, above the smallest success (11.5 MiB);
+ *  it is a bili-side budget, not a proven upstream limit. 0 disables the pre-send shed
+ *  (legacy send-as-is). The HTTP lane is unaffected: its hard refusal cap stays
+ *  network.outboundBodyBytes. */
+export function limitsWsOutboundBytes(): number {
+    const v = tInt("BILI_WS_OUTBOUND_BYTES", loadConfigFile().network?.wsOutboundBytes);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : DEFAULT_WS_OUTBOUND_BYTES;
 }
 
 // --- session persistence (was BILI_PERSIST_* env-only) ---

@@ -158,6 +158,7 @@
 | `network.receiveBodyBytes` | number | 5368709120 | BILI_RECEIVE_BODY_BYTES | 单请求读入内存的入站 wire 字节上限，超限在 receive 阶段返回 413。由硬编码 100 MiB 提升到 5 GiB（#3128 owner 决定），使多 GB 单请求被接受而非断连。同时也是解码请求占用两个共享大解码准入槽位的阈值。WebSocket lane 保持固定 100 MiB 表面。 |
 | `network.decodedBodyBytes` | number | 10737418240 | BILI_DECODED_BODY_BYTES | content-encoding 解压（gzip/deflate/br/zstd）后的解码字节上限，解码过程中增量检查（decode 阶段 413）。默认为接收预算的 2 倍，沿用旧的 decode=2×wire 关系；用于防解压炸弹。 |
 | `network.outboundBodyBytes` | number | 5368709120 | BILI_OUTBOUND_BODY_BYTES | 转发到上游的重建请求字节上限（forward 阶段 413），按最终 body 字符串的 UTF-8 字节计。在 fetch 之前检查，超预算的重建不会触发上游看门狗分配。 |
+| `network.wsOutboundBytes` | number | 10485760 | BILI_WS_OUTBOUND_BYTES | 仅针对 WebSocket 通道的软字节预算（#3701）：当最终序列化的 Responses WS 帧超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。若帧仍超出限制且上游在任何事件发出前即以 1009 关闭连接，则在同一请求内尝试一次严格更小的重发。设为 0 可禁用裁减（即恢复此前的原样发送行为）。HTTP 通道不受影响——硬性拒绝上限仍为 network.outboundBodyBytes。 |
 | `guardrails` | object | {} (all defaults) | — | 守卫集合：pi/omp 插件的工具输出守卫（#3066）及代理侧流式 text-run 守卫（#3406）。 |
 | `guardrails.bashTimeout` | number | 60 | BILI_GUARDRAIL_BASH_TIMEOUT | 模型未写 timeout 时注入到 bash 工具的秒数（#3066 owner 有意为之，#3366 重申：无人看管的 bash 会把 pi 会话挂死一整天——宿主 schema 本身无默认值）。设 N 调整秒数，设 0 关闭注入（恢复 pi 原生行为）。 |
 | `guardrails.maxOutputBytes` | number | 50000 | BILI_GUARDRAIL_MAX_OUTPUT_BYTES | pi/omp 插件中每个工具结果的文本输出合计字节上限（0 禁用）。超限输出从头截断并附指向宿主已存完整输出的提示。 |
@@ -1787,6 +1788,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
 | `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
 | `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |
+| `BILI_WS_OUTBOUND_BYTES` | `network.wsOutboundBytes` | 10485760 |
 | `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PI_ACP_DELEGATE_FORCE_ENABLE` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
@@ -2180,7 +2182,7 @@ bili plugin remove pi       # 撤销（原文件一次性备份为 *.bili-bak）
 
 `install pi` 还会替换**遗留的** billion-context 条目（旧的 `npm:billion-context-pi` 引用、过期的 `npm:billion-context@x.y.z`、残留的 dev 目录路径），确保只有恰好一个 bili 插件在生效。
 
-安装的插件是**薄**插件（约 5 KB，零运行时依赖）：它检测代理（从 `/bili/` baseURL 或 `BILLION_CONTEXT_PROXY`）、从代理拉取工具 schema、注册原生工具、转发执行 —— 代理始终是唯一的压缩引擎，所以插件与代理永远版本一致。没有插件 API 的宿主（claude、codex、opencode）改装 MCP 桥（`dist/mcp.js`）—— 底层协议相同，但 MCP 没有斜杠命令（没有 `/acp`；claude 额外获得模型中介的 `/acp-cache` markdown 命令，写入 `<configdir>/commands/acp-cache.md`，其提示词驱动 `acp_cache` MCP 工具 —— 模型把报告原样贴回）。
+安装的插件是**薄**插件（约 5 KB，零运行时依赖）：它检测代理（从 `/bili/` baseURL 或 `BILLION_CONTEXT_PROXY`）、从代理拉取工具 schema、注册原生工具、转发执行 —— 代理始终是唯一的压缩引擎，所以插件与代理永远版本一致。没有插件 API 的宿主（claude、codex）改装 MCP 桥 —— claude 装 `dist/claude-mcp-entry.js`（同一桥加会话内代理守护，lane 代理死亡时自动重生，#1821），codex 装纯 `dist/mcp.js` —— 底层协议相同，但 MCP 没有斜杠命令（没有 `/acp`；claude 额外获得模型中介的 `/acp-cache` markdown 命令，写入 `<configdir>/commands/acp-cache.md`，其提示词驱动 `acp_cache` MCP 工具 —— 模型把报告原样贴回）。
 
 总开关：`BILLION_CONTEXT_PLUGIN=0` 彻底关闭插件模式（恢复 wire 层注入）。
 

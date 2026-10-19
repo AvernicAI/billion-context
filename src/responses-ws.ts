@@ -10,7 +10,7 @@ import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import type { WsBridgeCodec, WsBridgeContext, WsBridgeSession } from "./ws-bridge.js";
 
 type JsonObject = Record<string, unknown>;
-type DiagnosticLog = (level: "debug" | "warn", message: string) => void;
+type DiagnosticLog = (level: "debug" | "info" | "warn", message: string) => void;
 
 function closeCode(event: Event): number | "none" {
     return "code" in event && typeof event.code === "number" ? event.code : "none";
@@ -48,6 +48,22 @@ function releaseUpstreamWatchdog(response: Response, release: () => void): Respo
         async cancel(reason) { try { await reader.cancel(reason); } catch { /* upstream already gone */ } finish(); },
     });
     return new Response(wrapped, { status: response.status, statusText: response.statusText, headers: response.headers });
+}
+
+/** #3701: typed upstream WS failure carrying the close code and how far the
+ *  exchange got, so callers can route by MECHANISM instead of parsing a generic
+ *  message. close_code=1009 with receivedEvents=0 is the size-rejection signature
+ *  (the gateway answered our frame); anything else keeps the legacy treatment. */
+export class ResponsesWsUpstreamError extends Error {
+    constructor(
+        message: string,
+        readonly closeCode: number | "none",
+        readonly phase: "handshake" | "await-first-event" | "stream",
+        readonly receivedEvents: number,
+    ) {
+        super(message);
+        this.name = "ResponsesWsUpstreamError";
+    }
 }
 
 function object(value: unknown): value is JsonObject {
@@ -358,6 +374,13 @@ export class ResponsesWsUpstream {
             let retryFull = request.previous_response_id !== undefined;
             let receivedEvents = 0;
             const encoder = new TextEncoder();
+            // #3701: log the EXACT outbound frame bytes — the upstream gateway judges by
+            // bytes, not tokens, so this number is what the ws-byte-shed ladder targets.
+            const sendCreate = (payload: JsonObject): void => {
+                const frameText = JSON.stringify({ ...payload, ...egressTransportFields, type: "response.create" });
+                this.log("info", `upstream send mode=${payload.previous_response_id === undefined ? "full" : "delta"} bytes=${Buffer.byteLength(frameText)}`);
+                socket.send(frameText);
+            };
             // Backpressure (#2076): the WS socket cannot be paused, so frames arriving
             // while the consumer lags wait in the stream's own queue — delivery is
             // consumer-paced by construction. retained tracks that backlog (exact while
@@ -380,8 +403,14 @@ export class ResponsesWsUpstream {
                 else reject(error);
             };
             const failed = (event: Event): void => {
-                this.log("warn", `upstream failed phase=${receivedEvents > 0 ? "stream" : "await-first-event"} event=${event.type} close_code=${closeCode(event)} received_events=${receivedEvents}`);
-                fail(new Error("Responses WebSocket upstream disconnected before completion"), "upstream-disconnect");
+                const phase = receivedEvents > 0 ? "stream" : "await-first-event";
+                this.log("warn", `upstream failed phase=${phase} event=${event.type} close_code=${closeCode(event)} received_events=${receivedEvents}`);
+                fail(new ResponsesWsUpstreamError(
+                    `Responses WebSocket upstream disconnected before completion (close_code=${closeCode(event)}, received_events=${receivedEvents})`,
+                    closeCode(event),
+                    phase,
+                    receivedEvents,
+                ), "upstream-disconnect");
             };
             const aborted = (): void => {
                 this.log("debug", `upstream aborted phase=${receivedEvents > 0 ? "stream" : "await-first-event"}`);
@@ -409,7 +438,7 @@ export class ResponsesWsUpstream {
                             retryFull = false;
                             this.resetHistory("continuation-rejected");
                             this.log("debug", "upstream retry reason=continuation-rejected action=resend-full");
-                            socket.send(JSON.stringify({ ...body, ...egressTransportFields, type: "response.create" }));
+                            sendCreate(body);
                             return;
                         }
                         clean();
@@ -461,7 +490,7 @@ export class ResponsesWsUpstream {
             options.signal?.addEventListener("abort", aborted, { once: true });
             if (options.signal?.aborted) aborted();
             else {
-                try { socket.send(JSON.stringify({ ...request, ...egressTransportFields, type: "response.create" })); }
+                try { sendCreate(request); }
                 catch (error) { fail(error instanceof Error ? error : new Error("Responses WebSocket send failed"), "send-failed"); }
             }
         });

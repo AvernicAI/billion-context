@@ -101,7 +101,11 @@ function loadJimp(): Promise<JimpModule | null> {
     return jimpLoad;
 }
 
-async function doRescale(mime: RescaledMime, b64: string, origBytes: number, maxDim: number): Promise<RescaledImage | null> {
+// force (#3701 byte-shed ladder): skips the 100 KiB trigger gate and adopts ANY
+// strict byte reduction (not just <80%). A within-maxDim image is NOT skipped
+// here — a same-dim re-encode is adopted only if strictly smaller; the byte-shed
+// caller pre-filters maxDim-fitting images before calling (egress-shed rung B).
+async function doRescale(mime: RescaledMime, b64: string, origBytes: number, maxDim: number, force = false): Promise<RescaledImage | null> {
     try {
         const mod = await loadJimp();
         if (mod === null) return null;
@@ -111,14 +115,14 @@ async function doRescale(mime: RescaledMime, b64: string, origBytes: number, max
         // Re-check the gate against the AUTHORITATIVE dims (the header parse
         // may have failed for exotic containers).
         const scale = Math.min(1, maxDim / Math.max(ow, oh));
-        if (scale >= 1 && origBytes <= RESCALE_TRIGGER_BYTES) return null;
+        if (scale >= 1 && (!force || origBytes <= RESCALE_TRIGGER_BYTES)) return null;
         const tw = Math.max(1, Math.round(ow * scale));
         const th = Math.max(1, Math.round(oh * scale));
         if (tw !== ow || th !== oh) await img.resize({ w: tw, h: th });
         const out = mime === "image/jpeg"
             ? await img.getBuffer("image/jpeg", { quality: JPEG_QUALITY })
             : await img.getBuffer(mime);
-        if (out.length >= origBytes * KEEP_RATIO) return null;
+        if (force ? out.length >= origBytes : out.length >= origBytes * KEEP_RATIO) return null;
         return {
             base64: out.toString("base64"),
             width: tw,
@@ -168,6 +172,30 @@ async function rescaleImage(mediaType: string, b64: string, maxDim: number): Pro
 /** Test seam: drop the process-lifetime encode cache between cases. */
 export function clearRescaleEncodeCache(): void {
     encodeCache.clear();
+}
+
+/** #3701 byte-shed ladder step: forced re-encode at an explicit longest-edge dim.
+ *  Unlike rescaleImage there is no trigger gate and no keep-ratio floor — any strict
+ *  reduction is adopted; images already within maxDim are left alone. Returns the new
+ *  base64 (same mime) or null when nothing was saved (unsupported format, jimp absent,
+ *  or the re-encode did not shrink). Cached per hash+dim. */
+export async function shedDownscaleImage(mediaType: string, b64: string, maxDim: number): Promise<string | null> {
+    const mime = normalizeMime(mediaType);
+    if (!mime || typeof b64 !== "string" || b64.length === 0 || !Number.isFinite(maxDim) || maxDim <= 0) return null;
+    const dim = Math.floor(maxDim);
+    const hash = createHash("sha256").update(`${dim}:${b64}`, "utf8").digest("hex");
+    let pending = encodeCache.get(hash);
+    if (!pending) {
+        pending = doRescale(mime, b64, b64Bytes(b64), dim, true);
+        encodeCache.set(hash, pending);
+        while (encodeCache.size > ENCODE_CACHE_MAX) {
+            const oldest = encodeCache.keys().next().value;
+            if (oldest === undefined || oldest === hash) break;
+            encodeCache.delete(oldest);
+        }
+    }
+    const r = await pending;
+    return r === null ? null : r.base64;
 }
 
 function formatKb(bytes: number): number {
@@ -463,8 +491,9 @@ export async function applyImageRescalePass(messages: BiliMessage[], ctx: Rescal
 /** Resolve the mNNNNN ref of an image by matching its bytes against the
  *  session's incoming-image index (rebuilt from the raw inbound body every
  *  request). Ambiguous matches (same image under several refs) degrade to a
- *  size-only note rather than guess. */
-async function refForItemBytes(session: Session, mediaType: string, b64: string): Promise<string | undefined> {
+ *  size-only note rather than guess. Exported for the #3701 byte-shed
+ *  placeholders, which quote the same refs. */
+export async function refForItemBytes(session: Session, mediaType: string, b64: string): Promise<string | undefined> {
     const index = session.incomingImageIndex;
     if (!index) return undefined;
     const want = b64Bytes(b64);

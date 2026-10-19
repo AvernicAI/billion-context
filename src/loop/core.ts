@@ -35,6 +35,7 @@ import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { clearFoldHold, foldHoldPressure, heldFoldBlockIds } from "../fold-hold.js";
 import { dumpRejectedBody } from "../error-dump.js";
+import { shedEgressIfOverBudget } from "../egress-shed.js";
 import { bodyDumpEnabled as knobBodyDumpEnabled, imageRescaleMaxDim } from "../knobs.js";
 import { dumpsDir } from "../paths.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../strict-echo.js";
@@ -468,7 +469,7 @@ export async function* runCompressLoop(
     // but one copy per request is enough signal for humans).
     const seenMarkers = new Set<string>();
 
-    const fetchUpstream = (body: Record<string, unknown>) => {
+    const fetchUpstream = async (body: Record<string, unknown>) => {
         // #1592-family seam forensics: remember the body actually sent so the
         // next usage settle can pair it with the previous one (LCP on miss).
         // #2131: also hand over the exact message count — bodies above the
@@ -480,7 +481,22 @@ export async function* runCompressLoop(
         // 400). Scrub once at the single loop send chokepoint; the same string
         // then feeds resign and forensics so all three views agree (this also
         // de-duplicates the previous double JSON.stringify of the same body).
-        const wireBodyStr = scrubLoneSurrogatesOnWire(JSON.stringify(wireObj));
+        let wireBodyStr = scrubLoneSurrogatesOnWire(JSON.stringify(wireObj));
+        // #3701: internal re-requests ride the same WS transport as the outer
+        // turn (AsyncLocalStorage), so an oversized rebuild dies the same way —
+        // run the same soft byte budget here, before resign/forensics, so both
+        // see the bytes actually transmitted.
+        if (ctx.protocol) {
+            wireBodyStr = scrubLoneSurrogatesOnWire((await shedEgressIfOverBudget(wireBodyStr, ctx.protocol, {
+                sessionId: ctx.session.id,
+                session: ctx.session,
+                // Single sink: ctx.log routes into the same tee logger
+                // (server.ts logMsg → loggerLog), so calling both would
+                // write each line twice (#3701 review Finding 2).
+                log: (level, msg) => loggerLog(level, `[acp-loop] ${msg}`),
+                phase: "loop",
+            })).body);
+        }
         requestOptions.resign?.(requestOptions.headers, wireBodyStr);
         // #2131 follow-up: the message array lives under `messages` (chat),
         // `input` (Responses) or `contents` (Google) depending on wire shape.
