@@ -233,6 +233,12 @@ function mergeState(parsed: CompressionState): CompressionState {
         // resurrects with absorbed=[] and hideAbsorbedMessages has nothing to hide.
         absorbed: parsed.absorbed ?? fresh.absorbed,
         rules: parsed.rules ?? fresh.rules,
+        // #3769: fold-gated orphan-sweep bookkeeping must survive hydration —
+        // dropping sweptOrphanCallIds resurrects already-cleaned pairs after a
+        // restart (mid-history rewrite = cache break); the pending marker is
+        // transient, losing it only defers the sweep to the next fold.
+        sweptOrphanCallIds: parsed.sweptOrphanCallIds ?? fresh.sweptOrphanCallIds,
+        pendingOrphanSweepMinRef: parsed.pendingOrphanSweepMinRef ?? fresh.pendingOrphanSweepMinRef,
     };
 }
 
