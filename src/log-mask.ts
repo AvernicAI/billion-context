@@ -118,7 +118,7 @@ export function maskUrlsInText(text: string): string {
  *  preference must not weaken the publish boundary (same stance as
  *  redactSecretsInText, which is never gated by the switch). Userinfo, query
  *  and hash are dropped exactly as in maskUrlForLog; the path is kept. */
-export function maskUrlForPublish(url: string): string {
+function maskUrlForPublish(url: string): string {
     let u: URL;
     try {
         u = new URL(url);
