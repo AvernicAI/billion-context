@@ -89,7 +89,7 @@ function activeReasons(id: string, seen: Map<string, LiveProbeView>): string[] {
     return [];
 }
 
-export interface CleanupSessionInfo {
+interface CleanupSessionInfo {
     id: string;
     title?: string;
     label?: string;
@@ -181,7 +181,7 @@ export async function enumerateSessions(store: SessionStore, withSizes: boolean)
     return out;
 }
 
-export interface RemoveOutcome {
+interface RemoveOutcome {
     id: string;
     removed: boolean;
     blockedReasons: string[];
@@ -190,7 +190,7 @@ export interface RemoveOutcome {
     pinnedKept: number;
 }
 
-export async function removeOneSession(
+async function removeOneSession(
     store: SessionStore,
     id: string,
     opts: { force: boolean; probe: Map<string, LiveProbeView> },
@@ -268,7 +268,7 @@ function renderLs(rows: CleanupSessionInfo[], withSizes: boolean, dir: string): 
     return lines.join("\n");
 }
 
-export interface SessionsCommandOptions {
+interface SessionsCommandOptions {
     dir?: string;
     sub: "ls" | "rm" | "prune";
     target?: string;
