@@ -14,6 +14,11 @@
 // This test pins BOTH ends: the dsh lane keeps the snapshot across a real fold
 // executed through /__bili/plugin/tool, and an unregistered lane still folds
 // it away (allowlist discipline — KDD #9: never enable wholesale).
+// This suite pins the EAGER fold-render contract (the fold must be visible on
+// the first post-fold request). The #3003 deferred-materialization hold changes
+// that timing by design; its semantics are pinned in fold-hold*.test.ts.
+process.env.BILI_DEFER_MATERIALIZATION = "0";
+
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";

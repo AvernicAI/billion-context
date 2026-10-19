@@ -1,6 +1,8 @@
 // This suite pins the EAGER fold-render contract (the fold must be visible on
-// the first post-fold request). The #3003 deferred-materialization hold changes
-// that timing by design; its semantics are pinned in fold-hold*.test.ts.
+// the first post-fold request); the #3003 deferred-materialization hold changes
+// that timing by design (pinned in fold-hold*.test.ts). The harness sanitizes
+// BILI_* from the child env, so the pin rides the CONFIG FILE below
+// (compress.deferMaterialization:false in billion-context.json).
 process.env.BILI_DEFER_MATERIALIZATION = "0";
 
 import assert from "node:assert/strict";
@@ -91,7 +93,7 @@ test(`real OpenCode V2: native Responses WebSockets, fold and post-fold tools ($
     for (const dir of [...Object.values(dirs), nativeDir, path.join(dirs.config, "opencode"), path.join(dirs.config, "billion-context")]) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(nativeDir, "index.js"), `export { default } from ${JSON.stringify(pathToFileURL(entry).href)};\n`);
     fs.writeFileSync(path.join(dirs.config, "opencode/opencode.json"), JSON.stringify({ model: "openai/gpt-5.2", providers: { openai: { settings: { apiKey: "test-only-no-real-key", baseURL: `${origin}/v1`, transport: "websocket" } } }, plugins: [nativeDir], compaction: { auto: false } }));
-    fs.writeFileSync(path.join(dirs.config, "billion-context/billion-context.json"), JSON.stringify({ compress: { preserveRecentTokens: 0 } }));
+    fs.writeFileSync(path.join(dirs.config, "billion-context/billion-context.json"), JSON.stringify({ compress: { preserveRecentTokens: 0, deferMaterialization: false } }));
     const env = { ...process.env };
     for (const key of Object.keys(env)) if (/^(BILI|BILLION_CONTEXT|ACP_|OPENCODE|OPENAI|ANTHROPIC|NODE_TEST_CONTEXT)/.test(key) || /(?:API_KEY|TOKEN|SECRET|PASSWORD)$/i.test(key)) delete env[key];
     Object.assign(env, { HOME: dirs.home, XDG_CONFIG_HOME: dirs.config, XDG_DATA_HOME: dirs.data, XDG_STATE_HOME: dirs.state, XDG_CACHE_HOME: dirs.cache, ACP_AUTO_UPDATE: "0", BILLION_CONTEXT_NODE: process.execPath });

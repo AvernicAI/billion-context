@@ -13,6 +13,11 @@
 //      summary anchor (the cacheable region extends past the fold, not just the head);
 //   3. ordinary growth stays append-stable (modulo the volatile trailing chain tag) —
 //      guarding the fix against reintroducing mid-history churn.
+// This suite pins the EAGER fold-render contract (the fold must be visible on
+// the first post-fold request). The #3003 deferred-materialization hold changes
+// that timing by design; its semantics are pinned in fold-hold*.test.ts.
+process.env.BILI_DEFER_MATERIALIZATION = "0";
+
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";

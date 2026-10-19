@@ -26,6 +26,11 @@
 //   3. proxy lane, INLINE loop — the model streams a compress function_call,
 //      the proxy executes it server-side; the pair never enters the client
 //      history, so the anchor ALWAYS survives alongside the loop records.
+// This suite pins the EAGER fold-render contract (the fold must be visible on
+// the first post-fold request). The #3003 deferred-materialization hold changes
+// that timing by design; its semantics are pinned in fold-hold*.test.ts.
+process.env.BILI_DEFER_MATERIALIZATION = "0";
+
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
