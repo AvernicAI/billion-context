@@ -30,7 +30,7 @@ import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, reco
 import { detectStaleInstall, getLastInstall } from "../update.js";
 import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
-import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI } from "../web/index.js";
+import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildBlockContent, buildRefLookup, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI } from "../web/index.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
@@ -215,6 +215,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/diagnostics")) return sendDiagnostics(res, req.url);
     if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/detail")) return sendWebSessionDetail(res, req.url);
+    if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.split("?")[0].endsWith("/block-content")) return sendWebBlockContent(res, req.url);
+    if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.split("?")[0].endsWith("/block-ref")) return sendWebBlockRef(res, req.url);
     if (req.method === "GET" && req.url === "/") {
         // Browser visits root → redirect to the web UI. curl / health probes
         // (Accept: */* or no Accept) still get the JSON health check so
@@ -1200,6 +1202,86 @@ async function sendWebSessionDetail(res: http.ServerResponse, url: string): Prom
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(detail, null, 2));
+}
+
+function parseBlockUrl(url: string): { id: string; params: URLSearchParams } | null {
+    let u: URL;
+    try {
+        u = new URL(url, "http://localhost");
+    } catch {
+        return null;
+    }
+    const m = /^\/__bili\/sessions\/([^/]+)\/(?:block-content|block-ref)$/.exec(u.pathname);
+    if (!m) return null;
+    let id = "";
+    try {
+        id = decodeURIComponent(m[1]);
+    } catch {
+        // malformed percent-encoding → treat as unknown session (404 below)
+    }
+    return { id, params: u.searchParams };
+}
+
+async function sendWebBlockContent(res: http.ServerResponse, url: string): Promise<void> {
+    const parsed = parseBlockUrl(url);
+    if (!parsed) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "not found" }));
+        return;
+    }
+    const blockId = parsed.params.get("block");
+    const mode = parsed.params.get("mode");
+    if (!blockId || !mode) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "missing block or mode query parameter" }));
+        return;
+    }
+    const r = await buildBlockContent(parsed.id, blockId, mode);
+    if (r.status === "unknown-session") {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `unknown session: ${parsed.id}` }));
+        return;
+    }
+    if (r.status === "unknown-block") {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `unknown block: ${r.blockId}` }));
+        return;
+    }
+    if (r.status === "bad-mode") {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `invalid mode: ${r.mode} (expected one|full)` }));
+        return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(r.content, null, 2));
+}
+
+async function sendWebBlockRef(res: http.ServerResponse, url: string): Promise<void> {
+    const parsed = parseBlockUrl(url);
+    if (!parsed) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "not found" }));
+        return;
+    }
+    const q = parsed.params.get("q");
+    if (!q || !q.trim()) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "missing q query parameter" }));
+        return;
+    }
+    const r = await buildRefLookup(parsed.id, q);
+    if (r.status === "unknown-session") {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `unknown session: ${parsed.id}` }));
+        return;
+    }
+    if (r.status === "bad-query") {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "empty q query parameter" }));
+        return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(r, null, 2));
 }
 
 async function sendSessionReport(res: http.ServerResponse, url: string): Promise<void> {

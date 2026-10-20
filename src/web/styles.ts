@@ -249,6 +249,10 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .block-item .body.md hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
 .block-item .body.md strong { color: var(--text); }
 
+/* #3917 compression structure tree: rows reuse .block-item; only the locate highlight is new */
+.cstruct-node.hit summary { background: rgba(212, 167, 44, 0.18); }
+.cstruct-node.hit summary .bid { color: #d4a72c; }
+
 .handoff { font-size: 13.5px; line-height: 1.65; }
 .handoff h1, .handoff h2, .handoff h3, .handoff h4 { margin: 18px 0 8px; line-height: 1.3; }
 .handoff h1 { font-size: 17px; } .handoff h2 { font-size: 15.5px; } .handoff h3 { font-size: 14px; }

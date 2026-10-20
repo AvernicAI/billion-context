@@ -1929,6 +1929,17 @@ export const WEB_CLIENT = `(function () {
             });
         }
         parts.push("</div></div>");
+        // #3917: compression structure — tier tree over directBlockIds, lazy
+        // originals (one/full), mNNNNN locate, JSON export of the current view.
+        parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.cstruct_title") + '</span><span class="hint">' + t("det.cstruct_hint") + '</span></div><div class="card-b">');
+        if (!blocks.length) {
+            parts.push('<div class="dim small" style="padding:8px 0">' + t("det.blocks_empty") + "</div>");
+        } else {
+            parts.push('<div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center"><input id="cstruct-q" type="search" class="search" placeholder="' + escapeHtml(t("det.cstruct_search_ph")) + '" spellcheck="false" style="min-width:220px"><button id="cstruct-find" class="btn sm">' + t("det.cstruct_search_btn") + '</button><button id="cstruct-export" class="btn sm">' + t("det.cstruct_export") + "</button></div>");
+            parts.push('<div id="cstruct-status" class="dim small" style="margin-bottom:8px"></div>');
+            parts.push(buildCstructTree(blocks));
+        }
+        parts.push("</div></div>");
         if (Array.isArray(d.conflicts) && d.conflicts.length > 0) {
             // #2102: per-session evidence rows — the banner aggregates across sessions,
             // so this page is where its detail pointer lands.
@@ -1969,6 +1980,7 @@ export const WEB_CLIENT = `(function () {
             host.innerHTML = buildDetailHtml(d);
             bindHandoffActions(d);
             bindBlocksActions(d);
+            bindCstructActions(d);
             bindCacheReportActions(d);
             bindSessionReportActions(d);
             bindTrajectoryBrush(d);
@@ -2080,6 +2092,35 @@ export const WEB_CLIENT = `(function () {
         d.blockDetails.forEach((b) => { L.push(""); L.push(buildBlockMd(b)); });
         return L.join("\\n");
     }
+    // #3917: tier tree over directBlockIds. Roots = blocks no other block lists
+    // as a child (orphans whose parent was pruned surface as roots too).
+    function buildCstructTree(blocks) {
+        const byId = {};
+        blocks.forEach((b) => { byId[b.blockId] = b; });
+        const hasParent = new Set();
+        blocks.forEach((b) => (Array.isArray(b.children) ? b.children : []).forEach((c) => hasParent.add(c)));
+        const roots = blocks.filter((b) => !hasParent.has(b.blockId));
+        const node = (b, depth) => {
+            const refRange = refRangeOf(b);
+            const badge = b.active
+                ? '<span class="badge ok">' + t("det.block_active") + "</span>"
+                : '<span class="badge disk">' + t("det.block_inactive") + "</span>";
+            const extBadge = b.external ? '<span class="badge ext">' + t("det.block_external") + "</span>" : "";
+            // Same row shape as the flat 压缩块 list (class block-item) so the
+            // shared typography applies; cstruct-node adds tree behavior.
+            let html = '<details class="block-item cstruct-node" data-block="' + escapeHtml(b.blockId) + '" style="margin-left:' + depth * 16 + 'px"><summary><span class="bid">' + escapeHtml(b.blockId) + '</span>' + badge + extBadge + '<span class="topic">' + escapeHtml(blockTopic(b)) + '</span><span class="meta">T' + String(b.tier) + " · " + fmtW(b.compressedTokens) + " · " + timeAgo(b.createdAt) + (refRange ? " · " + escapeHtml(refRange) : "") + '</span></summary><div class="body md">';
+            html += renderBlockMd(b.summary || "");
+            html += '<div class="cstruct-orig" data-orig="' + escapeHtml(b.blockId) + '" style="margin-top:8px"><button class="btn sm cstruct-load" data-block="' + escapeHtml(b.blockId) + '" data-mode="one">' + t("det.cstruct_load_one") + '</button> <button class="btn sm cstruct-load" data-block="' + escapeHtml(b.blockId) + '" data-mode="full">' + t("det.cstruct_load_full") + '</button><div class="cstruct-orig-body"></div></div>';
+            html += "</div>";
+            (Array.isArray(b.children) ? b.children : []).forEach((cid) => {
+                const cb = byId[cid];
+                if (cb) html += node(cb, depth + 1);
+            });
+            html += "</details>";
+            return html;
+        };
+        return roots.map((r) => node(r, 0)).join("");
+    }
     // #3057 report export: MD/SVG render server-side (/__bili/session-report); the browser downloads MD and rasterizes the closed-vector SVG to PNG.
     function downloadUrl(url, name) {
         var a = document.createElement("a");
@@ -2154,6 +2195,98 @@ export const WEB_CLIENT = `(function () {
             const b = d.blockDetails[bi];
             if (!b) return;
             btn.addEventListener("click", (ev) => { ev.preventDefault(); ev.stopPropagation(); copyText(buildBlockMd(b), btn); });
+        });
+    }
+    // #3917: structure-tab actions — mNNNNN locate (exact id-set membership on
+    // the server), lazy originals per node, JSON export of the current view
+    // (blockDetails + whatever originals were loaded during this page visit).
+    function bindCstructActions(d) {
+        const findBtn = $("cstruct-find");
+        if (!findBtn) return;
+        const qEl = $("cstruct-q");
+        const status = $("cstruct-status");
+        const originals = {};
+        const nodeOf = (blockId) => document.querySelector('.cstruct-node[data-block="' + blockId + '"]');
+        const parentIdOf = (blockId) => {
+            for (const b of d.blockDetails || []) {
+                if ((Array.isArray(b.children) ? b.children : []).includes(blockId)) return b.blockId;
+            }
+            return null;
+        };
+        const clearHits = () => document.querySelectorAll(".cstruct-node.hit").forEach((n) => n.classList.remove("hit"));
+        const locate = async () => {
+            const q = String(qEl.value || "").trim();
+            if (!q) return;
+            clearHits();
+            status.textContent = "";
+            busy(findBtn, true);
+            try {
+                const r = await json(API_ROOT + "/sessions/" + encodeURIComponent(d.id) + "/block-ref?q=" + encodeURIComponent(q));
+                const matches = Array.isArray(r.matches) ? r.matches : [];
+                if (!matches.length) {
+                    status.textContent = q + " — " + t("det.cstruct_search_notfound");
+                    return;
+                }
+                matches.forEach((m) => {
+                    const n = nodeOf(m.blockId);
+                    if (n) n.classList.add("hit");
+                });
+                const owner = r.owner ? r.owner.blockId : matches[matches.length - 1].blockId;
+                for (let p = owner; p; p = parentIdOf(p)) {
+                    const n = nodeOf(p);
+                    if (n) n.open = true; else break;
+                }
+                status.textContent = q + " — " + t("det.cstruct_search_found", { n: matches.length, owner: owner });
+                const target = nodeOf(owner);
+                if (target && target.scrollIntoView) target.scrollIntoView({ block: "center", behavior: "smooth" });
+            } catch (e) {
+                toast(friendlyMsg(e), "err");
+            } finally {
+                busy(findBtn, false);
+            }
+        };
+        findBtn.addEventListener("click", locate);
+        qEl.addEventListener("keydown", (ev) => { if (ev.key === "Enter") locate(); });
+        document.querySelectorAll(".cstruct-load").forEach((btn) => {
+            btn.addEventListener("click", async () => {
+                const blockId = btn.getAttribute("data-block");
+                const mode = btn.getAttribute("data-mode");
+                const host = document.querySelector('.cstruct-orig[data-orig="' + blockId + '"] .cstruct-orig-body');
+                if (!host) return;
+                busy(btn, true);
+                try {
+                    const key = blockId + ":" + mode;
+                    let c = originals[key];
+                    if (!c) {
+                        c = await json(API_ROOT + "/sessions/" + encodeURIComponent(d.id) + "/block-content?block=" + encodeURIComponent(blockId) + "&mode=" + mode);
+                        originals[key] = c;
+                    }
+                    if (c.missing) {
+                        host.innerHTML = '<div class="dim small">' + t("det.cstruct_no_content") + "</div>";
+                        return;
+                    }
+                    let note = "";
+                    if (c.identicalToFull) note += '<div class="dim small" style="margin-top:4px">(' + t("det.cstruct_same_as_full") + ")</div>";
+                    if (c.truncated) note += '<div class="dim small" style="margin-top:4px;color:#d4a72c">' + t("det.cstruct_truncated") + "</div>";
+                    host.innerHTML = note + '<div class="md" style="margin-top:6px">' + renderBlockMd(String(c.text || "")) + "</div>";
+                } catch (e) {
+                    toast(friendlyMsg(e), "err");
+                } finally {
+                    busy(btn, false);
+                }
+            });
+        });
+        const exBtn = $("cstruct-export");
+        if (exBtn) exBtn.addEventListener("click", () => {
+            const payload = {
+                session: d.id,
+                ...(d.title ? { title: d.title } : {}),
+                generatedAt: new Date().toISOString(),
+                blocks: d.blockDetails || [],
+                originals: Object.keys(originals).map((k) => ({ blockId: k.split(":")[0], mode: k.split(":")[1], content: originals[k] })),
+            };
+            const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" }));
+            downloadUrl(url, "billion-context-cstruct-" + String(d.id).replace(/[^A-Za-z0-9._-]/g, "_") + ".json");
         });
     }
     function bindCacheReportActions(d) {

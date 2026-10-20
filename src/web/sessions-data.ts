@@ -211,6 +211,10 @@ interface WebSessionDetail extends WebSessionSummary {
         /** Present when the block's summary was written by the external
          *  summary chain — the web block badge mirrors /acp's "⚡ext". */
         external?: true;
+        /** #3917: child block ids (the blocks this block absorbed when it was
+         *  compressed) — the edge source for the structure tree view; the
+         *  kernel carries no parentBlockId, so children come from directBlockIds. */
+        children: string[];
     }>;
 }
 
@@ -924,6 +928,31 @@ export async function buildOverview(): Promise<WebOverview> {
 
 const detailInFlight = new Map<string, Promise<WebSessionDetail | null>>();
 
+/** #3917: resolve ONE session for read-only web access without creating it —
+ *  live pool → unified/disk store → disk-index file (#1937: never a directory
+ *  scan for a single id). Shared by the detail page and the block-content /
+ *  ref-lookup endpoints so all three agree on what "exists" means. */
+export async function resolveSessionForWeb(id: string): Promise<Session | undefined> {
+    const live = listSessions().find((s) => s.id === id);
+    let session: Session | undefined = live;
+    if (!session) {
+        // #2960 R2.2: unified-first — in full mode loadSync resolves the
+        // index row even when the legacy file is gone; in legacy/shadow it
+        // composes an origin-less path and misses, falling through to the
+        // disk-index file below.
+        session = getDiskStore().loadSync(id) ?? undefined;
+    }
+    if (!session) {
+        const files = await ensureIndex();
+        const abs = byId?.get(id);
+        if (abs && files.has(abs)) {
+            detailDecodes++;
+            session = (await getDiskStore().loadSessionFromFile(abs, id)) ?? undefined;
+        }
+    }
+    return session;
+}
+
 /** Full detail for one session: stats + compression blocks + the per-request
  *  cache ledger (trajectory-chart source) + rendered handoff document.
  *  Returns null when the id is unknown (→ 404). Never creates sessions —
@@ -935,22 +964,7 @@ export function buildSessionDetail(id: string): Promise<WebSessionDetail | null>
     if (existing) return existing;
     const run = (async (): Promise<WebSessionDetail | null> => {
         const live = listSessions().find((s) => s.id === id);
-        let session: Session | undefined = live;
-        if (!session) {
-            // #2960 R2.2: unified-first — in full mode loadSync resolves the
-            // index row even when the legacy file is gone; in legacy/shadow it
-            // composes an origin-less path and misses, falling through to the
-            // disk-index file below.
-            session = getDiskStore().loadSync(id) ?? undefined;
-        }
-        if (!session) {
-            const files = await ensureIndex();
-            const abs = byId?.get(id);
-            if (abs && files.has(abs)) {
-                detailDecodes++;
-                session = (await getDiskStore().loadSessionFromFile(abs, id)) ?? undefined;
-            }
-        }
+        const session = await resolveSessionForWeb(id);
         if (!session) return null;
         return renderDetail(session, !!live);
     })();
@@ -1056,7 +1070,111 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
                 ...(span === null && b.endRef !== undefined ? { endRef: b.endRef } : {}),
                 active: b.active,
                 ...(isExternalSummaryBlock(b) ? { external: true } : {}),
+                // #3917: parent-child wiring for the structure tree view — the
+                // kernel has no parentBlockId, so children are the edge source.
+                // Sparse/legacy block records may lack the field entirely.
+                children: [...(b.directBlockIds ?? [])],
             };
         }),
     };
+}
+
+// ---------------------------------------------------------------------------
+// #3917 compression structure: lazy originals + message→block lookup
+// ---------------------------------------------------------------------------
+
+/** Response guard: one lazy-loaded original view must never exceed 2 MiB of
+ *  JSON — beyond that the browser tab dies before the user sees anything. */
+const BLOCK_CONTENT_MAX_CHARS = 2 * 1024 * 1024;
+
+export type BlockContentMode = "one" | "full";
+
+export interface WebBlockContent {
+    blockId: string;
+    mode: BlockContentMode;
+    /** True when the block exists but carries no persisted originals
+     *  (text/count absent) — e.g. blocks whose content was never stored. */
+    missing?: true;
+    /** Number of messages in the served view. */
+    count?: number;
+    /** Served text (truncated to BLOCK_CONTENT_MAX_CHARS when larger). */
+    text?: string;
+    /** True when text was cut down to the guard above. */
+    truncated?: true;
+    /** mode=one only: the one-level view is byte-identical to full and was
+     *  persisted as a single copy (#401) — same bytes, served under "one". */
+    identicalToFull?: true;
+}
+
+export type WebBlockContentResult =
+    | { status: "ok"; content: WebBlockContent }
+    | { status: "unknown-session" }
+    | { status: "unknown-block"; blockId: string }
+    | { status: "bad-mode"; mode: string };
+
+/** Lazy fetch of ONE block's originals in the requested view: "one" = direct
+ *  messages + nested child summaries (null ⇒ byte-identical to full, then
+ *  full's bytes are served with a marker), "full" = every original message.
+ *  Read-only: resolves exactly like the detail page, never creates sessions. */
+export async function buildBlockContent(id: string, blockId: string, mode: string): Promise<WebBlockContentResult> {
+    if (mode !== "one" && mode !== "full") return { status: "bad-mode", mode };
+    const session = await resolveSessionForWeb(id);
+    if (!session) return { status: "unknown-session" };
+    const block = session.state.blocks.find((b) => b.blockId === blockId);
+    if (!block) return { status: "unknown-block", blockId };
+    const content = session.blockContents.get(blockId);
+    if (!content) return { status: "ok", content: { blockId, mode: mode as BlockContentMode, missing: true } };
+    let view = mode === "full" ? content.full : content.one;
+    let identicalToFull = false;
+    if (view === null) {
+        view = content.full;
+        identicalToFull = true;
+    }
+    const truncated = view.text.length > BLOCK_CONTENT_MAX_CHARS;
+    return {
+        status: "ok",
+        content: {
+            blockId,
+            mode: mode as BlockContentMode,
+            count: view.count,
+            text: truncated ? view.text.slice(0, BLOCK_CONTENT_MAX_CHARS) : view.text,
+            ...(truncated ? { truncated: true as const } : {}),
+            ...(identicalToFull ? { identicalToFull: true as const } : {}),
+        },
+    };
+}
+
+export interface WebRefMatch {
+    blockId: string;
+    tier: number;
+    active: boolean;
+}
+
+export type WebRefLookupResult =
+    | { status: "ok"; query: string; kind: "ref" | "raw"; owner?: WebRefMatch; matches: Array<WebRefMatch> }
+    | { status: "unknown-session" }
+    | { status: "bad-query" };
+
+/** Locate ONE message inside the compression structure. Accepts a padded ref
+ *  ("m00042", resolved through state.messageRefs.byRef) or a raw id verbatim.
+ *  Membership is EXACT over each block's effectiveMessageIds (direct + nested)
+ *  — no span guessing — so every containing block (leaf + all ancestors) is
+ *  reported; `owner` is the deepest one (smallest id set). */
+export async function buildRefLookup(id: string, query: string): Promise<WebRefLookupResult> {
+    const session = await resolveSessionForWeb(id);
+    if (!session) return { status: "unknown-session" };
+    const q = query.trim();
+    if (!q) return { status: "bad-query" };
+    const kind = /^m\d+$/.test(q) ? "ref" as const : "raw" as const;
+    const rawId = kind === "ref" ? session.state.messageRefs.byRef[q] : q;
+    if (!rawId) return { status: "ok", query: q, kind, matches: [] };
+    const matches = session.state.blocks
+        .filter((b) => b.effectiveMessageIds.includes(rawId))
+        .map((b) => ({ blockId: b.blockId, tier: b.tier, active: b.active }));
+    if (matches.length > 0) {
+        const sizeOf = (m: WebRefMatch) => session.state.blocks.find((b) => b.blockId === m.blockId)?.effectiveMessageIds.length ?? Infinity;
+        const owner = [...matches].sort((a, b) => sizeOf(a) - sizeOf(b) || b.tier - a.tier)[0];
+        return { status: "ok", query: q, kind, owner, matches };
+    }
+    return { status: "ok", query: q, kind, matches: [] };
 }

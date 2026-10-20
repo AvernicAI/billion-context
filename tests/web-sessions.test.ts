@@ -16,7 +16,8 @@ import { getSession, _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { markdownToHtml } from "../src/web/markdown.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
-import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, hiddenEmptyCount, _resetDiskCacheForTest, _diskScanStatsForTest } from "../src/web/sessions-data.ts";
+import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, hiddenEmptyCount, _resetDiskCacheForTest, _diskScanStatsForTest, buildBlockContent, buildRefLookup } from "../src/web/sessions-data.ts";
+import type { WebBlockContent, WebBlockContentResult, WebRefLookupResult } from "../src/web/sessions-data.ts";
 import vm from "node:vm";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -1119,4 +1120,216 @@ withFullMode("R2.2 file-less rows: web list and detail survive a vanished legacy
     assert.equal(detail.blockDetails.length, 1);
     assert.equal(detail.blockDetails[0].blockId, "b1");
     assert.equal(detail.blockDetails[0].compressedTokens, 2500);
+});
+
+// #3917 compression structure: tier-tree children in the detail payload, lazy
+// per-block originals (one|full, 2 MiB guard) and exact mNNNNN/raw-id lookup.
+
+// A tier-2 parent absorbing a tier-1 child plus one standalone leaf. raw-1/raw-2
+// live in both parent and child; raw-3 only in the parent; raw-99 is known to
+// messageRefs but sits in no block. b1/b2 carry persisted contents (b2's one-view
+// is null = byte-identical to full); b3 has none.
+function mkCstructSession(id: string): Session {
+    const s = makeSession(id, { protocol: "openai", title: "Cstruct" }, { requests: 3, inputTokens: 900, cachedTokens: 300, contextTokens: 400 });
+    const parent = mkBlock("b1", 5000, true, "Parent topic");
+    parent.tier = 2;
+    parent.directBlockIds = ["b2"];
+    parent.effectiveMessageIds = ["raw-1", "raw-2", "raw-3"];
+    const child = mkBlock("b2", 2000, true, "Child topic");
+    child.directMessageIds = ["raw-1", "raw-2"];
+    child.effectiveMessageIds = ["raw-1", "raw-2"];
+    const solo = mkBlock("b3", 700, false, "Solo");
+    s.state.blocks.push(parent, child, solo);
+    s.state.messageRefs.byRef["m00001"] = "raw-1";
+    s.state.messageRefs.byRef["m00002"] = "raw-2";
+    s.state.messageRefs.byRef["m00003"] = "raw-3";
+    s.state.messageRefs.byRef["m00099"] = "raw-99";
+    for (const [ref, raw] of Object.entries(s.state.messageRefs.byRef)) s.state.messageRefs.byRaw[raw] = ref;
+    s.blockContents.set("b1", { one: { text: "ONE-B1", count: 6 }, full: { text: "FULL-B1", count: 9 } });
+    s.blockContents.set("b2", { one: null, full: { text: "FULL-B2", count: 3 } });
+    return s;
+}
+
+function assertOkContent(r: WebBlockContentResult): WebBlockContent {
+    assert.equal(r.status, "ok");
+    if (r.status !== "ok") throw new Error("unreachable: expected ok content result");
+    return r.content;
+}
+
+function assertOkLookup(r: WebRefLookupResult): Extract<WebRefLookupResult, { status: "ok" }> {
+    assert.equal(r.status, "ok");
+    if (r.status !== "ok") throw new Error("unreachable: expected ok lookup result");
+    return r;
+}
+
+withSessionsDir("compression structure detail exposes tier-tree children (#3917)", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    await store.writeNow(mkCstructSession("cs-1"));
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const d = await buildSessionDetail("cs-1");
+    assert.ok(d);
+    const byId = Object.fromEntries(d.blockDetails.map((b) => [b.blockId, b]));
+    assert.deepEqual(byId.b1.children, ["b2"], "tier-2 parent lists its absorbed child");
+    assert.deepEqual(byId.b2.children, [], "leaf has no children");
+    assert.deepEqual(byId.b3.children, [], "standalone block has no children");
+});
+
+withSessionsDir("buildBlockContent serves lazy originals with the 2 MiB guard (#3917)", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    await store.writeNow(mkCstructSession("cb-1"));
+    const big = makeSession("cb-big", { protocol: "openai" });
+    big.state.blocks.push(mkBlock("b1", 100, true));
+    big.blockContents.set("b1", { one: null, full: { text: "x".repeat(2 * 1024 * 1024 + 1000), count: 1 } });
+    await store.writeNow(big);
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+
+    const full = assertOkContent(await buildBlockContent("cb-1", "b1", "full"));
+    assert.equal(full.mode, "full");
+    assert.equal(full.text, "FULL-B1");
+    assert.equal(full.count, 9);
+    assert.equal(full.truncated, undefined);
+    assert.equal(full.identicalToFull, undefined);
+
+    const one = assertOkContent(await buildBlockContent("cb-1", "b1", "one"));
+    assert.equal(one.text, "ONE-B1");
+    assert.equal(one.count, 6);
+
+    // one === null means the single persisted copy IS the full view (#401)
+    const same = assertOkContent(await buildBlockContent("cb-1", "b2", "one"));
+    assert.equal(same.text, "FULL-B2");
+    assert.equal(same.identicalToFull, true);
+
+    const missing = assertOkContent(await buildBlockContent("cb-1", "b3", "full"));
+    assert.equal(missing.missing, true);
+
+    assert.deepEqual(await buildBlockContent("nope", "b1", "full"), { status: "unknown-session" });
+    assert.deepEqual(await buildBlockContent("cb-1", "bX", "full"), { status: "unknown-block", blockId: "bX" });
+    // mode validation runs before session resolution
+    assert.deepEqual(await buildBlockContent("nope", "b1", "bogus"), { status: "bad-mode", mode: "bogus" });
+
+    const trunc = assertOkContent(await buildBlockContent("cb-big", "b1", "full"));
+    assert.equal(trunc.truncated, true);
+    assert.ok(trunc.text, "truncated view still carries text");
+    assert.equal(trunc.text.length, 2 * 1024 * 1024);
+    assert.equal(trunc.count, 1, "count reflects the untruncated view");
+});
+
+withSessionsDir("buildRefLookup resolves mNNNNN/raw ids to exact owning blocks (#3917)", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    await store.writeNow(mkCstructSession("cs-2"));
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+
+    const ref = assertOkLookup(await buildRefLookup("cs-2", "m00001"));
+    assert.equal(ref.kind, "ref");
+    assert.deepEqual(ref.matches.map((m) => m.blockId).sort(), ["b1", "b2"], "every containing block reported");
+    assert.equal(ref.owner?.blockId, "b2", "deepest containing block owns");
+
+    const raw = assertOkLookup(await buildRefLookup("cs-2", "raw-2"));
+    assert.equal(raw.kind, "raw");
+    assert.deepEqual(raw.matches.map((m) => m.blockId).sort(), ["b1", "b2"]);
+
+    // raw-3 exists only inside the tier-2 parent
+    const parentOnly = assertOkLookup(await buildRefLookup("cs-2", "m00003"));
+    assert.deepEqual(parentOnly.matches.map((m) => m.blockId), ["b1"]);
+    assert.equal(parentOnly.owner?.blockId, "b1");
+
+    // known ref with no block membership / unknown raw id → honest empty set
+    assert.deepEqual(assertOkLookup(await buildRefLookup("cs-2", "m00099")).matches, []);
+    assert.deepEqual(assertOkLookup(await buildRefLookup("cs-2", "raw-none")).matches, []);
+
+    assert.equal((await buildRefLookup("cs-2", "")).status, "bad-query");
+    assert.equal((await buildRefLookup("cs-2", "   ")).status, "bad-query");
+    assert.equal((await buildRefLookup("nope", "m00001")).status, "unknown-session");
+});
+
+test("web endpoints serve lazy block content and ref lookup (#3917)", async () => {
+    const root = path.join(tmpdir(), `bili-web-sess-cstruct-${process.pid}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const biliConfig = path.join(root, "billion-context.json");
+    writeFileSync(biliConfig, '{"providers":{}}\n', "utf8");
+    const prevConfig = process.env.BILI_CONFIG_FILE;
+    const prevSessions = process.env.BILI_SESSIONS_DIR;
+    process.env.BILI_CONFIG_FILE = biliConfig;
+    process.env.BILI_SESSIONS_DIR = root;
+
+    const store = new SessionStore({ dir: root, debounceMs: 0, enabled: true });
+    await store.writeNow(mkCstructSession("ep-cs"));
+    _resetDiskCacheForTest();
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1:1",
+        routes: {},
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        passthroughSource: null,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    if (!proxy.listening) await once(proxy, "listening");
+    const port = (proxy.address() as { port: number }).port;
+    const base = `http://127.0.0.1:${port}`;
+    try {
+        const bcRes = await fetch(`${base}/__bili/sessions/ep-cs/block-content?block=b1&mode=full`);
+        assert.equal(bcRes.status, 200);
+        const bc = (await bcRes.json()) as { text: string; count: number };
+        assert.equal(bc.text, "FULL-B1");
+        assert.equal(bc.count, 9);
+
+        const oneRes = await fetch(`${base}/__bili/sessions/ep-cs/block-content?block=b1&mode=one`);
+        assert.equal(oneRes.status, 200);
+        assert.equal(((await oneRes.json()) as { text: string }).text, "ONE-B1");
+
+        const missBlock = await fetch(`${base}/__bili/sessions/ep-cs/block-content?block=bX&mode=full`);
+        assert.equal(missBlock.status, 404);
+        assert.match(((await missBlock.json()) as { error: string }).error, /unknown block/);
+
+        const badMode = await fetch(`${base}/__bili/sessions/ep-cs/block-content?block=b1&mode=bogus`);
+        assert.equal(badMode.status, 400);
+        assert.match(((await badMode.json()) as { error: string }).error, /invalid mode/);
+
+        const noParam = await fetch(`${base}/__bili/sessions/ep-cs/block-content?block=b1`);
+        assert.equal(noParam.status, 400);
+
+        const missSess = await fetch(`${base}/__bili/sessions/nope/block-ref?q=m00001`);
+        assert.equal(missSess.status, 404);
+        assert.match(((await missSess.json()) as { error: string }).error, /unknown session/);
+
+        const refRes = await fetch(`${base}/__bili/sessions/ep-cs/block-ref?q=m00001`);
+        assert.equal(refRes.status, 200);
+        const refBody = (await refRes.json()) as { owner?: { blockId: string }; matches: Array<{ blockId: string }> };
+        assert.equal(refBody.owner?.blockId, "b2");
+        assert.deepEqual(refBody.matches.map((m) => m.blockId).sort(), ["b1", "b2"]);
+
+        const noQ = await fetch(`${base}/__bili/sessions/ep-cs/block-ref`);
+        assert.equal(noQ.status, 400);
+    } finally {
+        if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;
+        if (prevSessions === undefined) delete process.env.BILI_SESSIONS_DIR; else process.env.BILI_SESSIONS_DIR = prevSessions;
+        await close(proxy);
+        _resetDiskCacheForTest();
+        rmrf(root);
+    }
 });
