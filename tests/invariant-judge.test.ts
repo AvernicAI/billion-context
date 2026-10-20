@@ -339,6 +339,9 @@ test("#4003 cap: bodies over JUDGE_BODY_CAP (4 MiB) skip the judge silently — 
     // Buffer input takes the same path (relays hand Buffers too).
     maybeRunInvariantJudge({ originalMessages: [], body: Buffer.from(body, "utf8"), protocol: "openai", sessionId: "s-cap" });
     assert.equal(seen.length, 0);
+    // Absent body: the gate owns the empty case — zero verdicts, accurate log.
+    maybeRunInvariantJudge({ originalMessages: [], protocol: "openai", sessionId: "s-cap" });
+    assert.equal(seen.length, 0);
     // Continuity lane: prev oversized OR next oversized → skip both.
     const small = JSON.stringify({ model: "m", messages: [{ role: "user", content: "q" }] });
     maybeJudgeContinuity(body, small, "openai", "s-cap");

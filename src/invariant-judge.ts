@@ -325,25 +325,27 @@ function armed(): boolean {
   return invariantJudgeEnabled();
 }
 
-/** Bodies above this size are skipped by the judge — a full advisory-side
- * JSON.parse of a #3128-scale multi-GiB body is an OOM/event-loop stall
- * vector, and the judge's own precedent (SEAM_BODY_CAP, 512 KiB) already
+/** Bodies outside this size range are skipped by the judge — a full
+ * advisory-side JSON.parse of a #3128-scale multi-GiB body is an OOM/event-loop
+ * stall vector, and the judge's own precedent (SEAM_BODY_CAP, 512 KiB) already
  * treats oversized bodies as "partial forensics: silently skip". Skips log
  * at debug (visible when converging a bug), never warn: a skipped diagnostic
  * is not a defect. Const by design — no knob until an operator asks (#4003). */
 const JUDGE_BODY_CAP = 4 * 1024 * 1024;
 
-function withinJudgeCap(body: string | Buffer | undefined): boolean {
-  if (body === undefined) return false;
-  const len = typeof body === "string" ? Buffer.byteLength(body) : body.length;
-  return len > 0 && len <= JUDGE_BODY_CAP;
+/** Byte length of a judge input body — 0 when absent; strings measured as
+ * UTF-8 bytes so strings and Buffers compare like-for-like against the cap. */
+function judgeBodyLen(body: string | Buffer | undefined): number {
+  if (!body) return 0;
+  return typeof body === "string" ? Buffer.byteLength(body) : body.length;
 }
 
 export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
   if (!armed()) return;
   try {
-    if (!withinJudgeCap(input.body)) {
-      loggerLog("debug", `[invariant-judge] body over ${JUDGE_BODY_CAP} bytes — skipping (advisory layer, #4003 cap)`);
+    const bodyLen = judgeBodyLen(input.body);
+    if (bodyLen === 0 || bodyLen > JUDGE_BODY_CAP) {
+      loggerLog("debug", `[invariant-judge] body ${bodyLen}B outside judge range (≤${JUDGE_BODY_CAP}B) — skipping (advisory layer, #4003 cap)`);
       return;
     }
     const entry = input.originalMessages ?? [];
@@ -375,7 +377,9 @@ export function maybeJudgeContinuity(
 ): void {
   if (!armed() || !prev) return;
   try {
-    if (!withinJudgeCap(prev) || !withinJudgeCap(body)) return;
+    const prevLen = judgeBodyLen(prev);
+    const bodyLen = judgeBodyLen(body);
+    if (prevLen === 0 || prevLen > JUDGE_BODY_CAP || bodyLen === 0 || bodyLen > JUDGE_BODY_CAP) return;
     const entry = parseExitCores(prev, protocol);
     const exitCores0 = parseExitCores(body, protocol);
     if (!entry || !exitCores0) return;
