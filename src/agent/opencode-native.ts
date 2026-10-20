@@ -141,7 +141,7 @@ async function oversizeDirectRefusal(e: V2HttpRequestEvent, s: V2State, reason?:
         );
     }
     return new Error(
-        `bili: proxy unavailable and this request cannot be sent uncompressed — body ~${floorTokens} tok (floor estimate ${bytes}B/4) exceeds the ${model.providerID}/${model.id} context window (${window}); upstream would reject it. Recovery is automatic (#3308); retry shortly, or start a fresh session if the local history has outgrown the window.`,
+        `bili: proxy unavailable and this request cannot be sent uncompressed — body ~${floorTokens} tok (floor estimate ${bytes}B/4) exceeds the ${model.providerID}/${model.id} context window (${window}); upstream would reject it. The proxy respawns automatically (#3308), but this request is NOT retried on its own — resubmit once it is back; if your local history has outgrown the window, start a fresh session instead (a resubmit cannot fit either).`,
     );
 }
 
