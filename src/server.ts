@@ -8,6 +8,8 @@ import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, defaultPrompts, deactivateBlock } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type ResolvedKernelConfig } from "./compress-settings.js";
 import { dropCompressReasoningIds, type CompressReasoningConfig } from "./reasoning-drop.js";
+import { noteLocalRefusal, localRefusalCovers, armDeadEnd } from "./size-evidence.js";
+import { classifyStatus, progressContinues as verdictProgressContinues, classifyRetryable, progressDetailSuffix, isContentDeadEnd } from "./preflight-verdict.js";
 import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
@@ -2720,50 +2722,7 @@ function preflightDeadEndCooldownMs(): number {
 // — NEVER as usage (that field is upstream billing evidence only) — scoped to
 // the route/model/window that saw them; an equal-or-wider refused window
 // covers the current equal-or-tighter one, anything else evaluates fresh.
-interface LocalRefusalRecord {
-    origin: string;
-    model: string;
-    window: number;
-    at: number;
-}
-
-const LOCAL_REFUSAL_MAX_RECORDS = 16;
-
-function readLocalRefusals(metadata: Record<string, unknown>): LocalRefusalRecord[] {
-    const raw = metadata.localRefusals;
-    if (!Array.isArray(raw)) return [];
-    return raw.filter((r): r is LocalRefusalRecord =>
-        !!r && typeof r === "object"
-        && typeof (r as LocalRefusalRecord).origin === "string"
-        && typeof (r as LocalRefusalRecord).model === "string"
-        && typeof (r as LocalRefusalRecord).window === "number",
-    );
-}
-
-/** Record a local 413 refusal for (origin, model, window). A wider refusal in
- *  the same scope already dominates (it covers every tighter window); a
- *  narrower one replaces it so the record tracks the widest verdict seen. */
-function noteLocalRefusal(session: Session, origin: string | undefined, model: string | undefined, window: number): void {
-    if (!origin || !model || !Number.isFinite(window) || window <= 0) return;
-    const records = readLocalRefusals(session.metadata);
-    const existing = records.find((r) => r.origin === origin && r.model === model);
-    if (existing !== undefined && existing.window >= window) return;
-    session.metadata.localRefusals = [
-        ...records.filter((r) => !(r.origin === origin && r.model === model)),
-        { origin, model, window: Math.floor(window), at: Date.now() },
-    ].slice(-LOCAL_REFUSAL_MAX_RECORDS);
-    markDirty(session);
-}
-
-/** True when this session was locally refused (413) by the SAME origin+model
- *  at an equal or WIDER window — the current request may then not reopen any
- *  forward-once escape hatch (#3846). Both sides must be known
- *  (evidence-permitlist discipline: an unprovenanced refusal proves nothing
- *  about an unprovenanced request, and vice versa). */
-function localRefusalCovers(metadata: Record<string, unknown>, origin: string | undefined, model: string | undefined, window: number): boolean {
-    if (!origin || !model) return false;
-    return readLocalRefusals(metadata).some((r) => r.origin === origin && r.model === model && r.window >= window);
-}
+// [#3977 Step 1] the store now lives in src/size-evidence.ts — moved verbatim.
 
 /** #568: commit the response early so a long preflight cannot lose the client
  *  to its header timeout. Streaming clients get an SSE stream with keep-alive
@@ -3746,14 +3705,16 @@ export async function preflightCompressIfNeeded(
     // byte-relay lanes) — bili must not declare structural doom for it; those
     // lanes keep their 502 fail-fast contract where NOT re-forwarding IS the
     // protection, not a client spin.
-    const status = f?.kind === "upstream" && f.status === 429 ? 503 : f?.kind === "exhausted" && f.deterministic && !payloadFitsWindow ? 413 : 502;
+    // [#3977 Step 1] the classification expressions below moved verbatim to
+    // src/preflight-verdict.ts — pure functions, same inputs, same outputs.
+    const status = classifyStatus(f, payloadFitsWindow);
     // #3918: non-deterministic exhaustion WITH committed progress is not terminal —
     // the folds persist in the session, so the next attempt starts from a smaller
     // baseline and continues the fold. Reporting retryable=false told hosts to stop
     // spinning exactly where each retry makes real progress (incident: 64 effective
     // folds, every round declared terminal). Deterministic exhaustion keeps today's
     // verdict: nothing more can fold from this view, so retries are genuinely doomed.
-    const progressContinues = f?.kind === "exhausted" && !f.deterministic && result.compressedRanges > 0;
+    const progressContinues = verdictProgressContinues(f, result.compressedRanges);
     // #3846: a deterministic can-never-fit verdict is local refusal evidence for
     // this scope — persist it so the forward-once escapes above stay closed on
     // retry even after the baseline demotes to estimate or the body changes.
@@ -3761,20 +3722,18 @@ export async function preflightCompressIfNeeded(
     // #2189: an explicit retryable=false from preflight (credential-shape
     // rejection — deterministic for the identical payload) overrides the
     // status-based heuristic below; every other path keeps today's mapping.
-    const retryable = progressContinues ? true : f?.retryable === false ? false : f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
+    const retryable = classifyRetryable(progressContinues, f);
     let ffDetail = f?.detail ?? "the payload still exceeds the window after preflight compression";
     if (progressContinues) {
-        const shortfall = foldedCalibratedSize !== undefined ? Math.max(0, limit - foldedCalibratedSize) : undefined;
-        ffDetail += ` ${result.compressedRanges} range(s) folded this turn persist in the session — the next attempt starts from a smaller baseline and continues the fold${shortfall !== undefined ? ` (~${shortfall.toLocaleString("en-US")} tokens short of the target)` : ""}.`;
+        ffDetail += progressDetailSuffix(result.compressedRanges, foldedCalibratedSize, limit);
     }
     const ff = failFast(status, ffDetail, retryable, result.compressedRanges > 0 ? foldedCalibratedSize : undefined, result.rangesRemaining);
-    const contentDeadEnd = f?.kind === "exhausted" || (f?.kind === "upstream" && f.status !== undefined && f.status >= 400 && f.status < 500 && !retryable);
+    const contentDeadEnd = isContentDeadEnd(f, retryable);
     if (contentDeadEnd && result.compressedRanges === 0) {
         const cooldownMs = preflightDeadEndCooldownMs();
         if (cooldownMs > 0) {
             ff.message += ` Preflight will not call the upstream again for the next ${Math.max(1, Math.round(cooldownMs / 60_000))}m for this identical request. Change the request or wait for the cooldown before retrying.`;
-            session.metadata.preflightDeadEnd = { key: deadEndKey, until: Date.now() + cooldownMs, status: ff.status, retryable: ff.retryable, message: ff.message };
-            markDirty(session);
+            armDeadEnd(session, { key: deadEndKey, until: Date.now() + cooldownMs, status: ff.status, retryable: ff.retryable, message: ff.message });
         }
     }
     return ff;
