@@ -342,6 +342,17 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
                     }
                     continue;
                 }
+                // #3410: document blocks (PDF) ride the sidecar verbatim since
+                // #3961 — size them like the openai file precedent above: inline
+                // base64 by payload, url refs by URL, bare block flat (billing
+                // must see them or the fold gate undercounts).
+                if (part.type === "document") {
+                    const src = part.source;
+                    if (isObj(src) && src.type === "base64" && typeof src.data === "string") total += base64ImageCost(src.data, billing, configuredCap);
+                    else if (isObj(src) && src.type === "url" && typeof src.url === "string") total += costForUrl(src.url, billing, configuredCap);
+                    else total += applyCap(REMOTE_IMAGE_TOKENS, configuredCap);
+                    continue;
+                }
             }
         }
     }
@@ -360,7 +371,7 @@ function bodyHasImagesProbe(protocol: "anthropic" | "openai" | "responses" | "go
     return protocol === "google" ? s.includes("inlineData") || s.includes("fileData")
         : protocol === "responses" ? s.includes("input_image") || s.includes('"content":[') || s.includes('"content": [')
         : protocol === "openai" ? s.includes("image_url") || s.includes('"type":"file"') || s.includes('"type": "file"') || s.includes('"content":[') || s.includes('"content": [')
-        : s.includes('"type":"image"') || s.includes('"type": "image"') || s.includes('"type":"redacted_thinking"') || s.includes('"type":"document"');
+        : s.includes('"type":"image"') || s.includes('"type": "image"') || s.includes('"type":"redacted_thinking"') || s.includes('"type": "redacted_thinking"') || s.includes('"type":"document"') || s.includes('"type": "document"');
 }
 
 export function imageTokensInRawBody(protocol: "anthropic" | "openai" | "responses" | "google", raw: string | Buffer, billing: ResolvedImageBilling = "bytes", configuredCap?: number): number {
@@ -459,6 +470,9 @@ export function countImagesInParsedBody(protocol: "anthropic" | "openai" | "resp
                     }
                     continue;
                 }
+                // #3410 lockstep: every document shape that bills in the cost
+                // walker must count here too (one block = one unit).
+                if (part.type === "document") { n += 1; continue; }
             }
         }
     }

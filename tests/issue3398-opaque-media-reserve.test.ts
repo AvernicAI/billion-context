@@ -84,7 +84,7 @@ test("#3398: standard image_url pricing is unchanged by the opaque charge", () =
     assert.equal(imageTokensInParsedBody("openai", bodyRemote, "bytes"), REMOTE_IMAGE_TOKENS);
 });
 
-test("#3398: anthropic nested tool_result media and redacted_thinking are priced; top-level document is not (the codec drops it)", () => {
+test("#3398: anthropic nested tool_result media and redacted_thinking are priced; top-level document is priced like opaque media (preserved verbatim since #3961)", () => {
     const body = openaiBody("user", [
         {
             type: "tool_result",
@@ -101,8 +101,10 @@ test("#3398: anthropic nested tool_result media and redacted_thinking are priced
     const docBody = openaiBody("user", [
         { type: "document", source: { type: "base64", media_type: "application/pdf", data: "E".repeat(8192) } },
     ]);
-    assert.equal(imageTokensInParsedBody("anthropic", docBody, "bytes"), 0);
-    assert.equal(countImagesInParsedBody("anthropic", docBody), 0);
+    // #3547/#3410: top-level document is priced like opaque media — the kernel
+    // codec preserves it verbatim since #3961, so the billing reserve matches.
+    assert.equal(imageTokensInParsedBody("anthropic", docBody, "bytes"), Math.ceil(8192 / 4));
+    assert.equal(countImagesInParsedBody("anthropic", docBody), 1);
 });
 
 test("#3398: google unknown-shape parts are priced; text/function carriers stay on their own channels", () => {
