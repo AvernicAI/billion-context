@@ -260,7 +260,7 @@ export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.ma
 //    reaches the harness at all (the proxy tool loop executes it
 //    server-side), so the exempt note tells the model to ignore the harness's
 //    only-run_code rule for exactly these tools.
-export const RUN_CODE_TOOL_NAME = "run_code";
+const RUN_CODE_TOOL_NAME = "run_code";
 
 // #3884: known code-mode/PTC omnibus tool names, one entry per OBSERVED host
 // shape — a code-mode harness collapses every registered tool behind ONE
