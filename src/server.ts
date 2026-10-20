@@ -98,7 +98,7 @@ import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type ProxyInstanceFile, type SameLanePeer } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, isPidAlive, listInstances, probePid, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
 import { mayClobberPointer, probeOwnerInfo, resolvePortClaim } from "./port-owner.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
@@ -1407,6 +1407,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         closeLogger();
         process.exit(0);
     };
+    const finishDrain = (): void => {
+        flushConversations();
+        void flushAllSessions().finally(finishShutdown);
+    };
     const shutdown = (sig: string) => {
         if (shuttingDown) return;
         shuttingDown = true;
@@ -1417,16 +1421,29 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // before invoking cb, so in-flight SSE streams get a chance to finish
         // rather than being yanked mid-chunk.
         server.close(() => {
-            flushConversations();
-            void flushAllSessions().finally(finishShutdown);
+            finishDrain();
         });
         // Hard fallback: if connections hang (client never closes), don't
-        // block shutdown forever — force-exit after a grace window.
-        setTimeout(() => {
-            log("warn", `shutdown grace window elapsed; forcing exit (liveConns=${connRecords.size})`);
-            flushConversations();
-            void flushAllSessions().finally(finishShutdown);
-        }, 10_000).unref?.();
+        // block shutdown forever — force-exit after a grace window. #3890:
+        // while connections are still ALIVE the window re-arms (bounded by
+        // SHUTDOWN_DRAIN_MAX_PASSES) instead of cutting in-flight upstream
+        // streams mid-response — idle keep-alives don't hold the proxy, the
+        // keep-alive reaper clears them within one window, so a healthy drain
+        // still exits promptly and a stuck socket can pin at most the cap.
+        let drainPasses = 0;
+        const armDrainBackstop = (): void => {
+            setTimeout(() => {
+                if (connRecords.size > 0 && drainPasses < SHUTDOWN_DRAIN_MAX_PASSES) {
+                    drainPasses += 1;
+                    log("warn", `shutdown grace window elapsed but liveConns=${connRecords.size} — extending drain ${drainPasses}/${SHUTDOWN_DRAIN_MAX_PASSES} (#3890)`);
+                    armDrainBackstop();
+                    return;
+                }
+                log("warn", `shutdown grace window elapsed; forcing exit (liveConns=${connRecords.size})`);
+                finishDrain();
+            }, SHUTDOWN_DRAIN_GRACE_MS).unref?.();
+        };
+        armDrainBackstop();
     };
     // #3544: POST /__bili/shutdown (stale-proxy rotation from a newer
     // generation's bring-up) takes this exact graceful path.
@@ -1454,21 +1471,44 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         let idleSince: number | null = null;
         let lastDead: number[] = [];
         let lastStaleHb: number[] = [];
+        // #3890: consecutive failed kill-0 probes per pid (see WATCHER_DEAD_CONFIRM_TICKS).
+        const deadStreak = new Map<number, number>();
         const watcher = setInterval(() => {
             const dead: number[] = [];
             const staleByHeartbeat: number[] = [];
             const tickNow = Date.now();
             for (const pid of proxyWatchers) {
-                const alive = isPidAlive(pid);
+                const probe = probePid(pid);
                 // #3544: heartbeat-opted owners ALSO die by liveness-proof
                 // expiry — kill(pid,0) is an existence check, identity-blind
                 // under Windows pid reuse. Legacy pids (no heartbeat on record)
-                // keep kill-0-only semantics.
-                if (watcherIsDead(alive, watcherLastSeen.get(pid), tickNow, WATCHER_HEARTBEAT_GRACE_MS)) {
+                // keep kill-0-only semantics. #3890: a failed kill-0 must be
+                // CONFIRMED over consecutive ticks before it removes the pid —
+                // one transient OpenProcess failure used to be enough to kill
+                // the whole proxy while its parent lived on.
+                const decision = tickWatchedPid(probe, watcherLastSeen.get(pid), tickNow, deadStreak.get(pid), { heartbeatGraceMs: WATCHER_HEARTBEAT_GRACE_MS, confirmTicks: WATCHER_DEAD_CONFIRM_TICKS });
+                if (decision.removed) {
                     proxyWatchers.delete(pid);
                     watcherLastSeen.delete(pid);
+                    deadStreak.delete(pid);
                     dead.push(pid);
-                    if (alive) staleByHeartbeat.push(pid);
+                    if (decision.staleHeartbeat) staleByHeartbeat.push(pid);
+                    continue;
+                }
+                if (probe.alive) {
+                    if ((deadStreak.get(pid) ?? 0) > 0) {
+                        deadStreak.delete(pid);
+                        log("info", `[watchdog] pid ${pid} alive again after failed kill-0 probe(s) — clearing death streak (#3890)`);
+                    }
+                } else {
+                    if (decision.streak === 1) {
+                        // Field instrumentation (#3890): Windows collapses every
+                        // non-ACCESS_DENIED OpenProcess failure into ESRCH, so
+                        // the errno is the only clue left to attribute false-dead
+                        // episodes — log it once per episode.
+                        log("info", `[watchdog] kill-0 probe failed for pid ${pid} (code=${probe.errCode ?? "?"}) — requiring ${WATCHER_DEAD_CONFIRM_TICKS} consecutive failures before believing it (#3890)`);
+                    }
+                    deadStreak.set(pid, decision.streak);
                 }
             }
             if (dead.length > 0) lastDead = dead;
@@ -1761,6 +1801,46 @@ const WATCHER_HEARTBEAT_GRACE_MS = 15_000;
 export function watcherIsDead(alive: boolean, lastSeen: number | undefined, nowMs: number, heartbeatGraceMs: number): boolean {
     if (!alive) return true;
     return lastSeen !== undefined && nowMs - lastSeen > heartbeatGraceMs;
+}
+
+// #3890: the shutdown backstop window, and how many times it may RE-ARM while
+// connections are still alive. One window is the historical hard fallback;
+// extra passes exist so an in-flight upstream stream finishes instead of being
+// cut mid-response when its owner's death triggers the exit. Worst-case total
+// drain ≈ (1 + SHUTDOWN_DRAIN_MAX_PASSES) windows.
+const SHUTDOWN_DRAIN_GRACE_MS = 10_000;
+const SHUTDOWN_DRAIN_MAX_PASSES = 10;
+
+// #3890: how many CONSECUTIVE failed kill-0 probes must agree before the
+// watchdog believes a watched pid has died. Pre-fix, ONE failed probe removed
+// the pid from the watcher set and the empty-set grace window that followed
+// never re-probed it — a single transient OpenProcess failure on Windows was
+// enough to force-exit the proxy ~6s later while its parent lived on (12 such
+// events in 2.5h against one live pid). At the 2s tick, three confirmations
+// span ~4–6s: long enough to ride out transient failures, short enough that a
+// genuinely dead parent still exits promptly.
+const WATCHER_DEAD_CONFIRM_TICKS = 3;
+
+export interface WatcherTickDecision {
+    /** Remove this pid from the watcher set on this tick. */
+    removed: boolean;
+    /** Removed because the heartbeat expired while the pid still reads alive (#3544). */
+    staleHeartbeat: boolean;
+    /** Failed-probe streak after this tick (0 when alive or removed). */
+    streak: number;
+}
+
+/** #3890: pure per-pid death-streak step. A live probe resets the streak; a
+ *  failed probe increments it and only removes the pid once the streak reaches
+ *  confirmTicks. Heartbeat expiry stays immediate (it is a time-based liveness
+ *  proof, not an existence probe — #3544 semantics). */
+export function tickWatchedPid(probe: PidProbe, lastSeen: number | undefined, nowMs: number, prevStreak: number | undefined, opts: { heartbeatGraceMs: number; confirmTicks: number }): WatcherTickDecision {
+    if (probe.alive) {
+        const staleHeartbeat = watcherIsDead(true, lastSeen, nowMs, opts.heartbeatGraceMs);
+        return { removed: staleHeartbeat, staleHeartbeat, streak: 0 };
+    }
+    const streak = (prevStreak ?? 0) + 1;
+    return streak >= opts.confirmTicks ? { removed: true, staleHeartbeat: false, streak: 0 } : { removed: false, staleHeartbeat: false, streak };
 }
 
 
