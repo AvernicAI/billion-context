@@ -43,6 +43,11 @@ import { maskIpsInText, redactSecretsInText } from "./log-mask.js";
 
 const MAX_BYTES = 10 * 1024 * 1024; // 10 MB → rotate
 
+// File-type bits for the open-fd directory check below (POSIX mode constants;
+// Node reports them identically on Windows).
+const S_IFMT = 0o170000;
+const S_IFDIR = 0o040000;
+
 export type Logger = (level: string, msg: string) => void;
 
 // ── Request-scoped session attribution ─────────────────────────────────────
@@ -171,6 +176,18 @@ export function setLogCapture(fn: ((level: string, msg: string) => void) | null)
     capture = fn;
 }
 
+/** Drop a freshly-opened stream whose fd failed verification (a directory on
+ *  Win32, or fstat itself failing): clear state so the next line reopens, and
+ *  run the one-shot degradation warn — the async-failure path getStream()'s
+ *  try/catch cannot see (#3857 follow-up to #3858). */
+function rejectOpen(s: WriteStream, err: unknown): void {
+    try { s.destroy(); } catch { /* best-effort */ }
+    stream = undefined;
+    streamFd = undefined;
+    writeProven = false;
+    warnReopenFailed(err);
+}
+
 function openStream(file: string): WriteStream {
     mkdirSync(path.dirname(file), { recursive: true });
     // Rotate if oversized.
@@ -192,11 +209,27 @@ function openStream(file: string): WriteStream {
         // file doesn't exist yet — fine
     }
     const s = createWriteStream(file, { flags: "a" });
-    // 'open' only records the fd (orphan-inode detection needs it). It must NOT
-    // arm liveness: on win32 (observed node 22 in CI) some paths (e.g. a
-    // DIRECTORY) open fine and only their writes fail (#3857).
+    // 'open' records the fd (orphan-inode detection needs it) and verifies it
+    // is usable. It must NOT arm liveness — that stays with the first DELIVERED
+    // write (#3857): on win32 (observed node 22 in CI) open(2) can hand out an
+    // fd for a DIRECTORY whose writes then always fail. Rejecting it here lets
+    // the degradation surface immediately (one warn naming the cause, zero lost
+    // lines) instead of on the first lost line; character devices (/dev/null
+    // logFile) stay legal.
     s.on("open", (fd: number) => {
-        if (stream === s) streamFd = fd;
+        if (stream !== s) return;
+        let st: ReturnType<typeof fstatSync>;
+        try {
+            st = fstatSync(fd);
+        } catch (err) {
+            rejectOpen(s, err);
+            return;
+        }
+        if ((st.mode & S_IFMT) === S_IFDIR) {
+            rejectOpen(s, new Error("path is a directory"));
+            return;
+        }
+        streamFd = fd;
     });
     // If the stream errors (disk full, perms), drop it so the next write
     // triggers a reopen instead of piling onto a dead stream. #3857: an ASYNC
