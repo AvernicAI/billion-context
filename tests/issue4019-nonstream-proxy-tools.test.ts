@@ -185,3 +185,27 @@ test("#4019 mixed round: proxy + real tool -> proxy surfaced as text, only real 
         h.restore();
     }
 });
+
+// #539/#684: OpenAI-wire thinking models (DeepSeek et al.) 400 a re-request that
+// drops the assistant turn's reasoning_content. The continuation must echo it back.
+test("#4019 non-stream openai: reasoning_content rides the proxy-only continuation verbatim (#539 class)", async () => {
+    const h = installFetch([openaiResponse({ content: "FINAL", finishReason: "stop" })]);
+    try {
+        const initial = openaiResponse({ content: null, toolCalls: [toolCall("call_r", "acp_status", {})] });
+        const initialMessage = ((initial.choices as Array<Record<string, unknown>>)[0].message) as Record<string, unknown>;
+        initialMessage.reasoning_content = "thinking out loud";
+        await compressLoopOpenaiJson(
+            initial,
+            makeCtx("i4019-reasoning", () => {}),
+            {},
+            { messages: [{ role: "user", content: "status?" }] },
+            { url: UNUSED_URL, headers: JSON_HEADERS },
+        );
+        const msgs = h.bodies[0].messages as Array<Record<string, unknown>>;
+        const assistantTurn = msgs.find((m) => m.role === "assistant");
+        assert.ok(assistantTurn, "assistant turn appended to the re-request");
+        assert.equal(assistantTurn.reasoning_content, "thinking out loud", "replayed assistant turn must echo reasoning_content back verbatim");
+    } finally {
+        h.restore();
+    }
+});

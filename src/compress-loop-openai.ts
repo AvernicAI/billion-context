@@ -38,6 +38,7 @@ interface ParsedToolCall {
 
 interface ParsedOutput {
     text: string;
+    reasoningContent?: string;
     toolCalls: ParsedToolCall[];
 }
 
@@ -60,6 +61,11 @@ function parseOutput(response: Record<string, unknown>): ParsedOutput {
     const message = (first?.message ?? {}) as Record<string, unknown>;
     const rawContent = message.content;
     const text = typeof rawContent === "string" ? rawContent : "";
+    // #539/#684: OpenAI-wire thinking models (DeepSeek et al.) REQUIRE the
+    // assistant turn's reasoning_content echoed back on replay — dropping it
+    // 400s the re-request ("reasoning_content ... must be passed back").
+    const rawReasoning = message.reasoning_content;
+    const reasoningContent = typeof rawReasoning === "string" && rawReasoning.length > 0 ? rawReasoning : undefined;
     const rawCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
     const toolCalls: ParsedToolCall[] = [];
     for (const tc of rawCalls) {
@@ -69,7 +75,7 @@ function parseOutput(response: Record<string, unknown>): ParsedOutput {
         const arguments_ = typeof fn.arguments === "string" ? fn.arguments : "";
         toolCalls.push({ id: typeof t.id === "string" ? t.id : undefined, name, arguments: arguments_ });
     }
-    return { text, toolCalls };
+    return { text, reasoningContent, toolCalls };
 }
 
 // Empty/malformed args yield {}: executeProxyToolAsync routes an empty compress
@@ -159,6 +165,7 @@ export async function compressLoopOpenaiJson(
             {
                 role: "assistant",
                 content: output.text.length > 0 ? output.text : null,
+                ...(output.reasoningContent !== undefined ? { reasoning_content: output.reasoningContent } : {}),
                 tool_calls: proxyCalls.map((c) => ({ id: c.id ?? "", type: "function", function: { name: c.name, arguments: c.arguments } })),
             },
             ...executed.map(({ call, result }) => ({ role: "tool", tool_call_id: call.id ?? "", content: result.text })),
