@@ -379,7 +379,10 @@ export function maybeJudgeContinuity(
   try {
     const prevLen = judgeBodyLen(prev);
     const bodyLen = judgeBodyLen(body);
-    if (prevLen === 0 || prevLen > JUDGE_BODY_CAP || bodyLen === 0 || bodyLen > JUDGE_BODY_CAP) return;
+    if (prevLen === 0 || prevLen > JUDGE_BODY_CAP || bodyLen === 0 || bodyLen > JUDGE_BODY_CAP) {
+      loggerLog("debug", `[invariant-judge] continuity bodies ${prevLen}/${bodyLen}B outside judge range (≤${JUDGE_BODY_CAP}B) — skipping (advisory layer, #4003 cap)`);
+      return;
+    }
     const entry = parseExitCores(prev, protocol);
     const exitCores0 = parseExitCores(body, protocol);
     if (!entry || !exitCores0) return;

@@ -347,6 +347,10 @@ test("#4003 cap: bodies over JUDGE_BODY_CAP (4 MiB) skip the judge silently — 
     maybeJudgeContinuity(body, small, "openai", "s-cap");
     maybeJudgeContinuity(small, body, "openai", "s-cap");
     assert.equal(seen.length, 0);
+    // Continuity skips are observable at debug too (#4021 spec: both entries log).
+    const contSkips = lines.filter(([, m]) => m.includes("continuity") && m.includes("skipping"));
+    assert.ok(contSkips.length >= 2, "both continuity skips must be observable");
+    assert.ok(contSkips.every(([lvl]) => lvl === "debug"));
     // Sanity: a small body still judges (cap did not brick the happy path).
     const tiny = JSON.stringify({ model: "m", messages: [
       { role: "user", content: "hello" },
