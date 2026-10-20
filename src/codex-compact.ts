@@ -197,7 +197,7 @@ function parseForgeV2Blob(blob: string): CodexForgePayload | undefined {
     }
 }
 
-export interface BiliForgeHandoff {
+interface BiliForgeHandoff {
     summaryText: string;
     tail: ResponseInputItem[];
 }
