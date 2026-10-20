@@ -57,7 +57,7 @@ type PersistRecord = {
     savedAt: number;
     id: string;
     payload: {
-        meta: { label?: string };
+        meta: { label?: string; protocol?: string; upstreamOrigin?: string };
         messages: { id: string; contentType?: string; toolName?: string; toolCallId?: string }[];
         state: { messageRefs: { byRaw: Record<string, string> }; hiddenOrphanRefs?: string[]; sweptOrphanCallIds?: string[]; pendingOrphanSweepMinRef?: number };
     };
@@ -175,7 +175,12 @@ test("upgraded pre-fold-gate state keeps rotation-hidden orphans hidden end-to-e
         const callRef = rec.payload.state.messageRefs.byRaw[callMsg!.id];
         const resRef = rec.payload.state.messageRefs.byRaw[resMsg!.id];
         assert.ok(callRef && resRef, "refs resolvable from the persisted state");
-        const sPre = store2.loadSync(LABEL);
+        // Hydrate with the record's routing meta, not a bare id: a fresh
+        // un-booted store has no unified index or walked diskFiles, and the file
+        // is namespaced under <protocol>/<host>_<sha>/, so an id-only loadSync
+        // probes only _unknown/ and returns null (#3769 CI flake). getSession
+        // always passes this meta; mirror it for a route-deterministic load.
+        const sPre = store2.loadSync(rec.id, { protocol: rec.payload.meta.protocol, upstreamOrigin: rec.payload.meta.upstreamOrigin });
         assert.ok(sPre, "record hydrates before the upgrade turn");
         sPre.state.hiddenOrphanRefs = [callRef, resRef];
         delete sPre.state.sweptOrphanCallIds;
