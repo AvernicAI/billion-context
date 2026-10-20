@@ -8,7 +8,7 @@ import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, defaultPrompts, deactivateBlock } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type ResolvedKernelConfig } from "./compress-settings.js";
 import { dropCompressReasoningIds, type CompressReasoningConfig } from "./reasoning-drop.js";
-import { noteLocalRefusal, localRefusalCovers, armDeadEnd } from "./size-evidence.js";
+import { noteLocalRefusal, fitEvidence, armDeadEnd } from "./size-evidence.js";
 import { classifyStatus, progressContinues as verdictProgressContinues, classifyRetryable, progressDetailSuffix, isContentDeadEnd } from "./preflight-verdict.js";
 import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
@@ -3208,7 +3208,12 @@ export async function preflightCompressIfNeeded(
     // payloads are unaffected (they never reach an escape hatch); another
     // origin/model or a larger window judges fresh, exactly like the #1933 F2
     // baseline demotion does.
-    const localRefusalHere = localRefusalCovers(session.metadata, currentOrigin, model, limit);
+    // [#3977 Step 2] the evidence gate: every forward-once escape hatch below
+    // consumes THIS adjudication (invariant A) — the localRefusals store is
+    // reached only through fitEvidence, so a store added later is consulted by
+    // every hatch the moment it lands in the adjudicator.
+    const evidence = fitEvidence(session.metadata, currentOrigin, model, limit);
+    const localRefusalHere = evidence.verdict === "cannot-fit";
     // #2313: an estimate may not block the forward. The trigger above can
     // fire on the calibrated chars/4 estimate alone; when the current
     // upstream's billing scale diverges from the estimator's caliber

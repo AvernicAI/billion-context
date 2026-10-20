@@ -12,6 +12,39 @@
 import { markDirty, type Session } from "./session.js";
 
 // ---------------------------------------------------------------------------
+// Invariant A (#3977): every forward-once escape hatch must consult
+// fitEvidence() — the SINGLE adjudicator over the persisted size-evidence
+// stores. A hatch that bypasses this gate re-bets an estimator guess against
+// evidence bili already holds (the #3846 lesson: the probe hatch could not
+// consult localRefusals because the store did not exist yet — a gate that
+// enumerates stores by construction cannot "forget" one added later).
+// ---------------------------------------------------------------------------
+
+/** The three-way adjudication every escape hatch (and later every preflight
+ *  exit) consumes: cannot-fit = persisted hard evidence this (origin, model)
+ *  cannot accept this window; can-fit = persisted evidence it can; unknown =
+ *  no persisted evidence (estimates are grades, not verdicts — they may only
+ *  refine an unknown, never manufacture a can/cannot). */
+type EvidenceVerdict = "can-fit" | "cannot-fit" | "unknown";
+
+interface EvidenceAdjudication {
+    verdict: EvidenceVerdict;
+    /** Which store decided, for the incident log. */
+    reason: string;
+}
+
+/** Adjudicate the persisted size evidence for (origin, model, window).
+ *  Stores consulted today: localRefusals (#3846). Step 4+ adds the
+ *  overflow-arm family — a new store lands HERE and every hatch inherits it
+ *  the same moment, which is the whole point of the gate. */
+export function fitEvidence(metadata: Record<string, unknown>, origin: string | undefined, model: string | undefined, window: number): EvidenceAdjudication {
+    if (localRefusalCovers(metadata, origin, model, window)) {
+        return { verdict: "cannot-fit", reason: "local-413 at an equal or wider window (#3846)" };
+    }
+    return { verdict: "unknown", reason: "no persisted evidence for this scope" };
+}
+
+// ---------------------------------------------------------------------------
 // Store: localRefusals (#3846) — persisted local 413 evidence
 // ---------------------------------------------------------------------------
 
@@ -62,8 +95,10 @@ export function noteLocalRefusal(session: Session, origin: string | undefined, m
  *  at an equal or WIDER window — the current request may then not reopen any
  *  forward-once escape hatch (#3846). Both sides must be known
  *  (evidence-permitlist discipline: an unprovenanced refusal proves nothing
- *  about an unprovenanced request, and vice versa). */
-export function localRefusalCovers(metadata: Record<string, unknown>, origin: string | undefined, model: string | undefined, window: number): boolean {
+ *  about an unprovenanced request, and vice versa).
+ *  [#3977 Step 2] module-private: hatches consume fitEvidence()/
+ *  escapeHatchOpen(), never a raw store read. */
+function localRefusalCovers(metadata: Record<string, unknown>, origin: string | undefined, model: string | undefined, window: number): boolean {
     if (!origin || !model) return false;
     return readLocalRefusals(metadata).some((r) => r.origin === origin && r.model === model && r.window >= window);
 }
