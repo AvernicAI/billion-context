@@ -452,7 +452,9 @@ const INBOUND_MSG_CAP = 8192;
  * the outbound body diverges mid-list. */
 export interface InboundSlot {
     msgs: number;
-    /** sha256-16 of each message's canonical JSON, in list order. */
+    /** sha256-16 of each message's JSON minus bili-generated fields
+     *  (thinkingTokens, #4054 — its only producer is the #1320 projection,
+     *  so it must never read as client-origin evidence), in list order. */
     fps: string[];
     /** Parallel to `fps`: role + JSON length + coarse content class of each
      *  message, recorded so a divergent index can report WHAT the client
@@ -478,7 +480,13 @@ export function noteInboundMessages(session: Session, msgs: CoreMessage[]): void
     const fps: string[] = [];
     const meta: { role: string; len: number; cls: string }[] = [];
     for (const m of msgs) {
-        const j = JSON.stringify(m);
+        // #4054: thinkingTokens has exactly one producer — bili's own #1320
+        // projection (projectThinkingMass mutates these same objects before
+        // capture) — so a meter delta must never read as client-origin
+        // evidence. Strip the TOP-LEVEL field only before fingerprinting
+        // (nested client content that happens to use the name is untouched);
+        // the fast path keeps zero overhead when the field is absent.
+        const j = m.thinkingTokens !== undefined ? JSON.stringify({ ...m, thinkingTokens: undefined }) : JSON.stringify(m);
         fps.push(createHash("sha256").update(j).digest("hex").slice(0, 16));
         meta.push({ role: String((m as { role?: unknown }).role ?? "?"), len: j.length, cls: inboundMessageClass(m) });
     }
