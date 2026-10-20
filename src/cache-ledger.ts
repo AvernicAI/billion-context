@@ -460,11 +460,40 @@ export interface InboundSlot {
     meta: { role: string; len: number; cls: string }[];
 }
 
+// #4043: host-generated metering fields — present on Prepared.originalMessages
+// but NOT in the client's bytes. projectThinkingMass (#1320) stamps
+// CoreMessage.thinkingTokens onto the anthropic-lane list between conversion
+// and this capture, and re-derives the value every turn from the previous
+// usage report — so a byte-stable client list would otherwise show positional
+// fingerprint divergence at every signature-only reasoning message, and
+// detectSeam's #3023 client arm would attribute a bili-owned miss to "host
+// churn". Strip these fields from the ORIGIN EVIDENCE only: signatures, raw
+// payloads, tool ids and unknown semantic fields stay full evidence, and miss
+// accounting is untouched. Future host-projected metering fields MUST extend
+// this list before shipping (evidence-permitlist, same discipline as #1104/#1107).
+const GENERATED_METERING_FIELDS: readonly string[] = ["thinkingTokens"];
+
+/** Canonical JSON of ONE message as ORIGIN EVIDENCE — the message minus the
+ *  host-generated metering fields above. Fast path: messages without any
+ *  generated field stringify byte-identically to before this exclusion
+ *  existed, so every unaffected session keeps its legacy fingerprints. */
+function originEvidenceJson(m: CoreMessage): string {
+    const r = m as unknown as Record<string, unknown>;
+    if (!GENERATED_METERING_FIELDS.some((k) => k in r)) return JSON.stringify(m);
+    const stripped: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(r)) {
+        if (!GENERATED_METERING_FIELDS.includes(k)) stripped[k] = v;
+    }
+    return JSON.stringify(stripped);
+}
+
 /** #3023: capture side of the inbound pair — call at the send chokepoint
  *  (src/server/relay.ts), next to noteForwardedBody, with the request's
  *  original (pre-rebuild) message list. Cost is one canonical stringify per
  *  message (≈ one extra body serialization, the outbound path already does
- *  the same order of work hashing the wire body). */
+ *  the same order of work hashing the wire body). Fingerprints are computed
+ *  over origin evidence (#4043): host-generated metering never counts as
+ *  client-origin divergence, everything else does. */
 export function noteInboundMessages(session: Session, msgs: CoreMessage[]): void {
     const transient = session.transient ??= {};
     if (msgs.length > INBOUND_MSG_CAP) {
@@ -478,7 +507,7 @@ export function noteInboundMessages(session: Session, msgs: CoreMessage[]): void
     const fps: string[] = [];
     const meta: { role: string; len: number; cls: string }[] = [];
     for (const m of msgs) {
-        const j = JSON.stringify(m);
+        const j = originEvidenceJson(m);
         fps.push(createHash("sha256").update(j).digest("hex").slice(0, 16));
         meta.push({ role: String((m as { role?: unknown }).role ?? "?"), len: j.length, cls: inboundMessageClass(m) });
     }
