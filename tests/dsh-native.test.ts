@@ -2826,6 +2826,9 @@ test("#1365 apply() attach mode: runtime death with routed evidence — waits th
             const ctx = mockCtx();
             apply(ctx);
             await waitFor(() => ctx.registeredTools.length === 1, "attach tool registration");
+            // settle the apply-time verify flight before simulating death — an in-flight
+            // flight would be joined by respawn() below and its pre-death verdict inherited (#4049)
+            await _settleNativeForTest();
             const respawn = _stateRespawnForTest();
             assert.ok(respawn !== undefined, "attach mode armed state.respawn");
             // the external manager restarts the proxy: hard down, then back on the same port
@@ -2837,8 +2840,10 @@ test("#1365 apply() attach mode: runtime death with routed evidence — waits th
                 upTimer = setTimeout(() => server.listen(port, "127.0.0.1", () => resolve()), 100);
             });
             const recovered = await recoveredPromise;
-            clearTimeout(upTimer);
+            // await `up` BEFORE clearing its timer — the timer is `up`'s only resolver,
+            // so clearing it first strands `await up` on an unresolvable promise (#4049)
             await up;
+            clearTimeout(upTimer);
             assert.equal(recovered, origin, "recovery lands back on the pinned origin");
             assert.equal(spawnCalls, 0);
             assert.equal(process.env.BILLION_CONTEXT_PROXY, origin);
