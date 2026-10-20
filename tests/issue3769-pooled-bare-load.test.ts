@@ -4,13 +4,15 @@
 // index miss on the sqlite path (fresh store over an existing dir, row still
 // in an in-flight chain) surfaced as "record hydrates before the upgrade
 // turn" failing intermittently. The envelope walk is now seeded for ANY
-// unified mode; this test pins the disk fallback deterministically by
-// deleting index.db while the pooled envelope stays on disk.
+// unified mode AND for sidecar-degraded stores (#4049); these tests pin the
+// disk fallback deterministically by deleting index.db, or by making it
+// unopenable so the fresh store degrades to legacy-only, while the pooled
+// envelope stays on disk.
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import test from "node:test";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -34,7 +36,7 @@ function sse(obj: unknown): string {
     return `data: ${JSON.stringify(obj)}\n\n`;
 }
 
-test("bare-id loadSync hydrates a pooled envelope when the unified index misses (#3769 flake)", async () => {
+async function runPooledLoadFlow(indexBreak: "delete" | "unopenable"): Promise<void> {
     const dir = mkdtempSync(path.join(tmpdir(), "bili-pool-store-"));
     const upstream = http.createServer((req, res) => {
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
@@ -99,10 +101,18 @@ test("bare-id loadSync hydrates a pooled envelope when the unified index misses 
         const pooled = readdirSync(path.join(dir, "openai"));
         assert.equal(pooled.filter((f) => f.endsWith(".json") && !f.endsWith(".content-store.json")).length, 1, "pooled envelope present");
 
-        // Simulate the index miss: drop index.db entirely (plus sqlite
+        // Simulate the index loss: drop index.db entirely (plus sqlite
         // sidecars) while the envelope stays on disk.
         for (const side of ["index.db", "index.db-wal", "index.db-shm"]) {
             rmSync(path.join(dir, side), { force: true });
+        }
+        if (indexBreak === "unopenable") {
+            // A DIRECTORY at the db path forces maybeOpen into its CANTOPEN
+            // branch ("unable to open database file"): the fresh store
+            // degrades to legacy-only with `shadow` undefined — exactly the
+            // state a transient open failure under CI load leaves behind
+            // (#4049). The disk fallback must work there too.
+            mkdirSync(path.join(dir, "index.db"));
         }
 
         // Fresh store over the same dir: bare-id load MUST hydrate from the
@@ -124,4 +134,12 @@ test("bare-id loadSync hydrates a pooled envelope when the unified index misses 
         setRegistryForTest({});
         await rmrf(dir);
     }
+}
+
+test("bare-id loadSync hydrates a pooled envelope when the unified index misses (#3769 flake)", async () => {
+    await runPooledLoadFlow("delete");
+});
+
+test("bare-id loadSync hydrates a pooled envelope when the sidecar cannot open (#4049, #3769 flake family)", async () => {
+    await runPooledLoadFlow("unopenable");
 });

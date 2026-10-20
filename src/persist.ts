@@ -1322,13 +1322,16 @@ export class SessionStore {
         // #3931 step 3: network backends make the envelope the sync read
         // path — their viewFor/importRecord sync facades always miss, so
         // bare-id loads must find namespaced files without a bootBounded
-        // walk. Seeded once, sync. ANY unified mode (#3769 flake): on the
-        // sqlite path viewFor usually hits, but a bare-id load whose index
-        // row is not there yet (fresh store over an existing dir, row still
-        // in an in-flight chain) must still hydrate the pooled envelope off
-        // disk — without this the legacy fallback silently returns null and
-        // the session looks nonexistent until a full boot walk.
-        if (!this.diskFilesSeeded && this.shadow) {
+        // walk. Seeded once, sync, INDEPENDENT OF SIDECAR HEALTH (#4049):
+        // the envelope walk is the last-resort read path, so it must work
+        // when the sidecar is absent too — a CANTOPEN at construction
+        // (transient lock/fd/AV failure under load) or an explicit legacy
+        // mode leaves `shadow` undefined, and gating the seed on it turned
+        // every bare-id load of a pooled-path record into a permanent
+        // silent null (#3769 flake recurred through exactly this hole; on
+        // the sqlite path viewFor also misses for a fresh store whose
+        // index row is not there yet, row still in an in-flight chain).
+        if (!this.diskFilesSeeded && this.enabled) {
             this.diskFiles = [
                 ...walkJsonFilesSync(this.sessionsDir),
                 ...(existsSync(`${this.sessionsDir}-cold`) ? walkJsonFilesSync(`${this.sessionsDir}-cold`) : []),
