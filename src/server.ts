@@ -1821,7 +1821,7 @@ const SHUTDOWN_DRAIN_MAX_PASSES = 10;
 // genuinely dead parent still exits promptly.
 const WATCHER_DEAD_CONFIRM_TICKS = 3;
 
-export interface WatcherTickDecision {
+interface WatcherTickDecision {
     /** Remove this pid from the watcher set on this tick. */
     removed: boolean;
     /** Removed because the heartbeat expired while the pid still reads alive (#3544). */
