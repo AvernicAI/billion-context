@@ -478,11 +478,27 @@ export function noteInboundMessages(session: Session, msgs: CoreMessage[]): void
     const fps: string[] = [];
     const meta: { role: string; len: number; cls: string }[] = [];
     for (const m of msgs) {
-        const j = JSON.stringify(m);
+        // #4054: fingerprint CLIENT bytes only — drop bili's projected meter first.
+        const j = JSON.stringify(stripProjectedMeter(m));
         fps.push(createHash("sha256").update(j).digest("hex").slice(0, 16));
         meta.push({ role: String((m as { role?: unknown }).role ?? "?"), len: j.length, cls: inboundMessageClass(m) });
     }
     transient.inBody = { msgs: msgs.length, fps, meta };
+}
+
+/** #4054: strip the top-level projected thinking-token meter so the inbound
+ *  fingerprint reflects CLIENT bytes only. `thinkingTokens`' sole producer is
+ *  bili's own #1320 projection (`projectThinkingMass`, budget.ts:175) — no wire
+ *  codec fills it from client bytes — so any change between two requests is by
+ *  definition NOT a client change and must not drive the #3023 client arm. */
+function stripProjectedMeter(m: CoreMessage): unknown {
+    const r = m as unknown as Record<string, unknown>;
+    if (!("thinkingTokens" in r)) return m;
+    const rest: Record<string, unknown> = {};
+    for (const key of Object.keys(r)) {
+        if (key !== "thinkingTokens") rest[key] = r[key];
+    }
+    return rest;
 }
 
 function inboundMessageClass(m: CoreMessage): string {
