@@ -78,7 +78,7 @@ export function localRefusalCovers(metadata: Record<string, unknown>, origin: st
  *  host cannot re-bill it. The READ side stays inline in server.ts this step:
  *  its replay semantics (status fallback, stale-key eviction) are exactly as
  *  rich as the block that owns them; the write side is owned here. */
-export interface PreflightDeadEndRecord {
+interface PreflightDeadEndRecord {
     key: string;
     until: number;
     status: number;

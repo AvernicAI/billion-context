@@ -8,7 +8,7 @@
 /** Structural slice of the walk outcome the classification needs. The walk
  *  result itself stays internal to server.ts; only the fields the verdict
  *  reads are required here, so this stays a pure, dependency-free module. */
-export interface VerdictWalkSlice {
+interface VerdictWalkSlice {
     kind?: string;
     deterministic?: boolean;
     status?: number;
@@ -16,7 +16,7 @@ export interface VerdictWalkSlice {
     detail?: string;
 }
 
-export type PreflightStatus = 413 | 502 | 503;
+type PreflightStatus = 413 | 502 | 503;
 
 /** (comment moved verbatim from server.ts)
  *  #3461 problem 2: DETERMINISTIC exhaustion (futile-round math proved no
