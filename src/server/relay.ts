@@ -8,7 +8,7 @@ import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens
 import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
-import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleRejectionImageLearning, settleUsageReport } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
@@ -60,7 +60,7 @@ import { buildForwardHeaders, connectionNamedHeaders, RESPONSE_ONLY_STRIP_HEADER
 import { bodyDumpEnabled, logDumpFailure } from "./observability.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
-import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
+import { buildForwardTarget, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageReserveFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path
@@ -592,8 +592,8 @@ export async function forward(
     // facts stay the pairing source, same as noteForwardedBody's semantics.
     if (prepared && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
         const nImages = countImagesInRawBody(prepared.protocol, wireBody);
+        const learnUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
         if (nImages > 0) {
-            const learnUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const msgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
             noteForwardedImageFacts(prepared.session, {
                 nImages,
@@ -602,6 +602,16 @@ export async function forward(
                 fp: `${imageBillingFor(opts, learnUpstream)}:${imageTokenCapFor(opts, learnUpstream)}`,
             });
         }
+        // #3947: pair every round's anchor with the image mass it actually
+        // carried — stamped here (send chokepoint) because usage settles and
+        // overflow arms land AFTERWARDS from the same round's payload. The
+        // value is the same learned-??-prior caliber imageReserveFor feeds the
+        // prepare lanes, so effectiveTokenCount's lift subtracts like-for-like.
+        // Text-only rounds stamp 0 on purpose: a stale non-zero from an earlier
+        // image round would under-lift a later anchor.
+        prepared.session.stats.lastInputImageTokens = nImages > 0
+            ? imageReserveFor(prepared.session, prepared.protocol, wireBody, opts, learnUpstream)
+            : 0;
     }
     // Must be created before fetchWithTimeout: the signal aborts the upstream
     // request when the client disconnects (IDE cancel), otherwise the proxy
@@ -992,6 +1002,11 @@ export async function forward(
         if (overflowArmed || !info.isOverflow) return;
         overflowArmed = true;
         const s = prepared!.session;
+        // #3947: an unbilled overflow rejection still states the payload's own
+        // size — teach the per-image cost from it now (the billing channel
+        // can't fire on a request that was never billed). No-op when the body
+        // carries no parseable count or the rejected round had no images.
+        if (typeof info.requestedTotal === "number" && info.requestedTotal > 0) settleRejectionImageLearning(s, info.requestedTotal);
         let reqModel: string | undefined;
         let rawBody: string | undefined;
         try {

@@ -672,21 +672,54 @@ export function noteForwardedImageFacts(session: Session, facts: ForwardedImageF
     imageFactsLastSent.set(session, facts);
 }
 
-function settleImageLearning(session: Session, billedTotal: number): void {
+function consumeImageFacts(session: Session): ForwardedImageFacts | undefined {
     const facts = imageFactsLastSent.get(session);
-    if (!facts) return;
+    if (!facts) return undefined;
     imageFactsLastSent.delete(session);
-    if (facts.nImages <= 0 || billedTotal <= 0) return;
-    const observed = billedTotal - facts.textSide;
-    if (observed <= 0) return; // text estimate overshot the bill — no signal
-    const per = observed / facts.nImages;
+    return facts;
+}
+
+/** Shared EMA absorption for both sample channels (#3947): one entry per host,
+ *  fingerprint-invalidated, TTL'd, capped. */
+function absorbImageSample(session: Session, host: string, fp: string, per: number): void {
     if (!(per >= 1 && per <= LEARNED_PER_IMAGE_MAX)) return; // out-of-band sample
     const store = (session.metadata.learnedImageCosts ?? {}) as Record<string, LearnedImageCostEntry>;
-    const prev = store[facts.host];
+    const prev = store[host];
     const cost = prev && typeof prev.cost === "number" ? prev.cost * (1 - LEARNED_IMAGE_COST_ALPHA) + per * LEARNED_IMAGE_COST_ALPHA : per;
-    store[facts.host] = { cost, seen: (prev?.seen ?? 0) + 1, ts: Date.now(), fp: facts.fp };
+    store[host] = { cost, seen: (prev?.seen ?? 0) + 1, ts: Date.now(), fp };
     session.metadata.learnedImageCosts = store;
     markDirty(session);
+}
+
+function settleImageLearning(session: Session, billedTotal: number): void {
+    const facts = consumeImageFacts(session);
+    if (!facts || facts.nImages <= 0 || billedTotal <= 0) return;
+    const observed = billedTotal - facts.textSide;
+    if (observed <= 0) return; // text estimate overshot the bill — no signal
+    absorbImageSample(session, facts.host, facts.fp, observed / facts.nImages);
+}
+
+/** #3947: rejection-side twin of settleImageLearning. An UNBILLED overflow
+ *  rejection still states the rejected payload's own size in its body ("you
+ *  requested N tokens", 「本次请求约 N tokens」) — that is this route's count of
+ *  exactly the bytes we just forwarded, and it is the only evidence available
+ *  while every forward is rejected: settleImageLearning gates on a positive
+ *  bill, which by definition never lands in that state, so without this the
+ *  learned reserve stays at the pixels prior and every size judgment
+ *  undercounts an image-dominated payload by up to ~19× (incident #3947). Same
+ *  seam, same store, same guards — the sample is (statedTotal − textSide)/nImages
+ *  from the facts captured at the send chokepoint of the rejected round. A
+ *  stated total below our own text-side estimate is an inconsistent sample
+ *  (mis-parsed number or a count of a subset) and is dropped rather than
+ *  learned: a wrong guess poisons every later fit decision on the route.
+ *  Consumption is one-shot like the billing channel — the next forward
+ *  recaptures fresh facts before any later settle. */
+export function settleRejectionImageLearning(session: Session, statedTotal: number): void {
+    const facts = consumeImageFacts(session);
+    if (!facts || facts.nImages <= 0 || !Number.isFinite(statedTotal) || statedTotal <= 0) return;
+    const observed = statedTotal - facts.textSide;
+    if (observed <= 0) return; // route counted less than our text estimate — inconsistent
+    absorbImageSample(session, facts.host, facts.fp, observed / facts.nImages);
 }
 
 /** Consume side of L1: the learned reserve for THIS payload — learned per-image

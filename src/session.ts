@@ -405,6 +405,16 @@ export type Session = {
          *  provider says nothing about whether another accepts the payload.
          *  Absent on legacy session files → baseline keeps legacy behavior. */
         lastInputTokensOrigin?: string;
+        /** #3947: image reserve (learned ?? prior, same caliber as
+         *  imageReserveFor) of the payload whose anchor lastInputTokens
+         *  describes — co-stamped at the send chokepoint of that round, so a
+         *  usage settle or overflow arm landing from the same round pairs with
+         *  the image mass actually forwarded. effectiveTokenCount lifts the
+         *  anchor by (current reserve − this) only: images added since the
+         *  reading count, text-side drift never does (#1839/#1820 ghost
+         *  discipline). Dropped with the other baseline stats at
+         *  native-compaction boundaries. Absent → treated as 0. */
+        lastInputImageTokens?: number;
          /** #1933 F1: calibrated scale factor k̂ = mean of up to 3 recent
           *  consistent same-route samples of (upstream-billed input ÷ local
          *  text estimate), clamped to [0.25, 4] — two-way since #2366: the
@@ -1253,6 +1263,8 @@ export function resetSessionCompression(session: Session): void {
     session.stats.lastInputTokens = 0;
     // #857: a zeroed baseline carries no provenance — drop any stale flag.
     delete session.stats.lastInputTokensSource;
+    // #3947: the pairing image mass dies with the anchor it describes.
+    delete session.stats.lastInputImageTokens;
     // #1110: the conversation was rebuilt — a pre-compaction overflow arm no
     // longer bounds this session; drop it so the guard falls back to the
     // declared window instead of clamping to a stale ceiling.

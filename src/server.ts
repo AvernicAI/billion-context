@@ -2310,7 +2310,18 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // #1839: an overflow arm rides in here too — it is evidence, not billing,
     // but it is bounded by the declared/stated window so it cannot produce
     // the >100% ghost class, and the next real usage report overwrites it.
-    if (session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm")) return { tokens: session.stats.lastInputTokens, source: "usage" };
+    if (session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm")) {
+        // #3947: the anchor covers the payload of ITS OWN round, whose image
+        // mass was co-stamped at the send chokepoint (lastInputImageTokens).
+        // If the CURRENT view carries more image mass than that round did —
+        // images added since the reading ride none of the text calibers — lift
+        // the anchor by exactly that delta. Anything text-side stays anchored
+        // byte-identical: the local estimate must never re-amplify over a real
+        // reading (#1839/#1820 ghost discipline), so a text-only or same-image
+        // turn returns the raw anchor unchanged.
+        const lift = inboundImageTokens - (session.stats.lastInputImageTokens ?? 0);
+        return { tokens: lift > 0 ? session.stats.lastInputTokens + lift : session.stats.lastInputTokens, source: "usage" };
+    }
     // #1820: right after a preflight rebuild the usage-grade baseline above is
     // momentarily absent (the rebuild request's own report hasn't landed yet,
     // or the upstream never reports), and every branch below sizes on the
@@ -3216,9 +3227,17 @@ export async function preflightCompressIfNeeded(
     // the hatch and #488's 400 loop reopens); an estimate-derived or
     // legacy-unmarked baseline is NOT (#857: preflight used to write image
     // estimates back into lastInputTokens, which permanently closed this
-    // hatch on pixel-billing upstreams). With evidence present we trust the
-    // estimate and fall through to fold / fail-fast below.
-    const noOverflowEvidence = session.stats.lastInputTokens < limit
+    // hatch on pixel-billing upstreams). The ≥ window test applies to
+    // usage-grounded baselines (a small successful bill proves the payload
+    // FITS); an overflow-arm is evidence at ANY magnitude — the classified
+    // rejection itself proved overflow, and the no-window arm branch stamps
+    // min(declared, defaultCountTokens(rawBody)), which sits far BELOW the
+    // window for CJK/base64-heavy bodies (local char/4 « upstream bill) —
+    // requiring ≥ window there left the hatch open after every such rejection
+    // and re-opened #488's identical-400 loop (#3947). With evidence present
+    // we trust the estimate and fall through to fold / fail-fast below.
+    const noOverflowEvidence =
+        (session.stats.lastInputTokensSource === "usage" && session.stats.lastInputTokens < limit)
         || (session.stats.lastInputTokensSource !== "usage" && session.stats.lastInputTokensSource !== "overflow-arm");
     // #1800/#1843: the TEXT channel fits the window but `text + imageReserve`
     // does not, and we hold no overflow evidence → the image reserve clears the
