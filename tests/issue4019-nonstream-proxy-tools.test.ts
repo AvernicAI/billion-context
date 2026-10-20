@@ -186,6 +186,26 @@ test("#4019 mixed round: proxy + real tool -> proxy surfaced as text, only real 
     }
 });
 
+test("#4019 non-stream openai: compress is executed + re-requested so the model continues post-compress", async () => {
+    const h = installFetch([openaiResponse({ content: "POST-COMPRESS-ANSWER", finishReason: "stop" })]);
+    try {
+        const out = await compressLoopOpenaiJson(
+            openaiResponse({ content: null, toolCalls: [toolCall("c_cmp", "compress", {})] }),
+            makeCtx("i4019-compress", () => {}),
+            {},
+            { messages: [{ role: "user", content: "compress please" }] },
+            { url: UNUSED_URL, headers: JSON_HEADERS },
+        );
+        assert.equal(h.count(), 1, "compress must trigger a re-request (pre-fix behavior stopped at finish=stop here)");
+        const { choice, message } = choiceOf(out);
+        assert.equal(message.tool_calls, undefined, "no undeclared proxy tool_calls leak");
+        assert.equal(choice.finish_reason, "stop");
+        assert.match(String(message.content), /POST-COMPRESS-ANSWER/, "model continues after compression");
+    } finally {
+        h.restore();
+    }
+});
+
 // #539/#684: OpenAI-wire thinking models (DeepSeek et al.) 400 a re-request that
 // drops the assistant turn's reasoning_content. The continuation must echo it back.
 test("#4019 non-stream openai: reasoning_content rides the proxy-only continuation verbatim (#539 class)", async () => {
