@@ -307,3 +307,56 @@ test("pin #3977 P-LEARN: an upstream 400 that STATES the real token count teache
         await close();
     }
 });
+
+// P-LEARN's companion edge: the steady-state assertion above compares two
+// POST-400 titles, so a ONE-TIME uptake of the stated count (k̂ recalibrated
+// once, or a one-off overflow-arm floor) would leave them equal and sail
+// through. The missing baseline is a session that NEVER saw the 400: today
+// the treated and the control refuse the same payload with byte-identical
+// titles; when step 4 makes the stated count calibration evidence, the
+// treated title's numbers/clauses move away from the control. (@flip-target)
+test("pin #3977 P-LEARN-b: refusal title after a stated-count 400 is byte-identical to a session that never saw the 400 (@flip-target for step 4)", async () => {
+    // Control: seed, then the oversized non-foldable payload — the unlearned
+    // reference title.
+    const upA = makeUpstream();
+    const portA = await listen(upA);
+    const a = await setup({ [`http://127.0.0.1:${portA}`]: { models: { "gpt-test": { context: WINDOW } } } });
+    let titleControl = "";
+    try {
+        a.ctx.headers["x-acp-session"] = "p3977-learn-control";
+        const rSeed = await post(a.ctx, { model: "gpt-test", stream: true, messages: [{ role: "user", content: "hello" }] });
+        assert.equal(rSeed.status, 200, "the fitting seed forwards");
+        await rSeed.text();
+        const rBig = await post(a.ctx, { model: "gpt-test", stream: true, messages: [{ role: "system", content: bigSystem() }, { role: "user", content: "q" }] });
+        assert.equal(rBig.status, 413, "oversized payload refused locally");
+        titleControl = await rBig.text();
+    } finally {
+        upA.server.close();
+        upA.server.closeIdleConnections?.();
+        await a.close();
+    }
+
+    // Treated: seed, detour into the #3900-shaped stated-count 400, then the
+    // SAME oversized payload.
+    const upB = makeUpstream();
+    const portB = await listen(upB);
+    const b = await setup({ [`http://127.0.0.1:${portB}`]: { models: { "gpt-test": { context: WINDOW } } } });
+    try {
+        b.ctx.headers["x-acp-session"] = "p3977-learn-treat";
+        const rSeed = await post(b.ctx, { model: "gpt-test", stream: true, messages: [{ role: "user", content: "hello" }] });
+        assert.equal(rSeed.status, 200, "the fitting seed forwards");
+        await rSeed.text();
+        upB.arm400();
+        const rImg = await post(b.ctx, { model: "gpt-test", stream: true, messages: [{ role: "user", content: imageContent() }] });
+        assert.equal(rImg.status, 400, "the detour rides and gets the stated-count 400");
+        await rImg.text();
+        const rBig = await post(b.ctx, { model: "gpt-test", stream: true, messages: [{ role: "system", content: bigSystem() }, { role: "user", content: "q" }] });
+        assert.equal(rBig.status, 413, "still refused locally");
+        const titleTreated = await rBig.text();
+        assert.equal(titleTreated, titleControl, "a one-time uptake of the stated count would move these numbers/clauses — today the 400 teaches nothing");
+    } finally {
+        upB.server.close();
+        upB.server.closeIdleConnections?.();
+        await b.close();
+    }
+});
