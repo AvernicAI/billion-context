@@ -17,7 +17,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, appendFileSync, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { log as loggerLog } from "../logger.js";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type SqliteEngineSource } from "./driver.js";
@@ -939,10 +939,18 @@ export class UnifiedStore {
      *  is forever; a restore must land on the same session id). Pinned
      *  checkpoints keep their rows + refs. Idempotent: an already-archived
      *  session is a no-op returning the existing export path. */
+    /** #3901/#3463: single append-only archive log — one JSON line per
+     *  archived session, not one tiny file per session. */
+    static readonly ARCHIVE_LOG_NAME = "archive.jsonl";
+
     archiveSession(sessionId: string, opts: { archiveDir: string }): { ok: boolean; exportPath?: string; reason?: string; contentRowsDeleted?: number } {
         const row = this.getSessionRow(sessionId);
         if (!row) return { ok: false, reason: "not-found" };
-        if (row.status === "archived") return { ok: true, exportPath: join(opts.archiveDir, `${sessionId}.json`) };
+        // #3901 review: sessions are small and numerous — a per-session file
+        // per archive would spray tiny files across the archive dir. One
+        // append-only JSONL holds every archived session, one line each.
+        const exportPath = join(opts.archiveDir, UnifiedStore.ARCHIVE_LOG_NAME);
+        if (row.status === "archived") return { ok: true, exportPath };
         // --- read everything the session owns (before any mutation) ---
         const messages = (this.db.prepare("SELECT seq, msg_id, ref, ref_num, role, kind, content_hash FROM messages WHERE session_id = ? ORDER BY seq").all(sessionId) as Record<string, unknown>[]);
         const mediaMaps = (this.db.prepare("SELECT seq, media_hash FROM message_media WHERE session_id = ?").all(sessionId) as Record<string, unknown>[]);
@@ -964,9 +972,11 @@ export class UnifiedStore {
             const c = this.db.prepare("SELECT bytes FROM content WHERE hash = ?").get(hash) as { bytes: Buffer | Uint8Array } | undefined;
             if (c) content[hash as string] = Buffer.from(c.bytes).toString("utf8");
         }
-        const exportPath = join(opts.archiveDir, `${sessionId}.json`);
         mkdirSync(opts.archiveDir, { recursive: true });
-        writeFileSync(exportPath, JSON.stringify({ version: 1, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }));
+        // One JSONL line per archived session: append-only (cheap, crash =
+        // at worst one truncated line which the reader skips), restore
+        // rewrites the file without the restored session's lines.
+        appendFileSync(exportPath, JSON.stringify({ version: 1, sessionId, archivedAt: Date.now(), session: row, content, messages, mediaMaps, blocks, refs: refsRows, deadRefs, ccrEntries: ccr, sessionExt: ext, checkpoints }) + "\n");
         // --- sweep the row bodies (refcount discipline; pinned checkpoints survive) ---
         let contentRowsDeleted = 0;
         this.db.transaction(() => {
@@ -999,7 +1009,7 @@ export class UnifiedStore {
      *  re-claims ON CONFLICT DO NOTHING (first claimant wins; the binding
      *  never left, so this is normally a no-op). */
     restoreArchived(sessionId: string, opts: { archiveDir: string }): { ok: boolean; reason?: string } {
-        const exportPath = join(opts.archiveDir, `${sessionId}.json`);
+        const exportPath = join(opts.archiveDir, UnifiedStore.ARCHIVE_LOG_NAME);
         if (!existsSync(exportPath)) return { ok: false, reason: "export-missing" };
         let dump: {
             session: ReturnType<UnifiedStore["getSessionRow"]>;
@@ -1012,8 +1022,29 @@ export class UnifiedStore {
             sessionExt: Record<string, unknown>[];
             checkpoints: Record<string, unknown>[];
         };
+        // Scan the JSONL for the session's line (skip malformed/truncated
+        // trailing lines — an archive append interrupted by a crash must not
+        // block restoring OTHER sessions).
+        let lineNo = -1;
+        let rawLines: string[] = [];
         try {
-            dump = JSON.parse(readFileSync(exportPath, "utf8")) as typeof dump;
+            rawLines = readFileSync(exportPath, "utf8").split("\n");
+            for (let i = 0; i < rawLines.length; i++) {
+                if (!rawLines[i].trim()) continue;
+                let candidate: { sessionId?: string };
+                try {
+                    candidate = JSON.parse(rawLines[i]) as { sessionId?: string };
+                } catch {
+                    continue;
+                }
+                if (candidate.sessionId === sessionId) { lineNo = i; break; }
+            }
+        } catch {
+            return { ok: false, reason: "export-corrupt" };
+        }
+        if (lineNo === -1) return { ok: false, reason: "export-missing" };
+        try {
+            dump = JSON.parse(rawLines[lineNo]) as typeof dump;
         } catch {
             return { ok: false, reason: "export-corrupt" };
         }
@@ -1049,7 +1080,20 @@ export class UnifiedStore {
                     sess.lastIngestedSeq ?? null, sess.orphansJson ?? null, sessionId,
                 );
         });
-        loggerLog("info", `[#3901] restored archived session ${sessionId} from ${exportPath}`);
+        // Drop the restored session's line(s) from the JSONL (a same-session
+        // archive can theoretically appear more than once across reinstalls;
+        // rewrite removes them all). Other sessions' lines are untouched.
+        const kept: string[] = [];
+        for (const l of rawLines) {
+            if (!l.trim()) continue;
+            try {
+                const head = JSON.parse(l) as { sessionId?: string };
+                if (head.sessionId === sessionId) continue;
+            } catch { continue; }
+            kept.push(l);
+        }
+        writeFileSync(exportPath, kept.length > 0 ? kept.join("\n") + "\n" : "");
+        loggerLog("info", `[#3901] restored archived session ${sessionId} from ${exportPath} (line removed from the archive log)`);
         return { ok: true };
     }
 

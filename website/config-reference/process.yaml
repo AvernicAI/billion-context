@@ -278,7 +278,7 @@ entries:
     default: "365"
     env: BILI_STORAGE_ARCHIVE_AFTER_DAYS
     group: process
-    desc_en: "GC age sweep window in days (#3463, #3901): sessions idle longer than this are archived - full export to the archive dir under the sessions directory, a tombstone row keeps the label and identity, content/media refs are released, and restore is one POST away. 0 disables the age sweep; POST /__bili/storage/gc always runs and takes ?vacuum=full to shrink an existing index.db (auto_vacuum=INCREMENTAL is always on for new writes). Env wins over the file tier."
+    desc_en: "GC age sweep window in days (#3463, #3901): sessions idle longer than this are archived - one JSON line appended to a single archive log (archive/archive.jsonl under the sessions directory — no per-session file spray), a tombstone row keeps the label and identity, content/media refs are released, and restore is one POST away. 0 disables the age sweep; POST /__bili/storage/gc always runs and takes ?vacuum=full to shrink an existing index.db (auto_vacuum=INCREMENTAL is always on for new writes). Env wins over the file tier."
     desc_zh: "GC 年龄清扫窗口（天，#3463/#3901）：闲置超过该时长的会话被归档 —— 完整导出到会话目录下的 archive/，墓碑行保留标签与身份，释放内容/媒体引用，一条 POST 即可恢复。0 关闭年龄清扫；POST /__bili/storage/gc 始终可用并支持 ?vacuum=full 收缩存量 index.db（新写入始终 auto_vacuum=INCREMENTAL）。环境变量优先于配置文件层。"
   - key: sessions
     type: object

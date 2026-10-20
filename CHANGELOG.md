@@ -7,7 +7,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ### 存储收尾九项一车（#3901，修复 #3463/#3762/#3841/#3798/#3633；#3723 落地）
 
-- **GC 与归档（#3463）**：新 `storage.archiveAfterDays`（环境变量 `BILI_STORAGE_ARCHIVE_AFTER_DAYS`，缺省 365，0=关）——闲置超期的会话归档（完整导出到 sessions 目录下 `archive/` + 墓碑行保标签 + 释放全部内容/媒体引用），`POST /__bili/storage/gc`（可带 `vacuum`）手动触发，`POST /__bili/storage/restore` 恢复；`auto_vacuum=INCREMENTAL` 常开（存量库首次需 `?vacuum=full` 收缩）。
+- **GC 与归档（#3463）**：新 `storage.archiveAfterDays`（环境变量 `BILI_STORAGE_ARCHIVE_AFTER_DAYS`，缺省 365，0=关）——闲置超期的会话归档（单文件追加式归档日志 `archive/archive.jsonl`，每会话一行——不撒小文件；墓碑行保标签 + 释放全部内容/媒体引用），`POST /__bili/storage/gc`（可带 `vacuum`）手动触发，`POST /__bili/storage/restore` 恢复；`auto_vacuum=INCREMENTAL` 常开（存量库首次需 `?vacuum=full` 收缩）。
 - **reap 台账（#3841）**：schema v6 `sessions.orphans_json`——收割形状（state.blocks 失块、blockContents 留文）现在定向记台账：被收割块行删除（引用计数释放），孤儿内容并入视图但不复活 state.blocks；重启不再复活已收割块、不再污染信封。
 - **媒体 CAS（#3762）**：schema v7 `message_media`——图片 base64 以内容哈希进 CAS、消息行只存 `{"$media":hash}` 引用（读回逐字节水合），同图多会话只存一份；删除/归档时引用计数释放。
 - **增量指针（#3798）**：`inc:canonical-ptrs` 逐行指针替代 base-seq 计数切片——resync 共享前缀的行复用不再丢历史；resync 时点先失效旧指针（响应前持久化），崩溃窗口退回旧切片语义（永不供错分支）；turn 锁重排：响应阶段 409 turn-in-flight 照旧、ack 之后的回写链被下一轮 await（ack 永不超前行落盘）。

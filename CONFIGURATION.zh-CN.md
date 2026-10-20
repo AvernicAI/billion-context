@@ -333,7 +333,7 @@
 | Key | Type | Default | Env | Description |
 |-----|------|---------|-----|-------------|
 | `BILI_DSH_AUTHORED_COMPACTION` | boolean | true (on, #3901 flip) | — | 让 bili 本地应答 dsh 压缩摘要请求（返回折叠快照而非拒绝，#3733）：身份头 + 内核渲染格式的块摘要，零出口流量；重放经 #2432 再基线识别。 |
-| `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | integer | 365 | — | GC 年龄清扫窗口（天，#3463）：闲置超过该时长的会话被归档（完整导出到归档目录 + 墓碑行保留标签 + 释放内容/媒体引用）。0 关闭年龄清扫；手动入口 POST /__bili/storage/gc 始终可用。配置文件键 storage.archiveAfterDays 为持久形式。 |
+| `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | integer | 365 | — | GC 年龄清扫窗口（天，#3463）：闲置超过该时长的会话被归档（单文件归档日志 archive/archive.jsonl 追加一行 + 墓碑行保留标签 + 释放内容/媒体引用）。0 关闭年龄清扫；手动入口 POST /__bili/storage/gc 始终可用。配置文件键 storage.archiveAfterDays 为持久形式。 |
 | `BILI_SNAPSHOT_SHADOW` | boolean | true (on) | — | 快照渲染影子对账（#3756 后续）：每轮已折叠会话都用引擎现算一次出站快照视图但不使用，与 legacy 实际出站比对分类，逐会话计数进 web 面板与 snapshot-shadow 诊断主题。0/false/off 关闭；1/true/on 开启；否则读配置文件 snapshot.shadow 布尔（默认开）。渲染车道本身仍受灰度开关控制（BILI_ROLLOUT_SNAPSHOT_RENDER），影子车道绝不改变出站字节 —— 它是后续翻转灰度的干跑证据。 |
 | `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | 覆盖配置文件路径（路径重定位）。 |
 | `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | 会话记录的存放目录（路径重定位）。 |
