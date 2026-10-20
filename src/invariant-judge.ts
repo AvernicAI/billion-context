@@ -325,9 +325,27 @@ function armed(): boolean {
   return invariantJudgeEnabled();
 }
 
+/** Bodies above this size are skipped by the judge — a full advisory-side
+ * JSON.parse of a #3128-scale multi-GiB body is an OOM/event-loop stall
+ * vector, and the judge's own precedent (SEAM_BODY_CAP, 512 KiB) already
+ * treats oversized bodies as "partial forensics: silently skip". Skips log
+ * at debug (visible when converging a bug), never warn: a skipped diagnostic
+ * is not a defect. Const by design — no knob until an operator asks (#4003). */
+const JUDGE_BODY_CAP = 4 * 1024 * 1024;
+
+function withinJudgeCap(body: string | Buffer | undefined): boolean {
+  if (body === undefined) return false;
+  const len = typeof body === "string" ? Buffer.byteLength(body) : body.length;
+  return len > 0 && len <= JUDGE_BODY_CAP;
+}
+
 export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
   if (!armed()) return;
   try {
+    if (!withinJudgeCap(input.body)) {
+      loggerLog("debug", `[invariant-judge] body over ${JUDGE_BODY_CAP} bytes — skipping (advisory layer, #4003 cap)`);
+      return;
+    }
     const entry = input.originalMessages ?? [];
     const exitCores0 = parseExitCores(input.body, input.protocol);
     if (!exitCores0) return; // unparseable/unknown wire → skip, never false-positive
@@ -357,6 +375,7 @@ export function maybeJudgeContinuity(
 ): void {
   if (!armed() || !prev) return;
   try {
+    if (!withinJudgeCap(prev) || !withinJudgeCap(body)) return;
     const entry = parseExitCores(prev, protocol);
     const exitCores0 = parseExitCores(body, protocol);
     if (!entry || !exitCores0) return;
