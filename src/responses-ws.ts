@@ -4,7 +4,7 @@ import WebSocket from "ws";
 import { MAX_REQUEST_BYTES, fetchWithTimeout, type FetchOptions } from "./fetch-util.js";
 import { withFetchTransport } from "./fetch-transport.js";
 import { BILI_HOP_HEADER } from "./server/context-window.js";
-import { connectionNamedHeaders, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
+import { connectionNamedHeaders, stripBiliPluginHeaders, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { BILI_TUNNEL_HEADER } from "./tunnel-guard.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import type { WsBridgeCodec, WsBridgeContext, WsBridgeSession } from "./ws-bridge.js";
@@ -85,7 +85,16 @@ export function finalizeResponsesWsUpstreamHeaders(url: string, rawHeaders: Fetc
     const headers = Object.fromEntries(new Headers(rawHeaders).entries());
     for (const key of Object.keys(headers)) if (UPSTREAM_HOP_HEADERS.has(key) || key.startsWith("sec-websocket-")) delete headers[key];
     stripRemoteCompactionBetaFeature(headers);
-    if (isAzureOpenAiHost(url)) for (const key of Object.keys(headers)) if (key.startsWith("x-bili-")) delete headers[key];
+    // #3905: parity with the HTTP forward path. Azure caps custom WS headers
+    // (#2359), so there EVERY x-bili-* goes (protocol markers included — azure is
+    // a terminal provider that never reads them). Elsewhere strip only the
+    // host-private x-bili-plugin* family, keeping hop/tunnel/ws-lane alive for
+    // downstream-bili transit (#300/#1086).
+    if (isAzureOpenAiHost(url)) {
+        for (const key of Object.keys(headers)) if (key.startsWith("x-bili-")) delete headers[key];
+    } else {
+        stripBiliPluginHeaders(headers);
+    }
     return headers;
 }
 

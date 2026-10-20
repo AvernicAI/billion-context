@@ -146,7 +146,7 @@ import {
     streamKeepAliveMs as knobStreamKeepAliveMs,
 } from "./knobs.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
-import { connectionNamedHeaders, NO_IDENTITY_MESSAGE, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
+import { connectionNamedHeaders, NO_IDENTITY_MESSAGE, stripBiliPluginHeaders, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { installWebSocketBridge } from "./ws-bridge.js";
 import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
@@ -2509,6 +2509,10 @@ export function buildForwardTarget(
         }
         if (!(isLoopbackAddress(req.socket.remoteAddress) && destLoopback && destAdminPath)) headers[BILI_TUNNEL_HEADER] = "1";
     }
+    // #3905: strip the host-private x-bili-plugin* convention family so none of
+    // it reaches the model endpoint. The bili→bili protocol markers (hop/tunnel/
+    // ws-lane) are intentionally left for downstream-bili transit (#300/#1086).
+    stripBiliPluginHeaders(headers);
     headers["host"] = new URL(upstreamUrl).host;
     // #3073: shared with the WS lane's final egress so probe and turn carry
     // the same beta surface (see stripRemoteCompactionBetaFeature).

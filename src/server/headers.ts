@@ -43,6 +43,25 @@ export const UPSTREAM_HOP_HEADERS = new Set([
 // binary bodies (#677).
 export const RESPONSE_ONLY_STRIP_HEADERS = new Set(["content-encoding"]);
 
+// #3905: the `x-bili-plugin*` family is host-private convention metadata — the
+// agent marker, conversation id, window/model declarations, and the declared-
+// tools channel (#3906/#3907). Each is consumed ONCE at this instance's ingress
+// to configure how the request is handled; none is meaningful to a real model
+// endpoint, yet the main HTTP lane used to copy every inbound header through,
+// leaking the whole family to the provider. Strip it at every outbound
+// model-endpoint derivation. The bili→bili PROTOCOL markers (x-bili-hop,
+// x-bili-tunnel, x-bili-ws-lane) are deliberately left alone: their consumer is
+// a DOWNSTREAM bili's ingress decision (#300/#1086), so they must survive
+// transit even though they leak harmlessly onto a terminal provider.
+/** #3905: remove every `x-bili-plugin*` header. Applied at each outbound
+ *  model-endpoint derivation (HTTP forward + WS egress) so host-private
+ *  convention metadata never rides to the provider. Mutates in place. */
+export function stripBiliPluginHeaders(headers: Record<string, string>): void {
+    for (const k of Object.keys(headers)) {
+        if (k.toLowerCase().startsWith("x-bili-plugin")) delete headers[k];
+    }
+}
+
 // RFC 7230 §6.1: the Connection header names additional hop-by-hop headers
 // that must be stripped per-message. Returns their lowercased names.
 export function connectionNamedHeaders(conn: string | string[] | undefined): Set<string> {
