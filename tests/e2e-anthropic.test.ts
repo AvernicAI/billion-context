@@ -28,6 +28,10 @@ const UPSTREAM_SYSTEM = "You are a test assistant.";
 // ~3660 chars of padding: the kernel refuses to fold ranges below a 5000-char
 // minimum, so the state-equivalence fixture's compressed range needs mass.
 const FILLER = "lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(60);
+// A genuine CC auto-mode one-shot carries the ENTIRE flattened session inside
+// the <transcript> wrapper (KB..MB scale); sub-KB placeholders fall below the
+// #3908 span floor and must NOT be detected as classifier requests.
+const CLASSIFIER_TRANSCRIPT = "<transcript>\n" + "[user] run deploy\n[assistant] ok\n".repeat(40) + "</transcript>";
 
 function anthropicSse(event: string, data: unknown): string {
     return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -443,7 +447,7 @@ test("e2e anthropic: auto-mode classifier forged locally by default — zero ups
             max_tokens: 64,
             stream: true,
             system: "You are a safety classifier.",
-            messages: [{ role: "user", content: "<transcript>\n[user] Is this command safe? rm -rf /\n</transcript>" }],
+            messages: [{ role: "user", content: CLASSIFIER_TRANSCRIPT }],
             stop_sequences: ["</severity>"],
         });
         assert.equal(h.captured.length, 0, `classifier request must produce ZERO upstream egress, got ${h.captured.length} requests`);
@@ -468,7 +472,7 @@ test("e2e anthropic: auto-mode classifier block flavor forged as bare <block>no<
             max_tokens: 64,
             stream: true,
             system: "You are a safety classifier.",
-            messages: [{ role: "user", content: "<transcript>\n[user] Is this command safe? rm -rf /\n</transcript>" }],
+            messages: [{ role: "user", content: CLASSIFIER_TRANSCRIPT }],
             stop_sequences: ["</block>"],
         });
         assert.equal(h.captured.length, 0, "zero upstream egress");
@@ -510,7 +514,7 @@ test("e2e anthropic: auto-mode classifier no-stop shape (stage-2/fast) forged vi
             max_tokens: 8192,
             stream: true,
             system: "You are a safety classifier. 50 is exactly the allow/block boundary.",
-            messages: [{ role: "user", content: "<transcript>\n[user] deploy to production\n</transcript>" }],
+            messages: [{ role: "user", content: CLASSIFIER_TRANSCRIPT }],
         });
         assert.equal(h.captured.length, 0, "no-stop classifier shapes must also be forged locally");
         const events = parseAnthropicSse(raw);
@@ -557,7 +561,7 @@ test("e2e anthropic: forged classifier call leaves ACP state byte-equivalent (#2
             max_tokens: 64,
             stream: true,
             system: "You are a safety classifier.",
-            messages: [{ role: "user", content: "<transcript>\n[user] rm -rf /\n</transcript>" }],
+            messages: [{ role: "user", content: CLASSIFIER_TRANSCRIPT }],
             stop_sequences: ["</severity>"],
         });
         assert.equal(h.captured.length, preForgeCalls, "forged classifier call must add zero upstream egress");
