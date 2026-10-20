@@ -32,6 +32,7 @@ import { applyImageRescalePass } from "../image-rescale.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectOpenaiTool, injectTool } from "./inject.js";
+import { EXPOSED_TOOLS_HEADER, parseExposedToolsHeader } from "./headers.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 
 export async function prepareOpenai(
@@ -94,7 +95,7 @@ export async function prepareOpenai(
     // keep it — their extensions expose the tools to the agent.
     // #3417: that judgement now lives in lane-decisions (observed reachability
     // overrides the dsh default — #3401); alias kept for the remaining reads.
-    const laneDecisions = resolveLaneDecisions({ protocol: "openai", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject });
+    const laneDecisions = resolveLaneDecisions({ protocol: "openai", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject, exposedTools: parseExposedToolsHeader(req.headers[EXPOSED_TOOLS_HEADER]) });
 
     const markerCounts = stripRawStage(parsed, "openai");
     logRawStripCounts(markerCounts, log, sessionId);

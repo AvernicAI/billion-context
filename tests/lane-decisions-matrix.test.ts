@@ -96,7 +96,7 @@ const settledClose = (srv: http.Server): Promise<void> => {
     });
 };
 
-async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool = true, teachTokens = 50_000) {
+async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool = true, teachTokens = 50_000, exposedTools?: string) {
     // Windows CI flake class (seen on runners, not on dev VMs): listen(0)
     // occasionally lands in an OS-reserved/excluded port range and emits
     // "error" (EACCES/EADDRINUSE) instead of "listening". events.once(
@@ -186,7 +186,7 @@ async function harness(wire: Wire, lane: Lane, toolNames: string[], injectTool =
     const send = async (texts: string[]) => {
         const r = await fetch(`${origin}/bili/${upstreamUrl}${endpoint}`, {
             method: "POST",
-            headers: { "content-type": "application/json", "x-acp-session": `lane-${lane}-${toolNames.join("-") || "notools"}`, ...(lane === "proxy" ? {} : { "x-bili-plugin": lane }) },
+            headers: { "content-type": "application/json", "x-acp-session": `lane-${lane}-${toolNames.join("-") || "notools"}`, ...(lane === "proxy" ? {} : { "x-bili-plugin": lane }), ...(exposedTools !== undefined ? { "x-bili-plugin-exposed-tools": exposedTools } : {}) },
             body: JSON.stringify(buildBody(texts)),
         });
         const bodyText = await r.text();
@@ -246,7 +246,7 @@ function outcome(wire: Wire, sentCount: number, forwarded: Record<string, unknow
     return { nudge, standingPrompt: sys.includes(STANDING_MARKER) };
 }
 
-const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; teach?: number; expect: (w: Wire) => RowOutcome }[] = [
+const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; teach?: number; /** raw x-bili-plugin-exposed-tools value; undefined = header absent */ exposedTools?: string; expect: (w: Wire) => RowOutcome }[] = [
     { name: "omp control keeps the surface", lane: "omp", tools: [], expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "dsh no-tools drops the surface (#3177)", lane: "dsh", tools: [], expect: () => ({ nudge: false, standingPrompt: false }) },
     // #3401 FIX ROW: dsh with compress actually declared on
@@ -296,12 +296,21 @@ const ROWS: { name: string; lane: Lane; tools: string[]; injectTool?: boolean; t
     { name: "EMERGENCY cannot punch through an unreachable dsh tool table (reverse guard)", lane: "dsh", tools: [], teach: 45_000, expect: () => ({ nudge: false, standingPrompt: false }) },
     { name: "EMERGENCY override fires on the PTC run_code shape too", lane: "dsh", tools: ["run_code"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
     { name: "EMERGENCY override fires on the PTC code_run shape too (#3884)", lane: "dsh", tools: ["code_run"], teach: 45_000, expect: () => ({ nudge: true, standingPrompt: true }) },
+    // #3884 Step3+ declaration pair (owner-approved 2026-10-20): the host's
+    // x-bili-plugin-exposed-tools is ground truth when present. Positive: an
+    // UNRECOGNIZED omnibus shape that name-matching still misses becomes
+    // reachable once the host declares what it exposed — the future-rename
+    // case that sank #3600/#3884 alike. Reverse: a recognized omnibus on top
+    // level stays SUPPRESSED when the host says compress is not among what it
+    // exposed (declaration outranks inference in BOTH directions).
+    { name: "dsh declared-exposed compress rescues unrecognized omnibus shape (#3884 Step3+)", lane: "dsh", tools: ["code_run2"], exposedTools: "compress,decompress", expect: () => ({ nudge: true, standingPrompt: true }) },
+    { name: "dsh declared-not-exposed suppresses despite recognized omnibus (#3884 Step3+ reverse)", lane: "dsh", tools: ["run_code"], exposedTools: "", expect: () => ({ nudge: false, standingPrompt: false }) },
 ];
 
 for (const wire of ["anthropic", "openai", "responses", "google"] as const) {
     for (const row of ROWS) {
         test(`lane matrix [${wire}] ${row.name}`, { timeout: 60_000 }, async () => {
-            const h = await harness(wire, row.lane, row.tools, row.injectTool, row.teach);
+            const h = await harness(wire, row.lane, row.tools, row.injectTool, row.teach, row.exposedTools);
             try {
                 await h.send(["hello"]);                 // teach usage 50k / 64k = 78%
                 await h.send(historyTexts());            // arm the nudge

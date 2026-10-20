@@ -12,6 +12,9 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 - 暴露面：`/__bili/status` 的 `snapshotShadow` 汇总（enabled/watching/errors/worst）、web 会话列表逐会话计数（`snapshotShadow` 字段）、`snapshot-shadow` 诊断主题（GitHub 一键上报）、面板 banner（仅 error>0 时出现，附复制诊断/报 issue 按钮）。
 - 配置：环境变量 `BILI_SNAPSHOT_SHADOW` 优先，配置文件 `snapshot.shadow` 布尔次之，缺省开启（`false`/`0`/`off` 关闭）。这是灰度翻转前的全舰队干跑 —— error 率连续一版本≈0 才翻 rollout。
 
+### Added
+
+- **插件车道:宿主可按请求声明实际暴露的 bili 工具(`x-bili-plugin-exposed-tools`,#3884 Step3+,owner 批准)**。可达性判定此前只有 wire 形状推断(认顶层工具名),宿主每改一次拢子工具名就静默失配一次(#3600→#3884 两起事故)。现在插件车道的宿主可在每个请求的 header 里声明本 preset 实际暴露了哪些 bili 工具:声明在场即真源,压过全部推断档位(含 profile 默认)——顶层是不认识的**新** omnibus 形态、只要声明含 `compress` 即可达(未来改名免疫);反方向同样成立——顶层是认识的 omnibus、声明说没暴露 compress,面照关(双向钉死)。header 缺省时传统名字推断逻辑逐位保持(owner 约束:没加 header 的请求行为不变,不嘎);proxy 车道结构性开面不受声明影响。这是 #3417/#3482 Step3+ 结构级真源方向的第一步,dsh 侧后续在 code-mode preset 补声明后本机制即为其服务。测试:b-class 单测(优先级规则 9 行 + 解析器)+ 矩阵 e2e 四 wire 双向行(声明救未知形态 / 声明压认识形态)。
 
 ### Fixed
 

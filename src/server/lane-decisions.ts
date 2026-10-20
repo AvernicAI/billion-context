@@ -165,6 +165,13 @@ interface LaneDecisionInput {
     readonly parsed: unknown;
     /** injectTool config (`shouldInject`) — the config-level master switch. */
     readonly shouldInject: boolean;
+    /** #3884 Step3+: parsed x-bili-plugin-exposed-tools declaration for THIS
+     * request — null when the header is absent (undeclared host → the legacy
+     * wire-shape inference below applies bit-for-bit), [] when
+     * present-but-empty ("exposes none"). When non-null it is ground truth:
+     * the declaration outranks every inference rung, profile default
+     * included (an explicit "not exposed" beats toolsHostScopedByDefault). */
+    readonly exposedTools: string[] | null;
 }
 // ④ nudgeOn — the ONE nudge-injection gate (#3482 Step 2.5). The four
 // prepares used to carry four hand-copied conjunctions that drifted (#3293:
@@ -225,23 +232,40 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     const declaredTools = observeDeclaredTools(input.parsed, input.protocol);
     // Reachability truth: in PROXY mode bili itself injects the tool
     // definitions into the outbound body, so the surface is structurally on.
-    // In PLUGIN mode the host owns the tool table: reach when this request
-    // declares `compress` (observed — some dsh profiles DO surface it, #3401)
-    // or the host exposes bili tools to the model by design (profile default,
-    // #3177). PTC presets collapse EVERY tool into a single omnibus (SDK
-    // bindings nested inside it), so top-level absence of `compress` is not
-    // evidence of unreachability there — ANY known omnibus name reads as
-    // reachable. Known shapes live in CODE_MODE_OMNIBUS_TOOL_NAMES (run_code
-    // = dsh-tools built-in, DSH 0.1.x; code_run = dsh-codemode transport,
-    // DSH 0.2.x): #3600's miss was released 0.1.198 suppressing the surface
-    // on every dsh PTC session until the window hit 100%, and #3884's miss
-    // was that same single-literal gate going stale when DSH 0.2.x renamed
-    // the transport (12× ARMED-SUPPRESSED at 42% usage, pendingT1 10× over
-    // threshold, fully silent).
-    const compressReachable = !input.pluginMode
-        || declaredTools.has("compress")
-        || [...CODE_MODE_OMNIBUS_TOOL_NAMES].some((n) => declaredTools.has(n))
-        || !profile.toolsHostScopedByDefault;
+    // In PLUGIN mode the host owns the tool table, with two evidence tiers:
+    //   Tier 1 — DECLARATION (#3884 Step3+, owner-approved 2026-10-20): the
+    //   host stamps x-bili-plugin-exposed-tools with what it actually exposed
+    //   for THIS request. It IS the ground truth the name-guessing below
+    //   approximated, so it decides alone — even against a recognized omnibus
+    //   name (a host that says "not exposed" wins). Top-level `compress`
+    //   stays callable-truth either way: it is in the model's tool table when
+    //   observed, declaration or no.
+    //   Tier 2 — WIRE-SHAPE INFERENCE (absent header; every host today):
+    //   reach when this request declares `compress` (observed — some dsh
+    //   profiles DO surface it, #3401) or a known code-mode omnibus sits at
+    //   the top level (PTC presets collapse EVERY tool into one omnibus with
+    //   SDK bindings nested inside it, so top-level absence of `compress` is
+    //   not evidence of unreachability there) or the host exposes bili tools
+    //   by design (profile default, #3177). Known shapes live in
+    //   CODE_MODE_OMNIBUS_TOOL_NAMES (run_code = dsh-tools built-in, DSH
+    //   0.1.x; code_run = dsh-codemode transport, DSH 0.2.x): #3600's miss
+    //   was released 0.1.198 suppressing the surface on every dsh PTC session
+    //   until the window hit 100%, and #3884's miss was that same
+    //   single-literal gate going stale when DSH 0.2.x renamed the transport
+    //   (12× ARMED-SUPPRESSED at 42% usage, pendingT1 10× over threshold,
+    //   fully silent). An absent header must keep this tier bit-for-bit —
+    //   undeclared hosts behave exactly as before (owner constraint).
+    const topLevelCompress = declaredTools.has("compress");
+    let compressReachable: boolean;
+    if (!input.pluginMode) {
+        compressReachable = true;
+    } else if (input.exposedTools !== null) {
+        compressReachable = topLevelCompress || input.exposedTools.includes("compress");
+    } else {
+        compressReachable = topLevelCompress
+            || [...CODE_MODE_OMNIBUS_TOOL_NAMES].some((n) => declaredTools.has(n))
+            || !profile.toolsHostScopedByDefault;
+    }
     const compressSurfaceOn = input.shouldInject && compressReachable;
     const billingBlockObserved = extractBillingAttributionBlock(systemOf(input.parsed)) !== undefined;
     const billingBlockWanted = profile.wantsBillingBlock || billingBlockObserved;

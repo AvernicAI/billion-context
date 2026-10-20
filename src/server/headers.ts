@@ -31,6 +31,25 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     "upgrade",
 ]);
 
+/** #3884 Step3+ (owner-approved 2026-10-20): per-request DECLARATION from a
+ * plugin host of which bili tools it actually exposed for THIS request
+ * (comma-separated tool names; present-but-empty = "exposes none"). The
+ * registration state lives only in the host, so where hosts adopt this the
+ * declaration replaces wire-shape name-guessing (#3600/#3884 fragility
+ * class). Absent header = undeclared host — consumers fall back to the
+ * legacy inference bit-for-bit; an absent header must never change behavior
+ * (owner constraint, #3884 thread). Precedence rules live in
+ * resolveLaneDecisions (#3417 lane-decisions). */
+export const EXPOSED_TOOLS_HEADER = "x-bili-plugin-exposed-tools";
+
+/** Parse the declaration: undefined header → null (absent); any other value
+ * → trimmed, lowercased names ([] when nothing was declared). */
+export function parseExposedToolsHeader(value: string | string[] | undefined): string[] | null {
+    if (value === undefined) return null;
+    const raw = Array.isArray(value) ? value.join(",") : value;
+    return raw.split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.length > 0);
+}
+
 // content-encoding is end-to-end (RFC 9110 §7.2), NOT hop-by-hop — but the two
 // directions need opposite treatment. RESPONSES: Node's fetch transparently
 // decodes compressed bodies, so the upstream's encoding marker must not reach

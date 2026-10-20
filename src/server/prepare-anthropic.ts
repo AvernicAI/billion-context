@@ -34,6 +34,7 @@ import { isAutoModeClassifier } from "../auto-mode-forge.js";
 import { countSystemAndToolsTokens, emergencyNudge, emergencyNudgeArmed, projectThinkingMass } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectSystem, injectTool } from "./inject.js";
+import { EXPOSED_TOOLS_HEADER, parseExposedToolsHeader } from "./headers.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 
 export async function prepareAnthropic(
@@ -70,6 +71,7 @@ export async function prepareAnthropic(
         pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined,
         parsed,
         shouldInject: opts.compress.injectTool,
+        exposedTools: parseExposedToolsHeader(req.headers[EXPOSED_TOOLS_HEADER]),
     });
     // #3222: #651's reasoning-drop plan, computed on the INBOUND history before
     // core.processTurn — see planReasoningDrop for why the post-turn view is too late.

@@ -29,6 +29,7 @@ import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, e
 import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
+import { EXPOSED_TOOLS_HEADER, parseExposedToolsHeader } from "./headers.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 
 function appendGoogleNudge(contents: GoogleContent[], text: string): GoogleContent[] {
@@ -100,7 +101,7 @@ export async function prepareGoogle(
     const injectTools = shouldInject && !pluginMode;
     // #3417: surface gating lives in lane-decisions (observed reachability
     // overrides the dsh default, #3401); alias kept for the remaining reads.
-    const laneDecisions = resolveLaneDecisions({ protocol: "google", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject });
+    const laneDecisions = resolveLaneDecisions({ protocol: "google", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject, exposedTools: parseExposedToolsHeader(req.headers[EXPOSED_TOOLS_HEADER]) });
     // #2483: this lane used to ignore renderNone entirely (hardcoded "text-only"
     // in processTurn, Prepared and countTokens) — the knob was dead config on /v1beta.
     const renderStrategy = knobRenderNone() ? "none" : "text-only";

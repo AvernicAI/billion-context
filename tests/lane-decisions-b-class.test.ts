@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { parseExposedToolsHeader } from "../src/server/headers.js";
 import { nudgeOn, resolveLaneDecisions, resolveWireClientProfile, surfaceOffDetail, type NudgeGateInputs } from "../src/server/lane-decisions.js";
 import { instructionsFingerprintApplies } from "../src/session-id.js";
 
@@ -91,7 +92,7 @@ test("nudgeOn: deliberate per-lane differences stay explicit (#3482)", () => {
 test("resolveLaneDecisions: billingBlockWanted = profile-declared OR wire-observed (#3482 site 1)", () => {
     const billingSystem = [{ type: "text", text: "x-anthropic-billing-header: acct-123" }, { type: "text", text: "You are helpful." }];
     const plainSystem = [{ type: "text", text: "You are helpful." }];
-    const input = (system: unknown, pluginAgent: string | undefined) => ({ protocol: "anthropic" as const, pluginMode: true, pluginAgent, parsed: { system }, shouldInject: true });
+    const input = (system: unknown, pluginAgent: string | undefined) => ({ protocol: "anthropic" as const, pluginMode: true, pluginAgent, parsed: { system }, shouldInject: true, exposedTools: null });
     // dsh declares it — even with no block on this wire.
     const dsh = resolveLaneDecisions(input(plainSystem, "dsh"));
     assert.equal(dsh.billingBlockWanted, true);
@@ -130,7 +131,7 @@ test("wire-client registry: instructionsFingerprintKeyed by observed signals (#3
 // the next omnibus rename shows up as `surface=off(top-level=[...])` next to
 // ARMED-SUPPRESSED instead of two more incidents of user archaeology.
 test("surfaceOffDetail: names observed tools on reachability-off, silent otherwise (#3884)", () => {
-    const dsh = (parsed: unknown, shouldInject: boolean) => resolveLaneDecisions({ protocol: "anthropic", pluginMode: true, pluginAgent: "dsh", parsed, shouldInject });
+    const dsh = (parsed: unknown, shouldInject: boolean) => resolveLaneDecisions({ protocol: "anthropic", pluginMode: true, pluginAgent: "dsh", parsed, shouldInject, exposedTools: null });
     // surface ON (compress declared top-level) → nothing to explain
     assert.equal(surfaceOffDetail(dsh({ tools: [{ name: "compress" }] }, true), true), undefined);
     // recognized omnibus → reachable → nothing to explain (negative direction)
@@ -142,4 +143,41 @@ test("surfaceOffDetail: names observed tools on reachability-off, silent otherwi
     assert.equal(surfaceOffDetail(dsh({}, true), true), "surface=off(no-tools)");
     // scoped lane with unrecognized names → the future-rename signal
     assert.equal(surfaceOffDetail(dsh({ tools: [{ name: "get_weather" }, { name: "code_run2" }] }, true), true), "surface=off(top-level=[get_weather,code_run2])");
+});
+
+// #3884 Step3+ (owner-approved): host declaration channel —
+// x-bili-plugin-exposed-tools is ground truth when present; an ABSENT header
+// keeps the legacy wire-shape inference bit-for-bit (owner constraint: a
+// request without the header must not change behavior).
+test("resolveLaneDecisions: exposed-tools declaration outranks wire inference (#3884 Step3+)", () => {
+    const dsh = (parsed: unknown, exposedTools: string[] | null) => resolveLaneDecisions({ protocol: "anthropic", pluginMode: true, pluginAgent: "dsh", parsed, shouldInject: true, exposedTools });
+    // declaration rescues an UNRECOGNIZED omnibus shape — the future-rename
+    // case that sank #3600 and #3884 alike.
+    assert.equal(dsh({ tools: [{ name: "code_run2" }] }, ["compress", "decompress"]).compressSurfaceOn, true);
+    // declaration beats a recognized-name inference: run_code on top level but
+    // the host says compress is NOT exposed → off (name matching alone said on).
+    assert.equal(dsh({ tools: [{ name: "run_code" }] }, ["decompress"]).compressSurfaceOn, false);
+    // present-but-empty = "exposes none" → off even with a recognized omnibus.
+    assert.equal(dsh({ tools: [{ name: "code_run" }] }, []).compressSurfaceOn, false);
+    // absent header → legacy inference, both directions (the fallback guarantee).
+    assert.equal(dsh({ tools: [{ name: "code_run" }] }, null).compressSurfaceOn, true);
+    assert.equal(dsh({ tools: [{ name: "get_weather" }] }, null).compressSurfaceOn, false);
+    // top-level compress stays ground truth even against a contradicting declaration.
+    assert.equal(dsh({ tools: [{ name: "compress" }] }, []).compressSurfaceOn, true);
+    // proxy mode is structural — a stray header cannot turn it off.
+    const proxy = resolveLaneDecisions({ protocol: "anthropic", pluginMode: false, pluginAgent: undefined, parsed: {}, shouldInject: true, exposedTools: [] });
+    assert.equal(proxy.compressSurfaceOn, true);
+    // declaration outranks the profile default too (pi: toolsHostScopedByDefault=false).
+    const pi = resolveLaneDecisions({ protocol: "anthropic", pluginMode: true, pluginAgent: "pi", parsed: {}, shouldInject: true, exposedTools: [] });
+    assert.equal(pi.compressSurfaceOn, false);
+    // surfaceOffDetail explains a declared-off case like any other off.
+    assert.equal(surfaceOffDetail(dsh({ tools: [{ name: "run_code" }] }, ["decompress"]), true), "surface=off(top-level=[run_code])");
+});
+
+test("parseExposedToolsHeader: absent → null, present → trimmed/lowercased names (#3884 Step3+)", () => {
+    assert.equal(parseExposedToolsHeader(undefined), null);
+    assert.deepEqual(parseExposedToolsHeader(""), []);
+    assert.deepEqual(parseExposedToolsHeader("compress"), ["compress"]);
+    assert.deepEqual(parseExposedToolsHeader("Compress, decompress ,, ACP_Status "), ["compress", "decompress", "acp_status"]);
+    assert.deepEqual(parseExposedToolsHeader(["compress", ""]), ["compress"]);
 });
