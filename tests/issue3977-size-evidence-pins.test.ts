@@ -15,9 +15,10 @@
 //            zero upstream calls (the #3846 guard on the image hatch).
 //   P-DIV    edge: a payload that FOLDS under the window after a local 413 —
 //            current post-refusal fold semantics, observed and pinned.
-//   P-LEARN  boundary: an upstream 400 whose body states the real token count
-//            teaches the estimator NOTHING today (titles byte-identical) —
-//            @flip-target for learnFromOutcome(overflow-400).
+//   P-LEARN  boundary (FLIPPED in step 4b): two agreeing 400s that STATE the
+//            rejected payload's counts ("N in the messages") publish a k-hat
+//            and flip an under-window payload from forward-direct to
+//            fold-first; a window-only 400 arms but never teaches.
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
@@ -68,6 +69,33 @@ function foldableHistory(): Array<{ role: string; content: string }> {
     return messages;
 }
 
+// The P-LEARN detour payload: a ~60KB base64 image plus ~24KB of core text
+// so the prepare-time estimate (~21.7K tokens: the local estimator bills the
+// base64 chars/4 like text) clears the CALIBRATION_MIN_ESTIMATE=2000 gate.
+// The upstream bills the image FAR above the local chars/4 caliber (the
+// #3900 production story: stated 60000 vs local ≈ 21.7K → ratio ≈ 2.8, inside
+// the plausibility band [0.2, 5]). Detour 2 rides because the recovery
+// request retires detour 1's arm (#1110), not because of these sizes.
+function detourContent(): unknown {
+    return [
+        { type: "text", text: "describe this" },
+        { type: "image_url", image_url: { url: `data:image/png;base64,${"A".repeat(60_000)}` } },
+        { type: "text", text: "detour load: " + "z".repeat(24_000) },
+    ];
+}
+
+// The P-LEARN flip payload: six foldable ~8KB turns ≈ 12K raw tokens — UNDER
+// the 20K window raw (forwards directly unlearned, see the control), but OVER
+// it once the learned k-hat (≈2.8) calibrates the estimate → fold-first.
+function underWindowFoldable(): Array<{ role: string; content: string }> {
+    const messages: Array<{ role: string; content: string }> = [];
+    for (let i = 0; i < 6; i++) {
+        messages.push({ role: i % 2 === 0 ? "user" : "assistant", content: `flip turn ${i} load: ` + `w${i}`.repeat(4_000) });
+    }
+    messages.push({ role: "user", content: "final question" });
+    return messages;
+}
+
 type Call = { summary: boolean; stream: boolean; contentChars: number };
 
 function chatSse(text: string, usage?: { prompt_tokens: number; completion_tokens: number }): string {
@@ -77,11 +105,14 @@ function chatSse(text: string, usage?: { prompt_tokens: number; completion_token
     return chunk({ role: "assistant" }, null) + chunk({ content: text }, null) + chunk({}, "stop", u) + "data: [DONE]\n\n";
 }
 
-// Upstream that can be flipped to answer the NEXT forwarded request with the
-// production-shaped 400 that STATES the real token count in its body.
-function makeUpstream(): { server: http.Server; calls: Call[]; arm400: () => void } {
+// Upstream that can be flipped to answer the NEXT forwarded request with a
+// 400. Two shapes: the window-only body (no per-part counts — arms but never
+// teaches) and the #3900/#3738 stated-count body ("N in the messages, K in the
+// completion") that step 4b's learnFromOutcome consumes.
+function makeUpstream(): { server: http.Server; calls: Call[]; arm400: () => void; arm400Stated: () => void } {
     const calls: Call[] = [];
     let arm400 = false;
+    let armStated = false;
     const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -95,6 +126,12 @@ function makeUpstream(): { server: http.Server; calls: Call[]; arm400: () => voi
                 if (isSummary) {
                     res.writeHead(200, { "content-type": "application/json" });
                     res.end(JSON.stringify({ id: "chatcmpl-sum", object: "chat.completion", model: "gpt-test", choices: [{ index: 0, message: { role: "assistant", content: SUMMARY_TEXT }, finish_reason: "stop" }] }));
+                    return;
+                }
+                if (armStated) {
+                    armStated = false;
+                    res.writeHead(400, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { message: "This model's maximum context length is 20000 tokens. However, you requested 70000 tokens (60000 in the messages, 10000 in the completion). Please reduce the length of the messages or completion.", type: "invalid_request_error" } }));
                     return;
                 }
                 if (arm400) {
@@ -111,7 +148,7 @@ function makeUpstream(): { server: http.Server; calls: Call[]; arm400: () => voi
             }
         });
     });
-    return { server, calls, arm400: () => { arm400 = true; } };
+    return { server, calls, arm400: () => { arm400 = true; }, arm400Stated: () => { armStated = true; } };
 }
 
 type Upstream = ReturnType<typeof makeUpstream>;
@@ -265,42 +302,84 @@ test("pin #3977 P-DIV: after a scoped local 413, a payload that folds under the 
     }
 });
 
-test("pin #3977 P-LEARN: an upstream 400 that STATES the real token count teaches the estimator NOTHING today — titles byte-identical (@flip-target for step 4)", async () => {
+test("pin #3977 P-LEARN (step-4 flip): two agreeing stated-count 400s teach the ring and flip an under-window payload to fold-first; a window-only 400 never teaches", async () => {
     const up = makeUpstream();
     const port = await listen(up);
     const { ctx, close } = await setup({ [`http://127.0.0.1:${port}`]: { models: { "gpt-test": { context: WINDOW } } } });
     try {
+        // ---------------- control session: a window-only 400 arms but teaches
+        // nothing. (One detour is the honest control: the second would be
+        // locally 413'd by the arm it just set — that refusal is itself the
+        // emergency shrink working, not a learning event.)
+        ctx.headers["x-acp-session"] = "p3977-learn-ctl";
+        const rSeedC = await post(ctx, { model: "gpt-test", stream: true, messages: [{ role: "user", content: "hello" }] });
+        assert.equal(rSeedC.status, 200, "control seed forwards");
+        await rSeedC.text();
+        up.arm400();
+        const rCtl1 = await post(ctx, { model: "gpt-test", stream: true, messages: [{ role: "user", content: detourContent() }] });
+        assert.equal(rCtl1.status, 400, "control detour rides and gets the window-only 400");
+        await rCtl1.text();
+        const ctlSession = getSession("p3977-learn-ctl");
+        // A later out-of-band usage settle may legitimately have created an
+        // EMPTY ring (current settleUsageReport semantics); the pin is that no
+        // SAMPLE was ever collected and nothing was published from the 400.
+        assert.ok(!ctlSession?.stats.calibrationRing || ctlSession.stats.calibrationRing.values.length === 0, `window-only 400s never collect a sample (ring ${JSON.stringify(ctlSession?.stats.calibrationRing)})`);
+        assert.equal(ctlSession?.stats.calibratedEstimate, undefined, "window-only 400s publish nothing");
+        const summariesBeforeCtl = up.calls.filter((c) => c.summary).length;
+        const rCtlB = await post(ctx, { model: "gpt-test", stream: true, messages: underWindowFoldable() });
+        assert.equal(rCtlB.status, 200, "control under-window payload forwards");
+        await rCtlB.text();
+        assert.equal(up.calls.filter((c) => c.summary).length, summariesBeforeCtl, "control: no fold happened — the arm alone changes nothing below the window");
+
+        // ---------------- learn session: two agreeing stated-count 400s
         ctx.headers["x-acp-session"] = "p3977-learn";
         const rSeed = await post(ctx, { model: "gpt-test", stream: true, messages: [{ role: "user", content: "hello" }] });
         assert.equal(rSeed.status, 200, "the fitting seed forwards");
         await rSeed.text();
-
         // Detour FIRST (before any local refusal exists — P-IMG-b proved the
         // evidence would block the ride): the image payload rides by
-        // arbitration and the upstream answers with the #3900-shaped 400 whose
-        // body STATES the real token count.
-        up.arm400();
-        const rImg = await post(ctx, { model: "gpt-test", stream: true, messages: [{ role: "user", content: imageContent() }] });
-        const imgStatus = rImg.status;
-        await rImg.text();
-        // OBSERVED on the integration branch (550860ed): the image payload
-        // rides and the upstream answers the stated-count 400 verbatim.
-        assert.equal(imgStatus, 400, "the detour payload rides and is answered with the stated-count 400");
-        assert.equal(up.calls.filter((c) => c.stream).length >= 2, true, "the detour payload reached the upstream");
+        // arbitration and the upstream answers with the #3738-shaped 400 whose
+        // body STATES the rejected payload's own counts. Two of them = two
+        // agreeing samples = a published k-hat.
+        for (let i = 0; i < 2; i++) {
+            up.arm400Stated();
+            const rImg = await post(ctx, { model: "gpt-test", stream: true, messages: [{ role: "user", content: detourContent() }] });
+            const imgBody = await rImg.text();
+            assert.equal(rImg.status, 400, `stated-count detour ${i + 1} rides and is answered with the counted 400 — got: ${imgBody.slice(0, 400)}`);
+            // #1110 recovery between detours: a successful usage report
+            // retires the one-shot arm, else detour 2 is locally 413'd by the
+            // very baseline detour 1 armed (#3450/#3738 — the emergency shrink
+            // doing its job). The tiny payload's settle never touches the ring
+            // (pendingEst < CALIBRATION_MIN_ESTIMATE).
+            const rRec = await post(ctx, { model: "gpt-test", stream: true, messages: [{ role: "user", content: "recovery ping" }] });
+            assert.equal(rRec.status, 200, `recovery ${i + 1} forwards and retires the arm`);
+            await rRec.text();
+        }
+        const learnSession = getSession("p3977-learn");
+        const ring = learnSession?.stats.calibrationRing;
+        assert.ok(ring && ring.values.length === 2, `the ring collected both samples (${JSON.stringify(ring?.values)})`);
+        const k = learnSession?.stats.calibratedEstimate;
+        assert.ok(typeof k === "number" && k >= 2 && k <= 2.5, `k-hat published from the stated counts (got ${k})`);
+        assert.equal(learnSession?.stats.calibratedEstimateModel, "gpt-test", "published factor is model-keyed");
 
-        // Baseline title for the oversized non-foldable payload, AFTER the
-        // stated-count 400 has had every chance to arm/teach.
+        // THE FLIP: the same under-window payload that forwarded directly in
+        // the control session now judges OVER the window once calibrated —
+        // preflight folds it first and the forward happens after the summary.
+        const summariesBefore = up.calls.filter((c) => c.summary).length;
+        const rB = await post(ctx, { model: "gpt-test", stream: true, messages: underWindowFoldable() });
+        assert.equal(rB.status, 200, "the calibrated over-window payload folds and forwards");
+        await rB.text();
+        assert.ok(up.calls.filter((c) => c.summary).length > summariesBefore, "the fold ran a real summary call first (fold-first, no forward-then-refold)");
+
+        // The oversized NON-FOLDABLE payload stays refused — and the dead-end
+        // replay (second identical request) returns the stored title verbatim.
         const rBig1 = await post(ctx, { model: "gpt-test", stream: true, messages: [{ role: "system", content: bigSystem() }, { role: "user", content: "q" }] });
-        assert.equal(rBig1.status, 413, "oversized payload refused locally");
+        assert.equal(rBig1.status, 413, "oversized payload still refused locally");
         const title1 = await rBig1.text();
-
-        // The oversized non-foldable payload again: with learnFromOutcome
-        // (step 4) the stated-count 400 becomes calibration evidence and the
-        // numbers in this title MOVE. Today they must not.
         const rBig2 = await post(ctx, { model: "gpt-test", stream: true, messages: [{ role: "system", content: bigSystem() }, { role: "user", content: "q" }] });
         assert.equal(rBig2.status, 413, "still refused locally");
         const title2 = await rBig2.text();
-        assert.equal(title1, title2, "the stated-count 400 changed nothing in the estimator's verdict today");
+        assert.equal(title1, title2, "the dead-end replay returns the stored refusal verbatim");
     } finally {
         up.server.close();
         up.server.closeIdleConnections?.();

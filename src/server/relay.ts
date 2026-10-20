@@ -9,7 +9,7 @@ import { type CompressionCore, type Config, type CoreMessage, defaultCountTokens
 import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
-import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, learnCalibrationSample, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, settleUsageReport } from "../cache-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
@@ -1084,6 +1084,21 @@ export async function forward(
                 log("warn", `[${s.id}] upstream-stated window ${info.window} differs from the window in use (${declaredWindow}, model=${reqModel ?? "unknown"}) — folding targets min of the two; set compress.modelContextLimit if the declaration is wrong (#3450)`);
             }
             log("warn", `[${s.id}] upstream context overflow (model=${reqModel ?? "unknown"}) — window ${info.window} stated upstream${measured !== undefined ? `, rejected payload ~${measured} tokens stated` : ""}${reserve !== undefined ? `, completion reservation ${reserve} tokens` : ""}; armed emergency shrink at ${armedBaseline}${armedBaseline < unclampedBaseline ? ` (clamped to the judging limit ${judgingLimit}, #3738)` : ""}, declared window unchanged (#987)`);
+            // [#3977 Step 4b / #3900] learnFromOutcome(overflow-400): a body
+            // that STATES the rejected payload's counts ("N in the messages")
+            // is the same physical event as a usage report — upstream
+            // MEASURED a payload bili estimated. Feed the calibration ring
+            // the same learner a usage settle feeds; the ring's own guards
+            // (pending pair set by THIS request at prepare, same route,
+            // plausibility band, ≥2 agreeing samples) decide publication.
+            // The messages share is the INPUT domain of the text estimator —
+            // the completion share is a reservation, not input text, so it
+            // never enters the sample. Note lastInputTokens was armed above
+            // (#3450); the learner reads the PENDING ESTIMATE pair, not the
+            // arm, so the two never collide.
+            if (measured !== undefined) {
+                learnCalibrationSample(s, normalizeUpstreamOrigin(upstreamUrl), measured);
+            }
         } else {
             // No window number stated — nothing to learn (and #987
             // removed the learner anyway), but the rejection itself is
