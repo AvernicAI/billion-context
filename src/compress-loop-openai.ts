@@ -42,13 +42,13 @@ interface ParsedOutput {
     toolCalls: ParsedToolCall[];
 }
 
-export interface CompressLoopOpenaiOptions {
+interface CompressLoopOpenaiOptions {
     signal?: AbortSignal;
     proxyUrl?: string;
     visibilityMarkers?: boolean;
 }
 
-export interface CompressLoopOpenaiRequestOptions {
+interface CompressLoopOpenaiRequestOptions {
     url: string;
     headers: Record<string, string>;
     wireTransform?: (body: Record<string, unknown>) => Record<string, unknown>;
