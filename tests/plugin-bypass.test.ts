@@ -103,7 +103,9 @@ describe("plugin bypass header (#920)", () => {
         const seen = JSON.parse(h!.captured[0]!.body) as { tools?: unknown[]; messages: unknown[] };
         assert.equal(seen.tools, undefined);
         assert.deepEqual(seen.messages, body.messages);
-        assert.equal(h!.captured[0]!.headers["x-bili-plugin-bypass"], "1");
+        // #3905: the bypass MARKER itself is host-private convention metadata — stripped at
+        // egress like the rest of the x-bili-plugin* family; the BODY above stays verbatim.
+        assert.equal(h!.captured[0]!.headers["x-bili-plugin-bypass"], undefined);
     });
 
     it("without the header the same request gets the plugin pipeline (tools injected)", { timeout: 60_000 }, async () => {

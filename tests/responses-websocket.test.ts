@@ -67,7 +67,7 @@ test("V2 handshake: routes OAuth/API Responses sockets and stamps native identit
     } finally { cleanup(); }
 });
 
-test("Responses WS egress headers: azure strips consumed x-bili-* under the custom-header cap; other hosts unchanged", () => {
+test("Responses WS egress headers: azure strips every x-bili-* under the custom-header cap; other hosts strip the plugin family (#2359/#3905)", () => {
     const raw = {
         host: "westus2.openai.azure.com",
         connection: "Upgrade",
@@ -88,12 +88,11 @@ test("Responses WS egress headers: azure strips consumed x-bili-* under the cust
     assert.equal(azure["x-openai-organization"], "org-test");
     assert.equal(azure["content-type"], "application/json");
     for (const dropped of ["host", "connection", "content-length", "sec-websocket-key", "sec-websocket-version", "x-bili-plugin", "x-bili-plugin-conversation", "x-bili-plugin-model", "x-bili-plugin-context-window"]) assert.ok(!(dropped in azure), `azure egress must not carry ${dropped}`);
+    // #3905: the host-private x-bili-plugin* family is stripped at egress on EVERY host
+    // (previously forwarded verbatim outside azure); bili→bili protocol markers are unaffected.
     const openai = finalizeResponsesWsUpstreamHeaders("https://api.openai.com/v1/responses", raw);
-    assert.equal(openai["x-bili-plugin"], "opencode");
-    assert.equal(openai["x-bili-plugin-conversation"], "ses_az");
-    assert.equal(openai["x-bili-plugin-model"], "gpt-5.2");
     assert.equal(openai["api-key"], "sk-azure-test-credential");
-    for (const dropped of ["host", "connection", "content-length", "sec-websocket-key"]) assert.ok(!(dropped in openai), `non-azure egress must still drop hop marker ${dropped}`);
+    for (const dropped of ["host", "connection", "content-length", "sec-websocket-key", "sec-websocket-version", "x-bili-plugin", "x-bili-plugin-conversation", "x-bili-plugin-model", "x-bili-plugin-context-window"]) assert.ok(!(dropped in openai), `non-azure egress must not carry ${dropped}`);
 });
 
 // #3073: the codex remote_compaction_v2 beta feature is stripped on EVERY
@@ -290,8 +289,8 @@ test("Responses WS: both ends use sockets; incremental tool continuation reaches
         assert.equal((f.rows[1].request.input as Item[]).length, 2);
         assert.ok(JSON.stringify(f.rows[1].full).includes("first-round-sentinel"));
         assert.equal(f.rows[0].headers.authorization, "Bearer fake-credential");
-        // #2359 control: a non-azure upstream still receives the consumed x-bili-* metadata verbatim — only *.openai.azure.com egress strips it.
-        assert.equal(f.rows[0].headers["x-bili-plugin"], "opencode");
+        // #3905: the host-private x-bili-plugin* marker is stripped at egress on every host (was verbatim pre-#3905; see tests/issue3905-egress-bili-strip.test.ts).
+        assert.equal(f.rows[0].headers["x-bili-plugin"], undefined);
         assert.equal(second.status, "completed");
         const session = peekSession(f.sid);
         assert.ok(session);
