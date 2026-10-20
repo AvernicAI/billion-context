@@ -272,6 +272,11 @@ interface CacheLedger {
         nbInput: number;
         seamSuspects: number;
         seamMissed: number;
+        /** #3837: unexplained-residual pairs that fell under the substantive
+         *  floor (tr ≤ 8192 or tr ≤ 0.3·input) — counted so small breaks stay
+         *  visible in the report instead of vanishing at the gate; never warned. */
+        seamFloored: number;
+        seamFlooredMissed: number;
         /** #1592 follow-up: misses with no client-side prefix break — the current
          *  body is byte-stable vs the previous request, or the previous message
          *  list comes back byte-identical as a prefix with only tail messages
@@ -836,8 +841,17 @@ function detectSeam(session: Session, led: CacheLedger): void {
     // post-switch cold-tail continuations (they carry no sw/pw/uw flag); legacy lines lack it and keep old behavior.
     if (line.sw === 1 || line.pw === 1 || line.uw === 1 || line.rs === 1 || line.cause !== undefined || line.foldSeq !== null) return;
     // Substantive unexplained residual only: a big ttlRepay slice of a big bill.
-    if (!(line.tr > 8192 && line.tr > 0.3 * line.input)) return;
+    // #3837: below-floor pairs no longer vanish silently — counted in seam.floored
+    // and announced once at info level so small unexplained breaks stay visible.
     const agg = led.agg;
+    if (!(line.tr > 8192 && line.tr > 0.3 * line.input)) {
+        agg.seamFloored += 1;
+        agg.seamFlooredMissed += line.tr;
+        if (agg.seamFloored === 1) {
+            loggerLog("info", `[${session.id}] [cache-seam] unexplained break under the warn floor (unexplained=${Math.round(line.tr)} tok, input=${line.input}) — counted in seam.floored, not warned (#3837)`);
+        }
+        return;
+    }
     const cur = session.transient?.sentBody;
     const prev = session.transient?.settledBody;
     // #2929: split the provider-side arms by idle gap — a byte-stable miss
@@ -1000,7 +1014,7 @@ export function getCacheLedger(session: Session): CacheLedger {
             "upstreamSwitches", "upstreamSwitchMissed", "restartDrops",
             "restartDropMissed", "attributedMissed", "unknownSamples", "unknownInput",
             "nbSamples", "nbInput",
-            "seamSuspects", "seamMissed",
+            "seamSuspects", "seamMissed", "seamFloored", "seamFlooredMissed",
             "providerSideMisses", "providerSideMissed", "providerTtlMisses", "providerTtlMissed", "rewinds", "rewindMissed", "abortCorrelated", "clientInserts", "clientInsertMissed", "orphanSweepSeams", "orphanSweepMissed",
         ] as const) {
             if (typeof g[key] !== "number") g[key] = 0;
@@ -1018,7 +1032,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         foldSeqCounter: 0,
         folds: [],
         lines: [],
-        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, effSwitches: 0, effSwitchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0, clientInserts: 0, clientInsertMissed: 0, orphanSweepSeams: 0, orphanSweepMissed: 0 },
+        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, effSwitches: 0, effSwitchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, seamFloored: 0, seamFlooredMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0, clientInserts: 0, clientInsertMissed: 0, orphanSweepSeams: 0, orphanSweepMissed: 0 },
     };
     meta[LEDGER_KEY] = led;
     return led;
@@ -1775,7 +1789,7 @@ interface BiliCacheReport extends CacheReport {
      *  is booked as new content, never as a prefix re-pay. */
     initialBills: { samples: number; inputTokens: number };
     invalidation: InvalidationTokenBreakdown;
-    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; providerTtl: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number; client: { count: number; missed: number }; orphanSweep: { count: number; missed: number } };
+    seam: { suspects: number; missed: number; floored: { count: number; missed: number }; events: SeamEvent[]; providerSide: { count: number; missed: number }; providerTtl: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number; client: { count: number; missed: number }; orphanSweep: { count: number; missed: number } };
 }
 
 export function buildSessionCacheReport(session: Session): BiliCacheReport {
@@ -1962,7 +1976,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         initialBills: { samples: a.nbSamples, inputTokens: a.nbInput },
         invalidation,
         stability,
-        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated, client: { count: a.clientInserts, missed: a.clientInsertMissed }, orphanSweep: { count: a.orphanSweepSeams, missed: a.orphanSweepMissed } },
+        seam: { suspects: a.seamSuspects, missed: a.seamMissed, floored: { count: a.seamFloored, missed: a.seamFlooredMissed }, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, providerTtl: { count: a.providerTtlMisses, missed: a.providerTtlMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated, client: { count: a.clientInserts, missed: a.clientInsertMissed }, orphanSweep: { count: a.orphanSweepSeams, missed: a.orphanSweepMissed } },
     };
 }
 
@@ -2115,6 +2129,9 @@ function formatSeam(r: BiliCacheReport): string {
             out.push("    (no body-pair forensics on this lane — aggregate flag only; report the session + log if this persists)");
         }
         out.push("  if reproducible: /acp-cache detail:\"full\" + bili.log around the timestamps above (likely a #1548-family round-2/steady render seam)");
+    }
+    if (r.seam.floored.count > 0) {
+        out.push(`ℹ SEAM SAMPLES UNDER FLOOR: ${r.seam.floored.count} sample(s) · ${fmtTok(r.seam.floored.missed)} tok unexplained but below the warn floor — counted for visibility, not warned (#3837)`);
     }
     if (r.seam.rewinds.count > 0) {
         out.push("↩ HISTORY REWOUND (client revert/trim)");
