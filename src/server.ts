@@ -57,6 +57,7 @@ export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, sh
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "./fold-reconcile.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
+import { baselineFloor as projectBaselineFloor, hasOverflowEvidence, localRefusalCovers, noteLocalRefusal, readBaselineEvidence } from "./size-evidence.js";
 import { detectStaleInstall } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
@@ -2707,64 +2708,6 @@ function preflightDeadEndCooldownMs(): number {
     return knobPreflightDeadEndCooldownMs();
 }
 
-// #3846: a local 413 ("can never fit, NOT forwarded") is independent evidence
-// that this origin/model/window cannot accept the payload — but it only ever
-// lived in the #726 dead-end marker's body-hash dimension: the moment the
-// baseline source demotes to estimate (the #2313 probe re-arms at
-// baselineFloor === 0) or the body changes between turns (the hash misses),
-// the refusal evaporates and every forward-once escape hatch (estimate-only
-// probe / image arbitration / #1839 rebuilt-view divergence / #3146
-// fresh-session) re-bets the same estimator guess — production shape: three
-// consecutive full-bill forwards of 606K/620K/633K-token payloads bili itself
-// had already refused locally. Persist refusals as their own metadata channel
-// — NEVER as usage (that field is upstream billing evidence only) — scoped to
-// the route/model/window that saw them; an equal-or-wider refused window
-// covers the current equal-or-tighter one, anything else evaluates fresh.
-interface LocalRefusalRecord {
-    origin: string;
-    model: string;
-    window: number;
-    at: number;
-}
-
-const LOCAL_REFUSAL_MAX_RECORDS = 16;
-
-function readLocalRefusals(metadata: Record<string, unknown>): LocalRefusalRecord[] {
-    const raw = metadata.localRefusals;
-    if (!Array.isArray(raw)) return [];
-    return raw.filter((r): r is LocalRefusalRecord =>
-        !!r && typeof r === "object"
-        && typeof (r as LocalRefusalRecord).origin === "string"
-        && typeof (r as LocalRefusalRecord).model === "string"
-        && typeof (r as LocalRefusalRecord).window === "number",
-    );
-}
-
-/** Record a local 413 refusal for (origin, model, window). A wider refusal in
- *  the same scope already dominates (it covers every tighter window); a
- *  narrower one replaces it so the record tracks the widest verdict seen. */
-function noteLocalRefusal(session: Session, origin: string | undefined, model: string | undefined, window: number): void {
-    if (!origin || !model || !Number.isFinite(window) || window <= 0) return;
-    const records = readLocalRefusals(session.metadata);
-    const existing = records.find((r) => r.origin === origin && r.model === model);
-    if (existing !== undefined && existing.window >= window) return;
-    session.metadata.localRefusals = [
-        ...records.filter((r) => !(r.origin === origin && r.model === model)),
-        { origin, model, window: Math.floor(window), at: Date.now() },
-    ].slice(-LOCAL_REFUSAL_MAX_RECORDS);
-    markDirty(session);
-}
-
-/** True when this session was locally refused (413) by the SAME origin+model
- *  at an equal or WIDER window — the current request may then not reopen any
- *  forward-once escape hatch (#3846). Both sides must be known
- *  (evidence-permitlist discipline: an unprovenanced refusal proves nothing
- *  about an unprovenanced request, and vice versa). */
-function localRefusalCovers(metadata: Record<string, unknown>, origin: string | undefined, model: string | undefined, window: number): boolean {
-    if (!origin || !model) return false;
-    return readLocalRefusals(metadata).some((r) => r.origin === origin && r.model === model && r.window >= window);
-}
-
 /** #568: commit the response early so a long preflight cannot lose the client
  *  to its header timeout. Streaming clients get an SSE stream with keep-alive
  *  comment lines (`: bili-preflight` — a spec-mandated no-op for every SSE
@@ -3187,9 +3130,8 @@ export async function preflightCompressIfNeeded(
     // (#604) on a measured (folded) payload describes a different view and
     // must not pull preflight into multi-minute runs over a payload whose own
     // post-fold estimate fits the window.
-    const baselineFloorRaw = prepared.processedMessages.length > 0
-        ? ((session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") ? session.stats.lastInputTokens : 0)
-        : session.stats.lastInputTokens;
+    const baselineEvidence = readBaselineEvidence(session.stats);
+    const currentOrigin = normalizeUpstreamOrigin(route?.upstream);
     // #1933 F2: a usage baseline is only authoritative for the route that
     // measured it — provider billing scales differ per upstream (the incident:
     // ~257K local estimate vs 59-63% real usage on one route; after a mid-
@@ -3198,11 +3140,11 @@ export async function preflightCompressIfNeeded(
     // untrusted when the request now routes elsewhere; the payload's own
     // (calibrated) estimate then judges it. Unprovenanced baselines (sessions
     // started before this field existed) keep the legacy behavior.
-    let baselineFloor = baselineFloorRaw;
-    const currentOrigin = normalizeUpstreamOrigin(route?.upstream);
-    const baselineOrigin = normalizeUpstreamOrigin(session.stats.lastInputTokensOrigin);
-    if (baselineFloor > 0 && currentOrigin !== undefined && baselineOrigin !== undefined && baselineOrigin !== currentOrigin) {
-        log("info", `[${session.id}] preflight usage-baseline ~${baselineFloor} tok was measured on ${maskUrlForLog(baselineOrigin)}, request now routes to ${maskUrlForLog(currentOrigin)} — demoting to untrusted, judging by this payload's own estimate (#1933)`);
+    const baselineProjection = projectBaselineFloor(baselineEvidence, currentOrigin, prepared.processedMessages.length > 0);
+    let baselineFloor = baselineProjection.floor;
+    if (baselineProjection.demoted && currentOrigin !== undefined) {
+        // demoted ⇒ both origins are known (size-evidence.projectBaselineFloor contract)
+        log("info", `[${session.id}] preflight usage-baseline ~${baselineProjection.from} tok was measured on ${maskUrlForLog(baselineProjection.origin ?? "")}, request now routes to ${maskUrlForLog(currentOrigin)} — demoting to untrusted, judging by this payload's own estimate (#1933)`);
         baselineFloor = 0;
     }
     // #1933 F1: scale the local text estimate by the per-route calibration
@@ -3276,7 +3218,7 @@ export async function preflightCompressIfNeeded(
     // [#autoFold] a growth trigger is operator intent, not a billing guess —
     // it never needs upstream evidence and must fold on the FIRST armed
     // request, so the #2313 estimate-only forward-once never skips it.
-    const probeForEvidence = !growthArmed && !unknownBaseline && session.stats.lastInputTokens > 0 && baselineFloor <= 0 && prepared.processedMessages.length > 0;
+    const probeForEvidence = !growthArmed && !unknownBaseline && baselineEvidence.tokens > 0 && baselineFloor <= 0 && prepared.processedMessages.length > 0;
     if (probeForEvidence) {
         // #2490: mathematically-doomed probe guard. The forward-once below bets
         // one request on "the estimator might be wrong about size"; that bet has
@@ -3342,8 +3284,7 @@ export async function preflightCompressIfNeeded(
     // estimates back into lastInputTokens, which permanently closed this
     // hatch on pixel-billing upstreams). With evidence present we trust the
     // estimate and fall through to fold / fail-fast below.
-    const noOverflowEvidence = session.stats.lastInputTokens < limit
-        || (session.stats.lastInputTokensSource !== "usage" && session.stats.lastInputTokensSource !== "overflow-arm");
+    const noOverflowEvidence = !hasOverflowEvidence(baselineEvidence, limit);
     // #1800/#1843: the TEXT channel fits the window but `text + imageReserve`
     // does not, and we hold no overflow evidence → the image reserve clears the
     // window on ESTIMATE alone while the real bill may be far smaller (pixel-tile
@@ -3403,7 +3344,7 @@ export async function preflightCompressIfNeeded(
         // estimator diverges from upstream billing (#3146 read chars-as-tokens
         // ~2x high). Rejections backed by real evidence keep today's wording.
         const estimateOnly = baselineFloor === 0 && kFactor === undefined
-            && session.stats.lastInputTokensSource !== "usage" && session.stats.lastInputTokensSource !== "overflow-arm";
+            && !(baselineEvidence.grade === "usage" || baselineEvidence.grade === "overflow");
         const estimateNote = estimateOnly ? " (size judged by bili's local estimate, which can diverge from what the upstream actually bills)" : "";
         const message =
             `${sizeClause} (model=${model})${rangesClause}${estimateNote} ` +
