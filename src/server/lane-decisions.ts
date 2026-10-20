@@ -255,6 +255,21 @@ export function resolveLaneDecisions(input: LaneDecisionInput): LaneDecisions {
     });
 }
 
+/** #3884 owner follow-up: make a reachability miss LOUD instead of silent.
+ * When an armed nudge stays suppressed because the lane surface is OFF for
+ * reachability (not the user's own injectTool=false choice), name what was
+ * actually observed on the top-level tool table: the next host omnibus rename
+ * then shows up in bili.log next to the ARMED-SUPPRESSED label as
+ * `surface=off(top-level=[new_name])` instead of requiring user archaeology
+ * (#3600 and #3884 were both diagnosed from user-reported log dumps). Returns
+ * undefined when there is nothing to explain: surface on, or off by user
+ * config. */
+export function surfaceOffDetail(d: LaneDecisions, shouldInject: boolean): string | undefined {
+    if (d.compressSurfaceOn || !shouldInject) return undefined;
+    const declared = [...d.observed.declaredTools];
+    return declared.length === 0 ? "surface=off(no-tools)" : `surface=off(top-level=[${declared.join(",")}])`;
+}
+
 function systemOf(parsed: unknown): string | Array<Record<string, unknown>> | undefined {
     if (parsed === null || typeof parsed !== "object") return undefined;
     const system = (parsed as Record<string, unknown>)["system"];

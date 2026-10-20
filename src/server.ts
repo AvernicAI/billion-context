@@ -2246,7 +2246,7 @@ export function diagTagSummary(messages: CoreMessage[], sessionId: string, strat
     return `[${sessionId}] processTurn: ${messages.length} msgs, renderTags=${strategy}, ${textTagged} text tagged, ${toolTagged} tool tagged (should be 0 with text-only)`;
 }
 
-export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number, model: string | undefined, willInject: boolean, decidePending = false): string {
+export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number, model: string | undefined, willInject: boolean, decidePending = false, surfaceOff?: string): string {
     const n = turn.nudge;
     if (!n) return `[${sessionId}] nudge: unavailable`;
     const b = n.breakdown ?? {};
@@ -2266,7 +2266,11 @@ export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: strin
         ? (decidePending ? `INJECT-PENDING T${n.tier ?? "?"}` : (n.shouldInject ? `INJECT T${n.tier ?? "?"}` : `INJECT-ESC T${n.tier ?? "?"}`))
         : (n.shouldInject ? `ARMED-SUPPRESSED T${n.tier ?? "?"}` : "idle");
     const modelTag = model ? ` model=${model}` : "";
-    return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}, reason="${n.reason.slice(0, 120)}"`;
+    // #3884: why an armed nudge stayed suppressed — reachability-off lanes name
+    // the observed top-level tools so the next omnibus rename is greppable here
+    // (`surface=off(top-level=[...])`) instead of arriving as a user incident.
+    const offTag = surfaceOff ? `, ${surfaceOff}` : "";
+    return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}${offTag}, reason="${n.reason.slice(0, 120)}"`;
 }
 
 // Zero-baseline sessions are judged conservatively ONLY when they arrived

@@ -37,7 +37,7 @@ import { imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPro
 import { applyImageRescaleItems } from "../image-rescale.js";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
-import { nudgeOn, resolveLaneDecisions } from "./lane-decisions.js";
+import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 
 export async function prepareResponses(
     parsed: ResponsesRequestBody,
@@ -354,7 +354,7 @@ export async function prepareResponses(
             growthFoldingArmed: growthFoldingArmed(loopConfig, codexLane && codexCompactMode() === "intercept" ? loopConfig.modelContextLimit * CODEX_COMPACT_HEALTH_RATIO : undefined),
             modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
         });
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = repairResponsesAssistantOrdering(applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId), originalMessages);
         reapOrphansLogged(session, msgs, log, sessionId);
         rebuiltInput = patchResponsesInput(projection, processedMessages);

@@ -34,7 +34,7 @@ import { isAutoModeClassifier } from "../auto-mode-forge.js";
 import { countSystemAndToolsTokens, emergencyNudge, emergencyNudgeArmed, projectThinkingMass } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectSystem, injectTool } from "./inject.js";
-import { nudgeOn, resolveLaneDecisions } from "./lane-decisions.js";
+import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -359,7 +359,7 @@ export async function prepareAnthropic(
             growthFoldingArmed: growthFoldingArmed(loopConfig),
             modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
         });
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, resolvedModel ?? parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, resolvedModel ?? parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = applyReasoningDrop(stripKernelSummaries(turn.messages, turn.state), reasoningPlan, log, sessionId);
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already

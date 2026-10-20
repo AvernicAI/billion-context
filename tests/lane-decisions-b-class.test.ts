@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { nudgeOn, resolveLaneDecisions, resolveWireClientProfile, type NudgeGateInputs } from "../src/server/lane-decisions.js";
+import { nudgeOn, resolveLaneDecisions, resolveWireClientProfile, surfaceOffDetail, type NudgeGateInputs } from "../src/server/lane-decisions.js";
 import { instructionsFingerprintApplies } from "../src/session-id.js";
 
 // #3482 Step 2.5 equivalence proof: the single nudgeOn() gate must reproduce
@@ -124,4 +124,22 @@ test("wire-client registry: instructionsFingerprintKeyed by observed signals (#3
     assert.equal(instructionsFingerprintApplies({ "x-claude-code-session-id": "9ae0…" }), true);
     assert.equal(instructionsFingerprintApplies({ "x-claude-code-session-id": "   " }), false); // blank ≠ signal
     assert.equal(instructionsFingerprintApplies({ "x-acp-session": "abc" }), false);
+});
+
+// #3884 owner follow-up: a reachability miss must be greppable in bili.log —
+// the next omnibus rename shows up as `surface=off(top-level=[...])` next to
+// ARMED-SUPPRESSED instead of two more incidents of user archaeology.
+test("surfaceOffDetail: names observed tools on reachability-off, silent otherwise (#3884)", () => {
+    const dsh = (parsed: unknown, shouldInject: boolean) => resolveLaneDecisions({ protocol: "anthropic", pluginMode: true, pluginAgent: "dsh", parsed, shouldInject });
+    // surface ON (compress declared top-level) → nothing to explain
+    assert.equal(surfaceOffDetail(dsh({ tools: [{ name: "compress" }] }, true), true), undefined);
+    // recognized omnibus → reachable → nothing to explain (negative direction)
+    assert.equal(surfaceOffDetail(dsh({ tools: [{ name: "run_code" }] }, true), true), undefined);
+    assert.equal(surfaceOffDetail(dsh({ tools: [{ name: "code_run" }] }, true), true), undefined);
+    // off by USER CONFIG (injectTool=false) → no explanation demanded
+    assert.equal(surfaceOffDetail(dsh({}, false), false), undefined);
+    // scoped lane, no tools at all → honest no-tools shape
+    assert.equal(surfaceOffDetail(dsh({}, true), true), "surface=off(no-tools)");
+    // scoped lane with unrecognized names → the future-rename signal
+    assert.equal(surfaceOffDetail(dsh({ tools: [{ name: "get_weather" }, { name: "code_run2" }] }, true), true), "surface=off(top-level=[get_weather,code_run2])");
 });

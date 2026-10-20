@@ -29,7 +29,7 @@ import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, e
 import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
-import { nudgeOn, resolveLaneDecisions } from "./lane-decisions.js";
+import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 
 function appendGoogleNudge(contents: GoogleContent[], text: string): GoogleContent[] {
     const last = contents[contents.length - 1];
@@ -240,7 +240,7 @@ export async function prepareGoogle(
             growthFoldingArmed: growthFoldingArmed(loopConfig),
             modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
         });
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge, decideTier1Arm && !decideFallbackOverride));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
