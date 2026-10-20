@@ -13,6 +13,12 @@ import path from "node:path";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST_ZSTD = "0";
+// #3818/#3769: this suite drives stores directly (flushSync/loadSync on bare
+// ids against namespaced files) and was re-pinned to the full-mode default —
+// under the runner's legacy baseline the sidecar is off and a fresh,
+// non-booted store cannot reverse-lookup the namespaced envelope. The
+// storage family pins its own mode instead of riding the corpus baseline.
+process.env.BILI_STORAGE_UNIFIED = "full";
 process.env.BILI_CONFIG_FILE = path.join(mkdtempSync(path.join(tmpdir(), "bili-upg-hermetic-")), "no-config.json");
 
 import { defaultConfig } from "acp-kernel";
