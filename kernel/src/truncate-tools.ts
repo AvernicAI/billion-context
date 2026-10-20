@@ -96,13 +96,32 @@ export function truncateLargeToolOutputs(
       if (original.length <= opts.keepPrefixChars + opts.keepSuffixChars) {
         continue;
       }
-      const prefix = clampPrefix(original, opts.keepPrefixChars);
+      const marker = `\n\n...${TRUNCATION_MARKER} — original ~${tokens} tokens]...\n\n`;
+      let prefixChars = opts.keepPrefixChars;
+      let suffixChars = opts.keepSuffixChars;
+      // Invariant (#3935): the replacement must be strictly shorter than the
+      // original. Just above keepPrefix+keepSuffix the fixed marker overhead
+      // makes it longer (or equal), so shrink both sides proportionally to fit.
+      const keptBudget = original.length - marker.length - 1;
+      if (keptBudget < prefixChars + suffixChars) {
+        if (keptBudget <= 0) continue;
+        const totalKeep = prefixChars + suffixChars;
+        prefixChars = Math.floor((keptBudget * prefixChars) / totalKeep);
+        suffixChars = keptBudget - prefixChars;
+      }
+      const prefix = clampPrefix(original, prefixChars);
       const suffix = clampWindow(
         original,
-        original.length - opts.keepSuffixChars,
+        original.length - suffixChars,
         original.length,
       );
-      const replacement = `${prefix}\n\n...${TRUNCATION_MARKER} — original ~${tokens} tokens]...\n\n${suffix}`;
+      const replacement = `${prefix}${marker}${suffix}`;
+      if (
+        replacement.length >= original.length ||
+        countTokens(replacement) >= tokens
+      ) {
+        continue;
+      }
       replacements.set(candidate.id, replacement);
       truncatedCount++;
       remaining -= tokens - countTokens(replacement);
