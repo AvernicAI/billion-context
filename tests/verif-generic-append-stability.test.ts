@@ -8,6 +8,7 @@ import { assignRefs } from "../kernel/src/refs.js";
 import { renderVisibleRefs } from "../kernel/src/render-refs.js";
 import { defaultCountTokens } from "../kernel/src/tokenize.js";
 import type { CoreMessage } from "../kernel/src/types.js";
+import { resolve, sep } from "node:path";
 
 /**
  * Generic arbitrary-input discovery (issue #3848 acceptance, directive: find
@@ -32,7 +33,7 @@ import type { CoreMessage } from "../kernel/src/types.js";
  *     message is protected.
  */
 
-const REPO = new URL("..", import.meta.url).pathname;
+const REPO = resolve(import.meta.dirname, "..") + sep;
 const REFS = `${REPO}kernel/src/refs.ts`;
 const RENDER_REFS = `${REPO}kernel/src/render-refs.ts`;
 
