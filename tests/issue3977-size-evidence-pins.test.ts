@@ -387,14 +387,14 @@ test("pin #3977 P-LEARN (step-4 flip): two agreeing stated-count 400s teach the 
     }
 });
 
-// P-LEARN's companion edge: the steady-state assertion above compares two
-// POST-400 titles, so a ONE-TIME uptake of the stated count (k̂ recalibrated
-// once, or a one-off overflow-arm floor) would leave them equal and sail
-// through. The missing baseline is a session that NEVER saw the 400: today
-// the treated and the control refuse the same payload with byte-identical
-// titles; when step 4 makes the stated count calibration evidence, the
-// treated title's numbers/clauses move away from the control. (@flip-target)
-test("pin #3977 P-LEARN-b: refusal title after a stated-count 400 is byte-identical to a session that never saw the 400 (@flip-target for step 4)", async () => {
+// P-LEARN's companion edge (review fix 19bea679, upgraded for the step-4b
+// flip): the refusal TITLE is where a one-time uptake of the 400 would show.
+// Two directions, both pinned against a session that NEVER saw any 400:
+//   (i)  a window-only 400 (no per-part counts) never teaches — byte-identical
+//        title, exactly the pre-flip world the original pin captured;
+//   (ii) TWO agreeing stated-count 400s publish k-hat and the treated title's
+//        estimate numbers move AWAY from the control — the flip, observed.
+test("pin #3977 P-LEARN-b: a window-only 400 never moves the refusal title; two stated-count 400s do (k-hat recalibrates the quoted estimate)", async () => {
     // Control: seed, then the oversized non-foldable payload — the unlearned
     // reference title.
     const upA = makeUpstream();
@@ -415,27 +415,61 @@ test("pin #3977 P-LEARN-b: refusal title after a stated-count 400 is byte-identi
         await a.close();
     }
 
-    // Treated: seed, detour into the #3900-shaped stated-count 400, then the
-    // SAME oversized payload.
+    // (i) Window-only 400: arms the shrink but carries no per-part counts —
+    // nothing for the learner to pair. The title must stay byte-identical.
     const upB = makeUpstream();
     const portB = await listen(upB);
     const b = await setup({ [`http://127.0.0.1:${portB}`]: { models: { "gpt-test": { context: WINDOW } } } });
     try {
-        b.ctx.headers["x-acp-session"] = "p3977-learn-treat";
+        b.ctx.headers["x-acp-session"] = "p3977-learn-treat-wo";
         const rSeed = await post(b.ctx, { model: "gpt-test", stream: true, messages: [{ role: "user", content: "hello" }] });
         assert.equal(rSeed.status, 200, "the fitting seed forwards");
         await rSeed.text();
         upB.arm400();
         const rImg = await post(b.ctx, { model: "gpt-test", stream: true, messages: [{ role: "user", content: imageContent() }] });
-        assert.equal(rImg.status, 400, "the detour rides and gets the stated-count 400");
+        assert.equal(rImg.status, 400, "the detour rides and gets the window-only 400");
         await rImg.text();
         const rBig = await post(b.ctx, { model: "gpt-test", stream: true, messages: [{ role: "system", content: bigSystem() }, { role: "user", content: "q" }] });
         assert.equal(rBig.status, 413, "still refused locally");
         const titleTreated = await rBig.text();
-        assert.equal(titleTreated, titleControl, "a one-time uptake of the stated count would move these numbers/clauses — today the 400 teaches nothing");
+        assert.equal(titleTreated, titleControl, "a 400 without per-part counts never teaches the estimator");
     } finally {
         upB.server.close();
         upB.server.closeIdleConnections?.();
         await b.close();
+    }
+
+    // (ii) Two agreeing stated-count 400s (recovery between them retires the
+    // one-shot arm, #1110): k-hat publishes, the big payload's quoted
+    // estimate scales, and the refusal title MOVES away from the control.
+    const upC = makeUpstream();
+    const portC = await listen(upC);
+    const c = await setup({ [`http://127.0.0.1:${portC}`]: { models: { "gpt-test": { context: WINDOW } } } });
+    try {
+        c.ctx.headers["x-acp-session"] = "p3977-learn-treat-sc";
+        const rSeed = await post(c.ctx, { model: "gpt-test", stream: true, messages: [{ role: "user", content: "hello" }] });
+        assert.equal(rSeed.status, 200, "the fitting seed forwards");
+        await rSeed.text();
+        for (let i = 0; i < 2; i++) {
+            upC.arm400Stated();
+            const rImg = await post(c.ctx, { model: "gpt-test", stream: true, messages: [{ role: "user", content: imageContent() }] });
+            assert.equal(rImg.status, 400, `stated-count detour ${i + 1} rides and gets the counted 400`);
+            await rImg.text();
+            const rRec = await post(c.ctx, { model: "gpt-test", stream: true, messages: [{ role: "user", content: "recovery ping" }] });
+            assert.equal(rRec.status, 200, `recovery ${i + 1} retires the arm`);
+            await rRec.text();
+        }
+        const treated = getSession("p3977-learn-treat-sc");
+        assert.ok(typeof treated?.stats.calibratedEstimate === "number", "k-hat published from the two stated-count 400s");
+        const streamsBeforeBig = upC.calls.filter((x) => x.stream).length;
+        const rBig = await post(c.ctx, { model: "gpt-test", stream: true, messages: [{ role: "system", content: bigSystem() }, { role: "user", content: "q" }] });
+        assert.equal(rBig.status, 413, "the calibrated payload is still refused locally (it was always over the window)");
+        const titleTreated = await rBig.text();
+        assert.notEqual(titleTreated, titleControl, "the learned k-hat recalibrates the quoted estimate — the title moves away from the never-saw-400 control");
+        assert.equal(upC.calls.filter((x) => x.stream).length, streamsBeforeBig, "the oversized payload never reached the upstream");
+    } finally {
+        upC.server.close();
+        upC.server.closeIdleConnections?.();
+        await c.close();
     }
 });
