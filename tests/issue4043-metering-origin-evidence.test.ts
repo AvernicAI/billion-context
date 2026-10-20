@@ -73,3 +73,15 @@ test("a genuine client text edit co-occurring with metering drift still books th
     assert.equal(ledger.agg.clientInserts, 1, "raw payload edits stay full evidence");
     assert.equal(ledger.lines.at(-1)?.prov, "client");
 });
+
+// Direct pin on the strip itself (union coverage from duplicate PRs
+// #4055/#4056): holds even if the detectSeam attribution path reshapes.
+test("inbound fingerprint is immune to projected thinkingTokens fluctuation", () => {
+    const s = session();
+    noteInboundMessages(s, inbound(10));
+    const before = [...(s.transient?.inBody?.fps ?? [])];
+    noteInboundMessages(s, inbound(20));
+    const after = s.transient?.inBody?.fps ?? [];
+    assert.equal(before.length, 3, "all three messages fingerprinted");
+    assert.deepEqual(after, before, "fingerprint array unchanged when only bili's projected meter moves");
+});
