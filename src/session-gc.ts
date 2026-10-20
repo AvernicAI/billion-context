@@ -47,8 +47,10 @@ import { isValidSystemSurface, SYSTEM_SURFACE_SUFFIX } from "./system-surface.js
  * once #1083 lands — works via the store's format-agnostic reader).
  * Corrupt/unreadable files are left in place, never guessed at.
  *
- * #1180: the per-session CCR content store (#1097) lives next to its session
- * file as `<hash>.content-store.json` and shares the session's lifecycle —
+  * #1180: the per-session CCR content store (#1097) lives next to its session
+  * file as `<hash>.content-store.json` (the deterministic sibling computed by
+  * contentStoreRelPathFor in persist.ts — the suffix pairing below must stay
+  * consistent with it) and shares the session's lifecycle —
  * it holds lossless payload bytes (originals of oversized tool results), so
  * deleting the session loses exactly those bytes, the class of file this
  * sweep exists to clean:
