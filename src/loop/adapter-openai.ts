@@ -521,7 +521,14 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 }
                 const delta = choice.delta as Record<string, unknown> | undefined;
                 const finishReason = typeof choice.finish_reason === "string" ? choice.finish_reason : undefined;
-                const frameToolCalls = delta?.tool_calls as Array<Record<string, unknown>> | undefined;
+                // #3926: some gateways stamp EVERY chunk with `tool_calls: []`. An empty
+                // array carries no fragment info; classifying it as a tool frame strips the
+                // raw passthrough and, with pending left empty, silently drops ALL round-1
+                // text. Normalize it to absent so the frame takes the normal text path.
+                const tcsRaw = delta?.tool_calls;
+                const frameToolCalls = Array.isArray(tcsRaw) && tcsRaw.length > 0
+                    ? (tcsRaw as Array<Record<string, unknown>>)
+                    : undefined;
                 if (frameToolCalls) absorbToolCallDeltas(frameToolCalls);
 
                 if (finishReason) {
