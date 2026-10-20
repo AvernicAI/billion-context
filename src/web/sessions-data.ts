@@ -932,7 +932,7 @@ const detailInFlight = new Map<string, Promise<WebSessionDetail | null>>();
  *  live pool → unified/disk store → disk-index file (#1937: never a directory
  *  scan for a single id). Shared by the detail page and the block-content /
  *  ref-lookup endpoints so all three agree on what "exists" means. */
-export async function resolveSessionForWeb(id: string): Promise<Session | undefined> {
+async function resolveSessionForWeb(id: string): Promise<Session | undefined> {
     const live = listSessions().find((s) => s.id === id);
     let session: Session | undefined = live;
     if (!session) {
@@ -1087,7 +1087,7 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
  *  JSON — beyond that the browser tab dies before the user sees anything. */
 const BLOCK_CONTENT_MAX_CHARS = 2 * 1024 * 1024;
 
-export type BlockContentMode = "one" | "full";
+type BlockContentMode = "one" | "full";
 
 export interface WebBlockContent {
     blockId: string;
@@ -1144,7 +1144,7 @@ export async function buildBlockContent(id: string, blockId: string, mode: strin
     };
 }
 
-export interface WebRefMatch {
+interface WebRefMatch {
     blockId: string;
     tier: number;
     active: boolean;
