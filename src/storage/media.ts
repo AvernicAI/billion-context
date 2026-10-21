@@ -52,9 +52,8 @@ const sha256Hex = (s: string): string => createHash("sha256").update(s).digest("
  *  construction for anything this matches. */
 const CANONICAL_DATA_URL = /^data:([^;,]+);base64,(.+)$/;
 
-/** A split raw-wire url: `data:<type>;base64,$media:<sha256hex>` (exported
- *  for the async hydrate twin in mysql.ts). */
-export const SPLIT_MEDIA_URL = /^data:([^;,]+);base64,\$media:([0-9a-f]{64})$/;
+/** A split raw-wire url: `data:<type>;base64,$media:<sha256hex>`. */
+const SPLIT_MEDIA_URL = /^data:([^;,]+);base64,\$media:([0-9a-f]{64})$/;
 
 /** A bare base64-slot reference (anthropic source.data / google
  *  inlineData.data): the stored value IS `$media:<sha256hex>`. */
@@ -68,7 +67,7 @@ const SPLIT_MARKERS = [
     "\"imageBase64\"", "\"rawOpenaiContent\"", "\"rawOpenaiContentParts\"",
     "\"rawAnthropicBlock\"", "\"rawGoogleParts\"", "\"rawResponsesItem\"",
 ];
-export const HYDRATE_MARKERS = ["\"$media\"", "$media:"];
+const HYDRATE_MARKERS = ["\"$media\"", "$media:"];
 
 interface MediaRef { hash: string; bytes: string }
 
@@ -76,7 +75,7 @@ interface RawOpenaiImagePart { image_url: { url: unknown } }
 
 /** True when v is a split-form slot value: an object whose only job is to
  *  carry a CAS hash under $media. */
-export function isMediaRef(v: unknown): v is { $media: string } {
+function isMediaRef(v: unknown): v is { $media: string } {
     return v !== null && typeof v === "object" && !Array.isArray(v) && typeof (v as { $media?: unknown }).$media === "string";
 }
 
@@ -86,7 +85,7 @@ export function isMediaRef(v: unknown): v is { $media: string } {
  *  image_url.url lands on the message itself. Developer-role messages reuse
  *  rawOpenaiContent for the whole original message object — filtered out by
  *  the type check below. */
-export function collectRawOpenaiImageParts(msg: Record<string, unknown>): RawOpenaiImagePart[] {
+function collectRawOpenaiImageParts(msg: Record<string, unknown>): RawOpenaiImagePart[] {
     const out: RawOpenaiImagePart[] = [];
     const push = (c: unknown): void => {
         if (c === null || typeof c !== "object") return;
