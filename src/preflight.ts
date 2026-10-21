@@ -1438,21 +1438,68 @@ interface DeterministicDigestOptions {
     countText: (text: string) => number;
 }
 
+function digestLabelCategory(label: string): string {
+    const m = /^assistant tool-call (\S+)/.exec(label);
+    if (m) return m[1];
+    if (label.startsWith("tool-result")) return "result";
+    return label;
+}
+
 export function deterministicDigest(entries: DigestEntry[], startRef: string, endRef: string, opts: DeterministicDigestOptions): string {
     const { maxSummary, minSummaryLength, shrinkBound, countText } = opts;
     const totalChars = entries.reduce((sum, entry) => sum + entry.text.length, 0);
     const header = `[deterministic digest ${startRef}:${endRef}] ${entries.length} message(s), ~${totalChars} char(s) total. Emergency fast-path under extreme overflow (#2383): structural digest, no LLM summary; originals preserved - decompress this block to restore them verbatim.`;
+
+    // #4224: one-line structural conclusion — counts by message category so
+    // the digest conveys WHAT happened even when per-entry excerpts are trimmed.
+    let structureLine = "";
+    if (entries.length > 0) {
+        const counts = new Map<string, number>();
+        for (const e of entries) {
+            const cat = digestLabelCategory(e.label);
+            counts.set(cat, (counts.get(cat) ?? 0) + 1);
+        }
+        const parts = [...counts.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .map(([cat, n]) => `${n}\u00d7${cat}`);
+        structureLine = `Structure: ${parts.join(", ")}.`;
+    }
+
     const fits = (form: string): boolean =>
         countText(form) <= shrinkBound && (maxSummary === undefined || maxSummary <= 0 || form.length <= maxSummary);
     const line = (entry: DigestEntry, headChars: number): string => {
         const head = headChars > 0 ? ` :: ${entry.text.replace(/\s+/g, " ").trim().slice(0, headChars)}` : "";
         return `[${entry.ref} ${entry.label}] ${entry.text.length}ch${head}`;
     };
-    for (const headChars of [DIGEST_HEAD_CHARS, 0]) {
+    const preamble = entries.length > 0 ? `${header}\n${structureLine}\n` : header;
+
+    // #4224: dynamic head-length trimming. Instead of all-or-nothing (120→0→
+    // header-only), compute the per-line head budget from the remaining space
+    // so large spans keep short excerpts rather than losing them entirely.
+    const tryForm = (headChars: number): string | null => {
+        if (entries.length === 0) {
+            const form = preamble;
+            return fits(form) ? form : null;
+        }
         const body = entries.map((entry) => line(entry, headChars)).join("\n");
-        const form = entries.length > 0 ? `${header}\n${body}` : header;
-        if (fits(form)) return form;
+        const form = `${preamble}${body}`;
+        return fits(form) ? form : null;
+    };
+
+    const candidates: number[] = [DIGEST_HEAD_CHARS];
+    if (maxSummary !== undefined && maxSummary > 0 && entries.length > 0) {
+        const n = entries.length;
+        const baseLen = preamble.length + entries.reduce((s, e) => s + line(e, 0).length + 1, 0);
+        const computed = Math.floor((maxSummary - baseLen - 4 * n + 1) / n);
+        if (computed >= 24 && computed < DIGEST_HEAD_CHARS) candidates.push(computed);
+        if (computed < 24) candidates.push(24);
     }
+    candidates.push(0);
+    for (const hc of candidates) {
+        const form = tryForm(hc);
+        if (form !== null) return form;
+    }
+    if (fits(preamble)) return preamble;
     if (fits(header)) return header;
     // Pathological: even the header cannot fit the bounds — emit a minimal
     // marker padded to the kernel's minimum so the block still applies.
@@ -2366,7 +2413,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 }
             }
         }
-        for (let oi = 0; oi < ordered.length && appliedThisRound === 0 && !poolQueueDrop; oi++) {
+        // #4224: emergency digests are CPU-only (zero upstream calls), so the
+        // LLM-path "one fold per round" cap wastes hundreds of rounds.
+        const maxFoldsPerRound = emergencyFold ? Infinity : 1;
+        for (let oi = 0; oi < ordered.length && appliedThisRound < maxFoldsPerRound && !poolQueueDrop; oi++) {
             const range = ordered[oi];
             if (decisionTokens < textTarget) break;
             if (deps.signal?.aborted) {
@@ -2385,7 +2435,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 break;
             }
             const { refToIdx } = refMaps(messages, deps.session.state);
-            if (baselineKnown) {
+            // #4224: skip the mid-walk futility bail in the emergency path —
+            // each fold is free (CPU-only), so "cannot fully close the gap"
+            // is not a reason to stop folding.
+            if (baselineKnown && !emergencyFold) {
                 // #1841: mid-walk futility bail. Ranges already consumed,
                 // skipped, or unresolvable cannot yield saving; when the live
                 // untried rest of the walk cannot close the gap either, stop
@@ -2761,7 +2814,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 commitFold(skipKey, startRef, endRef, summary, planned.effectiveMessageIds, outcome?.external || externalFold);
                 break;
             }
-            if (appliedThisRound > 0) break;
+            if (appliedThisRound >= maxFoldsPerRound) break;
             if (failure || budgetHit) break;
         }
         if (appliedThisRound === 0) {
