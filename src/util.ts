@@ -565,18 +565,49 @@ export function appendSystemText(
     return base ? `${base}\n\n---\n\n${added}` : added;
 }
 
+/** #4205/#3900: positive evidence that an anthropic-wire route enforces its
+ *  input limit INDEPENDENTLY of max_tokens (separate output budget — reserving
+ *  headroom there would just shift every band down for no safety gain). Two
+ *  shapes carry that evidence: the canonical Anthropic API host (direct Claude
+ *  Code / SDK traffic), or a claude-* model id on the wire (gateway / Bedrock /
+ *  Vertex fronts of real Claude — their billing keeps the separate output
+ *  budget too). Wrapper providers on the anthropic wire (DeepSeek /anthropic)
+ *  bill completion against the SAME window and 400'd at the wall (#3900:
+ *  1,070,269 + 128,000 vs 1,048,576) — they carry no evidence here, so they
+ *  reserve. A claude-named model on a mis-billing wrapper keeps the documented
+ *  first-shot residual: one 400 per fresh baseline, then the self-heal (#4093)
+ *  and the proven-share learning (#3973) correct it. Evidence-permitlist
+ *  discipline (KDD#9): extend with traffic evidence, never wholesale. */
+const ANTHROPIC_API_HOST = "api.anthropic.com";
+const CLAUDE_MODEL_ID_PREFIX = "claude-";
+
+export function hasSeparateOutputBudgetEvidence(origin: string | undefined, modelId: string | undefined): boolean {
+    if (origin !== undefined) {
+        try {
+            if (new URL(origin).hostname.toLowerCase() === ANTHROPIC_API_HOST) return true;
+        } catch { /* unparseable origin — no evidence */ }
+    }
+    if (typeof modelId === "string" && modelId.length > CLAUDE_MODEL_ID_PREFIX.length && modelId.toLowerCase().startsWith(CLAUDE_MODEL_ID_PREFIX)) return true;
+    return false;
+}
+
 /**
- * Whether the OUTPUT budget should be reserved from the context window at all.
- * Anthropic's Messages API enforces the input limit INDEPENDENTLY of
- * max_tokens (the output budget is separate — input up to the window works
- * with any max_tokens), so reserving it would shift the nudge/truncate bands
- * down by maxOutput on every session with no safety gain. The OpenAI-family
- * APIs count output against the window, so the reservation is only needed
- * there. Unknown/other protocols reserve (conservative — a missed reservation
- * at worst overflows once and the self-heal corrects it).
+ * Whether the OUTPUT budget should be reserved from the context window for
+ * THIS request. Every wire reserves by default — unknown/other protocols
+ * included (conservative: a missed reservation at worst overflows once and
+ * the self-heal corrects it). The Anthropic Messages API family is the one
+ * whose canonical routes enforce the input limit INDEPENDENTLY of max_tokens,
+ * so only routes carrying positive separate-wall evidence
+ * (hasSeparateOutputBudgetEvidence) are exempt; everything else on the wire
+ * reserves (#4205: the blanket protocol exemption was what let wrapper
+ * providers on that wire 400 at the wall, #3900). Absent origin/model
+ * evidence the call degrades to "reserve", never to "exempt". Proven-share
+ * overrides (#3973) compose at the call site: live overflow evidence can
+ * force a reservation even on an exempt route.
  */
-export function shouldReserveOutputHeadroom(protocol: string | undefined): boolean {
-    return protocol !== "anthropic";
+export function shouldReserveOutputHeadroom(protocol: string | undefined, origin?: string, modelId?: string): boolean {
+    if (protocol === "anthropic") return !hasSeparateOutputBudgetEvidence(origin, modelId);
+    return true;
 }
 
 /** System-carrier texts of a parsed request body, covering all four wire shapes:

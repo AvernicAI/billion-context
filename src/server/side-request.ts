@@ -1,7 +1,7 @@
 import type { WireProtocol } from "../util.js";
 import { estimateRawBodyTokens } from "../preflight.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
-import { reserveOutputHeadroom, shouldReserveOutputHeadroom, systemCarrierTexts } from "../util.js";
+import { reserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
 import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../compress-tool.js";
@@ -540,9 +540,12 @@ const SIDE_REQUEST_GUARD_TOLERANCE = 1.15;
  *  from this path. Block here instead of forwarding: estimate the RAW body
  *  (CJK-aware text + image tokens) against the effective window — the declared
  *  modelContextLimit (#987: no learned window exists anymore) minus the output
- *  reservation on wires where output counts against the window. blocked=false
- *  with limit<=0 means "window unknown — forward as before". blocked requires
- *  estimate >= limit x SIDE_REQUEST_GUARD_TOLERANCE (estimator bias). */
+ *  reservation on routes that carry one (#4205: decided by the caller via
+ *  shouldReserveOutputHeadroom with route+model evidence — the guard stays
+ *  pure mechanics and self-reserves once from the UNRESERVED limit it is
+ *  handed). blocked=false with limit<=0 means "window unknown — forward as
+ *  before". blocked requires estimate >= limit x SIDE_REQUEST_GUARD_TOLERANCE
+ *  (estimator bias). */
 export function sideRequestGuard(
     parsed: unknown,
     protocol: WireProtocol,
@@ -555,6 +558,11 @@ export function sideRequestGuard(
      *  prior) — replaces the internal billing-based estimate when provided so
      *  the guard sees the same image channel every other gate consumes. */
     imageReserve?: number,
+    /** #4205: whether THIS route reserves the output budget from the window —
+     *  policy lives at the call site (shouldReserveOutputHeadroom sees route +
+     *  model evidence the guard cannot); default false keeps non-reserving
+     *  callers byte-identical. */
+    reserveHeadroom: boolean = false,
 ): { blocked: boolean; estimate: number; limit: number } {
     let limit = modelContextLimit;
     // #987: no learned window exists, but a usage-grounded arm left by an
@@ -565,7 +573,7 @@ export function sideRequestGuard(
     if (armedLimit > 0 && (limit <= 0 || armedLimit < limit)) limit = armedLimit;
     const field = outputBudgetField(parsed);
     const maxOut = (field ? readOutputBudget(parsed as Record<string, unknown>, field) : undefined) ?? 0;
-    if (limit > 0 && shouldReserveOutputHeadroom(protocol)) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
+    if (reserveHeadroom && limit > 0) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
     const imageMass = imageReserve ?? imageTokensInParsedBody(protocol, parsed, imageBilling, configuredCap);
     const estimate = estimateRawBodyTokens(parsed) + imageMass;
     return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };

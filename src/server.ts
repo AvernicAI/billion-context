@@ -3398,9 +3398,10 @@ export async function preflightCompressIfNeeded(
         // windowShrinkReason (set ONLY by the operator-override and codex-align
         // paths) — NOT just on limit < resolvedNativeWindow: the per-request
         // output-headroom reservation (reserveOutputHeadroom) also lowers
-        // reqConfig.modelContextLimit below native for every non-Anthropic turn
-        // with a max_tokens, so comparing alone would emit this note for a
-        // setting the operator never touched (#737 review).
+        // reqConfig.modelContextLimit below native for every turn whose route
+        // reserves headroom (non-anthropic wires plus anthropic routes lacking
+        // separate-output-budget evidence, #4205), so comparing alone would emit
+        // this note for a setting the operator never touched (#737 review).
         const ffEmbeddedUrl = route?.rewrittenUrl;
         const ffProviderKeys = Object.keys(opts.routes);
         const shrinkNote = buildWindowShrinkNote({
