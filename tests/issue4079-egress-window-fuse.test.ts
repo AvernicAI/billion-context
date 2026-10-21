@@ -31,6 +31,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { rmrf } from "./tmp-rm.ts";
+import { closeServers } from "./server-close-guard.ts";
 
 const WINDOW = 20_000;
 
@@ -115,11 +116,7 @@ async function setup(): Promise<{ ctx: Ctx; calls: Call[]; close: () => Promise<
         },
         calls,
         close: async () => {
-            proxy.close();
-            proxy.closeIdleConnections?.();
-            upstream.close();
-            upstream.closeIdleConnections?.();
-            await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
+            await closeServers([proxy, upstream], "egress-fuse harness");
         },
     };
 }
