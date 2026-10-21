@@ -1069,8 +1069,16 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // denominator makes the ratio structurally ≤1, so #1839's
         // "trustworthy baseline" gate is subsumed and no longer needed.
         const viewMessages = ctx.compressMessages ?? ctx.messages;
+        // #4227: id→tokens map — one scan of the view serves both meters below.
+        const viewTokById = new Map<string, number>();
         let viewTokens = 0;
-        for (const m of viewMessages) viewTokens += countMessageTokens(m);
+        for (const m of viewMessages) {
+            const t = countMessageTokens(m);
+            viewTokById.set(m.id, t);
+            viewTokens += t;
+        }
+        // This-fold ratio only: lastCompress, the degenerate-fold gate and the
+        // staged-compress note all judge ONE rewrite, never the session (#4227).
         const shrinkRatio = viewTokens > 0 ? Math.min(1, r.tokensCompressed / viewTokens) : 0;
         const foldPoint = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0]?.startRef ?? "unknown";
         ctx.session.lastCompress = { at: Date.now(), shrinkRatio, foldPoint, blocks: r.blocksCreated, tokensCompressed: r.tokensCompressed };
@@ -1082,9 +1090,27 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // upstream eviction.
         const anchorTok = res.state.blocks.reduce((n, b) => n + (b.active ? Math.ceil(b.summary.length / 4) : 0), 0);
         const activeBlockCount = res.state.blocks.filter((b) => b.active).length;
-        const postCtx = Math.max(0, viewTokens - r.tokensCompressed);
+        // #4227: postCtx is the RENDERED post-fold context — raw view minus what
+        // EVERY active block covers (union, so overlapping merged blocks count
+        // once), not "raw view minus this fold". The old value ignored all
+        // earlier blocks' net savings: with 86+ active blocks it read as the
+        // full resend mass (#4224: postCtx≈14.5M while most of it was already
+        // covered) and printed "shrink 0%" + "ceiling ≥0%" for a heavily
+        // compressed session. Single-block sessions are byte-identical to the
+        // old value (union == this fold); re-entering anchors stay reported
+        // separately as anchor≈ below, so nothing double-counts.
+        const coveredIds = new Set<string>();
+        for (const b of res.state.blocks) if (b.active) for (const id of b.effectiveMessageIds) coveredIds.add(id);
+        let coveredTok = 0;
+        for (const id of coveredIds) {
+            const t = viewTokById.get(id);
+            if (t !== undefined) coveredTok += t;
+        }
+        const postCtx = Math.max(0, viewTokens - coveredTok);
+        const cumSaved = Math.max(0, viewTokens - postCtx);
+        const cumShrinkRatio = viewTokens > 0 ? Math.min(1, cumSaved / viewTokens) : 0;
         const ceiling = postCtx > 0 ? Math.floor((100 * anchorTok) / postCtx) : 0;
-        ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% (~${r.tokensCompressed}/${viewTokens} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated} anchor≈${anchorTok} tok (${activeBlockCount} active blocks, sys excluded) postCtx≈${postCtx} → next-request cache ceiling ≥${ceiling}%`);
+        ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% this-fold (~${r.tokensCompressed}/${viewTokens} tok) · cumulative ${Math.round(cumShrinkRatio * 100)}% (~${cumSaved}/${viewTokens} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated} anchor≈${anchorTok} tok (${activeBlockCount} active blocks, sys excluded) postCtx≈${postCtx} → next-request cache ceiling ≥${ceiling}%`);
         // #1911: a fold covering most of the live context is a degenerate reset —
         // legitimate as a marathon-session strategy, but it rewrites the whole
         // prefix and leaves only the anchor summaries. Hosts need a

@@ -8,6 +8,7 @@ import {
     type CoreMessage,
     type Prompts,
     type PackSurface,
+    type NudgeDecision,
 } from "acp-kernel";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
 import { IMAGE_PLACEHOLDER, imagePlaceholdersForSummary } from "./image-note.js";
@@ -1669,11 +1670,16 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     const attemptTierRecovery = async (): Promise<TierRecoveryResult> => {
         let callsUsed = 0;
         let netSaved = 0;
+        // #4227: the most recent measurement's nudge offer — pinned into the
+        // distill fold's ctx so its receipt tail judges from the same
+        // source/scope/moment as the recovery's own processTurn call.
+        let measuredNudge: NudgeDecision | undefined;
         const measureEst = (): number => {
             const turn = deps.core.processTurn({
                 messages, state: deps.session.state, config: noEmergencyTruncate(ccrLoopConfig(deps.session, activeConfig)),
                 tokenCount: currentTokens, renderTags: "text-only", contentStore: contentStoreOf(deps.session),
             });
+            measuredNudge = turn.nudge;
             deps.session.state = turn.state;
             adoptContentStore(deps.session, turn.contentStore);
             const view = applyAbsorbView(turn.messages, turn.state, activeConfig, currentTokens);
@@ -1815,7 +1821,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 stopReason = "unavailable";
                 break;
             }
-            const ctx: RewriteCtx = { core: deps.core, config: activeConfig, messages, session: deps.session, log: (m) => deps.log("info", m) };
+            const ctx: RewriteCtx = { core: deps.core, config: activeConfig, messages, session: deps.session, lastNudge: measuredNudge, log: (m) => deps.log("info", m) };
             const fold = parseCompressInput({ content: [{ startId: first.blockId, endId: last.blockId, summary: outcome.summary, topic: `preflight tier-${sourceTier + 1} distill (#2952)` }] });
             const applied = applyRanges(fold, ctx, { loopTracking: false });
             if (applied.outcome === "refused") {
@@ -2135,6 +2141,15 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 config: activeConfig,
                 messages,
                 session: deps.session,
+                // #4227: pin the receipt tail to THIS round's own nudge offer —
+                // the same source/scope/moment the walk above just acted on.
+                // Without it, postCompressTail falls back to a live recompute
+                // judged on statusInputBaseline (the previous request's usage-
+                // grade input tokens): in an overflow marathon that baseline is
+                // far below the window while the ACTUAL payload is 19x over, so
+                // the tail printed "No compressible ranges remain" in the very
+                // fold whose walk logged "102 viable range(s)" (#4224/#4227).
+                lastNudge: turn.nudge,
                 log: (msg) => deps.log("info", msg),
             };
             const creditBefore = deps.session.stats.compressCreditTokens;
