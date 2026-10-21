@@ -1813,7 +1813,36 @@ export async function handlePluginTool(
                 routedBy = "witness";
                 deps.log("info", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" resolves to a stale persona parent — following live lineage witness "${lineage.id}" (#2601)`);
             } else if (!nativeCaller) {
-                return forkReply(res, 409, { ok: false, code: "TOOL_CONVERSATION_CONFLICT", error: "outbound tool witness does not match conversationId" });
+                // #4168: a static env binding (the claude MCP shim's captured
+                // CLAUDE_CODE_SESSION_ID) goes stale when the host moves the
+                // conversation to a new session id (resume / native-compaction
+                // continuation) — every call then fails closed here forever,
+                // because #656's adoption only ever saw 404s. Still fail closed
+                // (#2024/#2016), but say WHO holds the matching outbound
+                // witness: with a unique witness, name it so the model can
+                // re-route via the #760 per-call conversation_id channel, and
+                // hand the shim the recency facts it needs to self-rebind. The
+                // fields are additive; `code` and the error prefix stay stable
+                // for existing consumers.
+                const witnesses = [...witnessIds];
+                let witnessLastSeen = 0;
+                for (const wid of witnesses) {
+                    const ws = peekSession(wid);
+                    if (ws && ws.lastSeen > witnessLastSeen) witnessLastSeen = ws.lastSeen;
+                }
+                const single = witnesses.length === 1 && witnesses[0] !== session.id ? witnesses[0] : undefined;
+                return forkReply(res, 409, {
+                    ok: false,
+                    code: "TOOL_CONVERSATION_CONFLICT",
+                    error: single
+                        ? `outbound tool witness does not match conversationId — your captured conversation id "${conversationId}" is stale: the identical call lives in conversation "${single}". Re-send with conversation_id="${single}", or restart the client to re-bind.`
+                        : `outbound tool witness does not match conversationId — your captured conversation id "${conversationId}" is stale and ${witnesses.length} sessions hold the matching outbound witness; refuse to guess. Start a fresh conversation or restart the client to re-bind.`,
+                    conversationId,
+                    namedSessionId: session.id,
+                    witnessSessions: witnesses,
+                    namedSessionLastSeen: session.lastSeen,
+                    witnessLastSeen,
+                });
             } else {
                 routedBy = "native";
                 deps.log("warn", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" conflicts with outbound witness — honoring the native caller, refusing the witness (#2024)`);

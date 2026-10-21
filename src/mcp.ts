@@ -152,8 +152,11 @@ function ensureManifest(): Promise<void> {
 export type McpForwardedToolResult = { text: string; failed: boolean; outcome?: ToolOutcomeKind; blocksCreated?: number };
 
 export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined, nativeCaller: boolean = false): Promise<McpForwardedToolResult> {
-    const effectiveConversationId = conversationIdOverride ?? conversationId;
     for (let attempt = 0; ; attempt++) {
+        // Recomputed per attempt: an in-loop adoption (#656/#4168) rewrites the
+        // global binding, and the retry must carry the NEW id — capturing it
+        // once above the loop would silently re-POST the stale one.
+        const effectiveConversationId = conversationIdOverride ?? conversationId;
         let res: Response;
         try {
             const body: Record<string, unknown> = { conversationId: effectiveConversationId, tool, args };
@@ -172,7 +175,7 @@ export async function forwardTool(tool: string, args: unknown, timeoutMs: number
             if (err instanceof Error && err.name === "TimeoutError") throw new Error(`tool forward timed out after ${timeoutMs}ms: ${tool}`);
             throw err;
         }
-        const data = (await res.json()) as { ok?: boolean; result?: string; error?: string; outcome?: unknown; blocksCreated?: unknown };
+        const data = (await res.json()) as { ok?: boolean; result?: string; error?: string; outcome?: unknown; blocksCreated?: unknown; code?: unknown; witnessSessions?: unknown; namedSessionLastSeen?: unknown; witnessLastSeen?: unknown };
         // #1875: ok:true means the tool RAN; the business effect rides outcome.
         // failure/refusal receipts become MCP isError so hosts surface them to
         // the model — partial still counts as success.
@@ -200,6 +203,33 @@ export async function forwardTool(tool: string, args: unknown, timeoutMs: number
         ) {
             if (await adoptLatestActiveConversation()) continue;
         }
+        // #4168: the captured id still RESOLVES, but the host moved the
+        // conversation to a new session id after this shim spawned (claude's
+        // native-compaction continuation / resume) — every call now fails
+        // closed on the outbound-witness conflict instead of ever 404ing, so
+        // the #656 adoption above never fires and the session is stuck for
+        // good. Extend the same one-shot adoption to this failure: adopt the
+        // UNIQUE witnessing session only when the proxy's recency facts prove
+        // traffic moved there AFTER the bound session's last activity.
+        // Multiple witnesses, missing facts (older proxy), or a still-fresh
+        // binding all stay on the loud 409 — fail closed, never guess.
+        if (
+            res.status === 409 && attempt === 0 && ORPHAN_ADOPT && conversationIdOverride === undefined && conversationId &&
+            data.code === "TOOL_CONVERSATION_CONFLICT"
+        ) {
+            const witnesses = Array.isArray(data.witnessSessions)
+                ? data.witnessSessions.filter((x): x is string => typeof x === "string" && x.length > 0)
+                : [];
+            const namedSeen = typeof data.namedSessionLastSeen === "number" ? data.namedSessionLastSeen : NaN;
+            const witnessSeen = typeof data.witnessLastSeen === "number" ? data.witnessLastSeen : NaN;
+            if (witnesses.length === 1 && witnesses[0] !== conversationId && Number.isFinite(namedSeen) && Number.isFinite(witnessSeen) && witnessSeen > namedSeen) {
+                process.stderr.write(
+                    `[bili-mcp] captured conversation id ${conversationId} is stale — the host moved this conversation to ${witnesses[0]} (resume/native compaction?); re-binding\n`,
+                );
+                conversationId = witnesses[0];
+                continue;
+            }
+        }
         throw new Error(data.error ?? `tool forward failed: ${res.status}`);
     }
 }
@@ -225,6 +255,12 @@ async function adoptLatestActiveConversation(): Promise<boolean> {
     } catch {
         return false;
     }
+}
+
+// Test seam: forwardTool's adoption rewrites the module-level binding, so
+// tests need a deterministic way to reset it between cases.
+export function _resetMcpBindingForTest(nextConversationId?: string): void {
+    conversationId = nextConversationId;
 }
 
 const ERR_TOOL = -32602;
