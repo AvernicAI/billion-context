@@ -1438,10 +1438,13 @@ interface DeterministicDigestOptions {
     countText: (text: string) => number;
 }
 
+// Labels are built by the digest entry collectors as `assistant tool-call <verb>`
+// and `tool result <verb>` (space-separated, see the entry builders below) — a
+// tool call and its result count as one logical action, so both collapse to the
+// verb ("Structure: 178×bash" for 89 calls + 89 results).
 function digestLabelCategory(label: string): string {
-    const m = /^assistant tool-call (\S+)/.exec(label);
+    const m = /^(?:assistant tool-call|tool result) (\S+)/.exec(label);
     if (m) return m[1];
-    if (label.startsWith("tool-result")) return "result";
     return label;
 }
 

@@ -227,6 +227,25 @@ test("deterministicDigest: #4224 dynamic head trimming keeps short excerpts for 
     assert.ok(headMatch && headMatch[1].length < 120, `head trimmed below 120 chars (got ${headMatch?.[1]?.length})`);
 });
 
+test("deterministicDigest: #4224 structure counts merge a tool call with its result under one verb", () => {
+    const entries = [
+        { ref: "m00001", label: "assistant tool-call bash", text: "ls -la" },
+        { ref: "m00002", label: "tool result bash", text: "total 8" },
+        { ref: "m00003", label: "assistant tool-call read", text: "path/a.ts" },
+        { ref: "m00004", label: "tool result read", text: "const x = 1;" },
+        { ref: "m00005", label: "user", text: "go" },
+    ];
+    const out = deterministicDigest(entries, "m00001", "m00005", {
+        maxSummary: 20_000, minSummaryLength: 50, shrinkBound: 100_000, countText: (t: string) => t.length,
+    });
+    const struct = out.split("\n").find((l) => l.startsWith("Structure:"));
+    assert.ok(struct, "structure line present");
+    assert.ok(struct.includes("2\u00d7bash"), `bash call and its result merged under one verb (got: ${struct})`);
+    assert.ok(struct.includes("2\u00d7read"), `read call and its result merged under one verb (got: ${struct})`);
+    assert.ok(struct.includes("1\u00d7user"), `plain role kept as-is (got: ${struct})`);
+    assert.ok(!struct.includes("tool result"), "no raw 'tool result <verb>' category leaks into the counts");
+});
+
 test("deterministicDigest: extreme bounds still fall back to header-only", () => {
     const entries = Array.from({ length: 8 }, (_, i) => ({
         ref: `m${String(i + 1).padStart(5, "0")}`,
