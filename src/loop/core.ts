@@ -168,27 +168,6 @@ function activeAbsorbToolName(session: Session, config: Config): string | undefi
     return a?.enabled === true ? a.toolName ?? ABSORB_TOOL_NAME : undefined;
 }
 
-// Canonical args for repeat-detection: key-order/whitespace differences must not
-// defeat an identical-call match, so parse + re-stringify with sorted keys.
-function canonicalArgs(args: string): string {
-    try {
-        return JSON.stringify(sortKeys(JSON.parse(args)));
-    } catch {
-        return args;
-    }
-}
-
-function sortKeys(v: unknown): unknown {
-    if (Array.isArray(v)) return v.map(sortKeys);
-    if (v !== null && typeof v === "object") {
-        const src = v as Record<string, unknown>;
-        const out: Record<string, unknown> = {};
-        for (const k of Object.keys(src).sort()) out[k] = sortKeys(src[k]);
-        return out;
-    }
-    return v;
-}
-
 // #3661: the re-request below replays proxy-tool arguments into assistant.tool_calls;
 // strict chat-template gateways crash server-side rendering of non-JSON arguments and
 // 400 the whole continuation request, so the round dies before the model ever sees the
@@ -571,16 +550,11 @@ export async function* runCompressLoop(
         return body;
     };
 
-    // #156: compress/decompress calls already failed this loop. Validation is
-    // deterministic (identical args → identical failure), so a byte-identical
-    // re-submission can never succeed — break early instead of at MAX_LOOP_ROUNDS.
-    const failedSignatures = new Set<string>();
-
     // #3302 (Ask 6): probe-family observability — a model failing compress with
     // one endpoint fixed and the other varying is enumerating a sparse ref
-    // space; the identical-args breaker above never fires on that pattern.
-    // Log it once as an operator signal; the failure receipts carry the live
-    // range table, so the loop keeps running for the model to find it.
+    // space; every attempt carries different args, so the failed-only breaker
+    // below ends such turns without ever flagging them. Log it once as an
+    // operator signal; the failure receipts carry the live range table.
     const probeFailures = new Map<string, Set<string>>();
     let probeWarned = false;
 
@@ -1448,30 +1422,32 @@ export async function* runCompressLoop(
                 return;
             }
 
-            // #156: if this round is only failed compress/decompress and one of
-            // them re-submits args that already failed, the model is stuck in a
-            // deterministic failure loop — break early instead of burning rounds.
+            // #156/#4186: if this round is only failed compress/decompress, stop
+            // here instead of re-requesting. The failed frames spliced into the
+            // retry body above are ephemeral (#1548): never persisted, never seen
+            // by the client. Letting them reach upstream and then vanish from the
+            // next request rewrites the provider's frozen prefix mid-history —
+            // an unsanctioned cache seam. Breaking keeps them off the wire; the
+            // receipt already streamed to the client carries why it failed, and a
+            // later turn can retry with a different range.
             const failedMutating = proxyResults.filter(
                 (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),
             );
-            if (reRequest && failedMutating.length > 0 && failedMutating.length === proxyResults.length) {
-                const repeated = failedMutating.some((pr) => failedSignatures.has(`${pr.name}\u0000${canonicalArgs(pr.arguments)}`));
-                if (repeated) {
-                    ctx.log(`[acp-loop] round ${round}: model re-submitted an already-failed compress with identical arguments; stopping after ${round} round(s) instead of ${MAX_LOOP_ROUNDS}`);
-                    loggerLog("warn", `[acp-loop] repeated identical compress failure at round ${round}; breaking early (#156)`);
-                    yield adapter.emitCompletion({ finishReason: "length", usage, terminalExtra });
-                    return;
-                }
-            }
-            for (const pr of failedMutating) failedSignatures.add(`${pr.name}\u0000${canonicalArgs(pr.arguments)}`);
 
             if (!probeWarned) {
                 const probing = recordProbeFailures(probeFailures, failedMutating);
                 if (probing) {
                     probeWarned = true;
-                    ctx.log(`[acp-loop] round ${round}: model probed ${probing.values.length} distinct ${probing.label} values (${probing.values.join(", ")}) in failed compress calls — sparse ref-space enumeration (#3302); not breaking early, the receipts carry the live range table`);
+                    ctx.log(`[acp-loop] round ${round}: model probed ${probing.values.length} distinct ${probing.label} values (${probing.values.join(", ")}) in failed compress calls — sparse ref-space enumeration (#3302); the receipts carry the live range table`);
                     loggerLog("warn", `[acp-loop] compress probe family at round ${round}: ${probing.values.length} distinct ${probing.label} values failed (${probing.values.join(", ")}) (#3302)`);
                 }
+            }
+
+            if (reRequest && failedMutating.length > 0 && failedMutating.length === proxyResults.length) {
+                ctx.log(`[acp-loop] round ${round}: failed-only mutating round; completing after ${round} round(s) instead of re-requesting (#156/#4186)`);
+                loggerLog("warn", `[acp-loop] failed compress/decompress round at round ${round}; breaking early (#156/#4186)`);
+                yield adapter.emitCompletion({ finishReason: "length", usage, terminalExtra });
+                return;
             }
 
             ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);
