@@ -1048,6 +1048,37 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             if (swallowUntilClose) {
                 const combined = swallowed + buf;
                 const span = looseCloseSpan(combined);
+                // #4163: a NEW opening inside the live bare-open span is the
+                // cross-chunk form of the #1720 nesting evidence ("more tag
+                // structure follows in this same chunk"): the whole-buffer
+                // path would have dropped THIS opening alone and released
+                // whatever sat between it and the inner markup as prose.
+                // Without the check the inner opening accumulates into
+                // `swallowed`, and the close-resolution release branch or the
+                // EOF bare-release (#1881) hands it to the client verbatim —
+                // same logical output, different persisted bytes per chunking
+                // (#3198). Split only when the opening precedes any close
+                // terminator: a close first resolves the pair on the existing
+                // path and the remainder (opening included) loops normally.
+                // Gated to bare-open release sessions: an attrs-bearing tail
+                // is tag content end-to-end (#644 EOF rule), and a wrapped
+                // turn discards its payload wholesale — neither re-adjudicates
+                // its interior.
+                if (swallowBareOpen && swallowReleases) {
+                    const o = LONE_OPEN.exec(combined);
+                    if (o !== null) {
+                        const d = degenCloseAfterRef(combined);
+                        const term = span !== null ? span.start : d !== null ? d.start : -1;
+                        if (term === -1 || o.index < term) {
+                            out += stripDeadRefCloses(combined.slice(0, o.index), true);
+                            dropSwallowSpan(o[0]);
+                            swallowed = "";
+                            swallowUntilClose = false;
+                            buf = combined.slice(o.index);
+                            continue;
+                        }
+                    }
+                }
                 if (span !== null) {
                     // Only a refs-only body is tag content (#1720/#2023): a
                     // prose body between paired tags is released and just the
