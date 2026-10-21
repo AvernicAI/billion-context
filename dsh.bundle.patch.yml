@@ -20,18 +20,29 @@
 # #3354: keep in sync with writeDshAcpPatch in src/launcher.ts — entry inject
 # lists are REPLACED by patches, not concatenated; if a future dsh ships its
 # own inject list on these entries, merge manually in BOTH layers.
-# #3962: these four gate rows target the FACTORY Web preset roster. A profile
-# that replaces those presets with its own ids (e.g. a desktop profile's twelve
-# local presets) has none of them, so all four rows match nothing and dsh logs
-# `patch: entry <id> not found` at startup — buried in the `loader` logger, NOT
-# surfaced in the plugin inventory / settings UI / any diagnostic. That miss is
-# EXPECTED here, not a regression: the real basic-compaction stand-down is done
-# by the global internal/config middleware (src/agent/dsh-compaction-disable.ts),
-# which fires for every agent-preset resolution regardless of id; the gate rows
-# only add an ordering fence (a preset stays pending until the overlay service
-# publishes). To check whether these rows applied on YOUR profile, grep the dsh
-# loader log for `patch: entry ... not found`. Do NOT delete them: profiles that
-# keep the factory roster get a real ordering fence from them.
+# #3962: these four gate rows target the FACTORY Web preset roster ONLY. A
+# profile that replaces those presets with its own ids has none of them, so all
+# four rows match nothing and dsh logs `patch: entry <id> not found` at startup
+# (buried in the `loader` logger, surfaced nowhere else).
+#
+# That miss is NOT harmless — it is a correctness risk. The inject gate is what
+# keeps a preset PENDING until the overlay service publishes, i.e. what
+# GUARANTEES the global internal/config middleware (src/agent/dsh-compaction-
+# disable.ts) registers BEFORE that preset resolves. Per that module's own
+# contract the guarantee covers only GATED ("protected") presets; an ungated
+# custom preset resolves by import order, which the upstream plugin explicitly
+# warns not to rely on. If such a preset resolves before the overlay registers,
+# its compaction-basic AND command-compact rows are never disabled -> a dsh
+# compaction checkpoint lands outside bili's knowledge and destroys the
+# compression substrate (#3354/#1772/#1729). Your own `auto: false` stops only
+# AUTO-trigger; it does NOT cover command-compact.
+#
+# If your profile uses custom preset ids, SELF-GATE each one by adding
+#     inject: [biliBasicCompactionPolicy]
+# to every custom preset entry (or keep the factory roster). To check whether
+# these factory rows applied on YOUR profile, grep the dsh loader log for
+# `patch: entry ... not found`. Do NOT delete these rows: factory-roster
+# profiles get a real ordering fence from them.
 - id: preset-standard
   inject: [biliBasicCompactionPolicy]
 - id: preset-ptc
