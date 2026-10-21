@@ -106,3 +106,17 @@ test("#4106: fixed-point property holds over generated fragment soup (seeded)", 
         assert.ok(s1.length <= t.length, "strip lengthened the text");
     }
 });
+
+test("#4106: beyond STRIP_PASS_CAP the walk keeps residue (CPU bound) — pinned corner", () => {
+    // Nine stacked $-anchored truncated closes peel exactly ONE per pass and
+    // never attest (close-only shapes deliberately do not self-attest,
+    // #1760/#644), so the ninth layer sits past the cap: the walk terminates
+    // at STRIP_PASS_CAP=8 keeping its residue instead of burning CPU on
+    // attacker-shaped input, and a further call peels the last layer. Pinning
+    // both facts keeps the docstring's bounded guarantee honest in either
+    // direction (cap change or peel-rate change fails this test loudly).
+    const t = "A" + "</acpa\n".repeat(9);
+    const s1 = stripAcpTags(t);
+    assert.equal(s1, "A</acpa\n", "cap behavior drifted");
+    assert.notEqual(stripAcpTags(s1), s1, "documented corner: one more call peels the final layer");
+});

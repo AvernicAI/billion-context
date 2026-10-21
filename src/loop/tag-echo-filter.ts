@@ -516,9 +516,14 @@ function stripPass(text: string, dropToolCallEmission: boolean, requestText: str
 // residue rather than burn CPU on attacker-shaped fields).
 const STRIP_PASS_CAP = 8;
 
-/** Whole-text ACP artifact strip. Returns a FIXED POINT: a repeated call never
- *  removes anything further (#4106 — retry/rebuild paths re-normalize already
- *  cleaned messages, so one call must do everything repeat calls would). */
+/** Whole-text ACP artifact strip. Returns a FIXED POINT whenever the exposure
+ *  cascade settles within STRIP_PASS_CAP passes (all attested shapes and every
+ *  observed cascade do — one call then does everything repeat calls would,
+ *  #4106, so retry/rebuild paths re-normalizing already-cleaned messages ship
+ *  stable bytes). Beyond the cap — attacker-shaped fields layering more
+ *  cross-stage exposures than this deep — the walk stops and keeps its
+ *  residue; a repeated call may peel further (the CPU bound outranks
+ *  completeness there, see the STRIP_PASS_CAP note above). */
 export function stripAcpTags(text: string, dropToolCallEmission = false, requestText?: string): string {
     const attested = laterChannelAttested(text);
     let out = text;
