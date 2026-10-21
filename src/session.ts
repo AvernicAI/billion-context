@@ -10,6 +10,7 @@ import { durableMessageToolPaths, withDurableProtection } from "./durable-messag
 import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
 import type { InboundSlot, SeamSlot } from "./cache-ledger.js";
+import type { FoldReconcileResult } from "./fold-reconcile.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -1453,6 +1454,14 @@ export function applyCompactionArchive(
     }
 
     const { byRaw, byRef } = session.state.messageRefs;
+    // #4131: name what the prune costs — ref(s) about to be dropped that still
+    // sit under some block's coverage, so silent coverage loss is auditable.
+    const droppedIds = new Set(Object.keys(byRaw).filter((id) => id !== REF_FLOOR_RAW_ID && !liveRawIds.has(id)));
+    let coverageNote = "";
+    if (droppedIds.size > 0) {
+        const affectedBlocks = session.state.blocks.filter((b) => (b.effectiveMessageIds ?? []).some((id) => droppedIds.has(id))).map((b) => b.blockId);
+        coverageNote = `; ${droppedIds.size} ref(s) dropped${affectedBlocks.length > 0 ? `, covering block(s) ${affectedBlocks.join(", ")}` : ""}`;
+    }
     pruneRefsToLiveIds(session, liveRawIds, byRaw, byRef);
 
     session.metadata.compactionBoundary = {
@@ -1462,7 +1471,7 @@ export function applyCompactionArchive(
         archivedBlocks: deactivated,
     };
     markDirty(session);
-    log("info", `[${session.id}] native compaction boundary: archived ${deactivated.length} pre-compaction block(s)${deactivated.length > 0 ? ` (${deactivated.join(", ")})` : ""}; pruned ref maps to ${liveRawIds.size} live raw id(s)`);
+    log("info", `[${session.id}] native compaction boundary: archived ${deactivated.length} pre-compaction block(s)${deactivated.length > 0 ? ` (${deactivated.join(", ")})` : ""}; pruned ref maps to ${liveRawIds.size} live raw id(s)${coverageNote}`);
 }
 
 /** Prune the ref maps to `liveRawIds` in place (same maps, not new objects:
@@ -1574,12 +1583,19 @@ interface RewriteDetection {
     knownBefore: number;
     incomingTotal: number;
     knownIncoming: number;
+    /** #4131: the ratio collapse was explained by this pass's fold-reconcile
+     *  finding EVERY covered id on the wire (present or re-anchored, zero
+     *  unmatched) — bili's own sanctioned id churn across builds (#3642 D1),
+     *  not a client rewrite. The destructive boundary is suppressed and
+     *  callers record an adoption event instead of marking one. */
+    churnExplained: boolean;
 }
 
 export function detectUnannouncedHistoryRewrite(
     session: Session,
     knownRefsBefore: ReadonlySet<string>,
     liveRawIds: Iterable<string>,
+    reconcile?: Pick<FoldReconcileResult, "kind" | "unmatched"> | null,
 ): RewriteDetection {
     const knownBefore = knownRefsBefore.size - (knownRefsBefore.has(REF_FLOOR_RAW_ID) ? 1 : 0);
     let incomingTotal = 0;
@@ -1588,14 +1604,28 @@ export function detectUnannouncedHistoryRewrite(
         incomingTotal++;
         if (knownRefsBefore.has(id)) knownIncoming++;
     }
-    const detected =
+    const rawDetected =
         knownBefore >= REWRITE_MIN_KNOWN_REFS &&
         session.state.blocks.length > 0 &&
         incomingTotal >= REWRITE_MIN_INCOMING_TOTAL &&
         knownIncoming > 0 &&
         knownIncoming / incomingTotal < REWRITE_MAX_KNOWN_RATIO &&
         knownIncoming / knownBefore < REWRITE_MAX_KNOWN_RATIO;
-    return { detected, knownBefore, incomingTotal, knownIncoming };
+    // #4131: order-centric doctrine — no single dimension may veto the
+    // multi-evidence verdict. When this pass's fold-reconcile found EVERY
+    // covered id on the wire (kind reanchored/resend, unmatched === 0), the
+    // hash-identity collapse is explained churn: bili's own cross-build id
+    // re-mint (#3642 D1 accepted exactly this once-per-upgrade mass churn,
+    // promising the reconcile ladder would absorb it). Marking the destructive
+    // compaction boundary here instead tombstones hundreds of still-cited
+    // refs (#4131 incident). Off/noop verdicts (reconcile disabled, side-request
+    // skip) carry no evidence either way → legacy behavior unchanged; partial
+    // claims (unmatched > 0) keep the legacy escalation path.
+    const churnExplained = rawDetected
+        && reconcile !== undefined && reconcile !== null
+        && (reconcile.kind === "reanchored" || reconcile.kind === "resend")
+        && reconcile.unmatched === 0;
+    return { detected: rawDetected && !churnExplained, knownBefore, incomingTotal, knownIncoming, churnExplained };
 }
 
 /** #1195: message ids are content hashes — if a client resends history whose

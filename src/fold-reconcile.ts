@@ -389,7 +389,7 @@ interface ReconciliationPlan {
     claimedChurnTokens?: number;
 }
 
-interface FoldReconcileResult {
+export interface FoldReconcileResult {
     kind: "off" | "noop" | "resend" | "reanchored" | "unmatched";
     missing: number;
     claims: number;
