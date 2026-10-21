@@ -355,3 +355,150 @@ test("#4069: delta planner verifies an image boundary through the split hash", (
         try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
     }
 });
+
+// ---- #4069 follow-up: the OTHER codecs' raw carriers carry the same payloads
+// a second time too (anthropic source.data, google inlineData, responses
+// item input_image urls) — they must ride the CAS as well, or a
+// multi-protocol install gets a half-split store.
+
+const ANTH_B64 = "e".repeat(70_000);
+const GOOG_A = "f".repeat(70_000);
+const GOOG_B = "g".repeat(70_000);
+const RESP_A = "h".repeat(70_000);
+const RESP_B = "i".repeat(70_000);
+
+test("#4069: anthropic rawAnthropicBlock source.data splits; dual-field dedups to one CAS row; round-trip byte-exact", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-media-cas-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        // Shape as produced by kernel/src/wire/anthropic.ts case "image":
+        // rawAnthropicBlock carries the WHOLE block incl. source.data, and the
+        // sidecar lifts the same bytes.
+        const m = {
+            id: "m-anth", role: "user", contentType: "image", text: "[image]", imagePart: true,
+            rawAnthropicBlock: { type: "image", source: { type: "base64", media_type: "image/png", data: ANTH_B64 } },
+            imageBase64: ANTH_B64, imageMediaType: "image/png",
+        };
+        store.ingestSession(planIngest(mkSession("sess-anth", [m])));
+        assert.equal(store.mediaRefCount(ANTH_B64), 1, "sidecar + raw slot share ONE CAS row");
+        const bodies = storedBodies(store, "sess-anth");
+        assert.ok(bodies.some((b) => !b.includes(ANTH_B64) && b.includes("$media:"), "stored content must not inline the base64"));
+        assert.equal(store.getMessages("sess-anth")[0].content, JSON.stringify(m), "byte-identical round-trip");
+        store.close();
+    } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
+    }
+});
+
+test("#4069: anthropic tool_result nested image blocks split; redacted_thinking .data NEVER touched", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-media-cas-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        // tool_result whose content array nests an image block (kernel
+        // anthropic.ts :175 stores such blocks verbatim under rawAnthropicBlock).
+        const nested = {
+            id: "m-nested", role: "tool", contentType: "tool_result", text: "",
+            rawAnthropicBlock: {
+                type: "tool_result", tool_use_id: "tu_1",
+                content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: ANTH_B64 } }],
+            },
+        };
+        // KDD#10 negative control: thinking-family bytes are signature-verified
+        // upstream and must stay verbatim ON THE WIRE — the storage split does
+        // not touch them (hydrate restores anyway, but the gate must not claim
+        // them either). Above floor on purpose: size must not unlock it.
+        const REDACTED_B64 = "j".repeat(70_000);
+        const redacted = {
+            id: "m-redacted", role: "assistant", contentType: "message", text: "",
+            rawAnthropicBlock: { type: "redacted_thinking", data: REDACTED_B64 },
+        };
+        store.ingestSession(planIngest(mkSession("sess-anth2", [nested, redacted])));
+        assert.equal(store.mediaRefCount(ANTH_B64), 1, "nested tool_result image split");
+        assert.equal(store.mediaRefCount(REDACTED_B64), 0, "redacted_thinking never split");
+        const rows = store.getMessages("sess-anth2");
+        assert.equal(rows[0].content, JSON.stringify(nested), "nested round-trip byte-exact");
+        assert.equal(rows[1].content, JSON.stringify(redacted), "redacted round-trip verbatim");
+        store.close();
+    } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
+    }
+});
+
+test("#4069: google rawGoogleParts inlineData splits per part; fileData URI untouched; round-trip byte-exact", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-media-cas-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        // Two inlineData parts (plural carrier) + a fileData part (URI — not
+        // base64 media, must pass through untouched).
+        const m = {
+            id: "m-goog", role: "user", contentType: "image", text: "[images]", imagePart: true,
+            rawGoogleParts: [
+                { inlineData: { mimeType: "image/png", data: GOOG_A } },
+                { text: "between" },
+                { inlineData: { mimeType: "image/jpeg", data: GOOG_B } },
+                { fileData: { mimeType: "application/pdf", fileUri: "https://files.example/x.pdf" } },
+            ],
+            imageBase64: GOOG_A, imageMediaType: "image/png",
+        };
+        store.ingestSession(planIngest(mkSession("sess-goog", [m])));
+        assert.equal(store.mediaRefCount(GOOG_A), 1, "first image: sidecar + inlineData share one row");
+        assert.equal(store.mediaRefCount(GOOG_B), 1, "second image split from its own part");
+        const bodies = storedBodies(store, "sess-goog");
+        assert.ok(bodies.some((b) => !b.includes(GOOG_A) && !b.includes(GOOG_B) && b.includes("$media:")), "stored content must not inline either payload");
+        assert.equal(store.getMessages("sess-goog")[0].content, JSON.stringify(m), "byte-identical round-trip");
+        store.close();
+    } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
+    }
+});
+
+test("#4069: responses rawResponsesItem input_image urls split (n×m amplification); remote url untouched; round-trip byte-exact", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-media-cas-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        // The item carries BOTH images; the sidecar lifts only the FIRST
+        // (kernel responses.ts) — the second rides the raw item alone, which is
+        // exactly the n×m amplification the issue calls out.
+        const m = {
+            id: "m-resp", role: "user", contentType: "image", text: "[images]", imagePart: true,
+            rawResponsesItem: {
+                type: "message", role: "user",
+                content: [
+                    { type: "input_image", image_url: `data:image/png;base64,${RESP_A}` },
+                    { type: "input_text", text: "and" },
+                    { type: "input_image", image_url: `data:image/jpeg;base64,${RESP_B}` },
+                    { type: "input_image", image_url: "https://img.example/r.png" },
+                ],
+            },
+            imageBase64: RESP_A, imageMediaType: "image/png",
+        };
+        store.ingestSession(planIngest(mkSession("sess-resp", [m])));
+        assert.equal(store.mediaRefCount(RESP_A), 1, "first image: sidecar + item url share one row");
+        assert.equal(store.mediaRefCount(RESP_B), 1, "second image split from the item alone");
+        const bodies = storedBodies(store, "sess-resp");
+        assert.ok(bodies.some((b) => !b.includes(RESP_A) && !b.includes(RESP_B) && b.includes("$media:") && b.includes("https://img.example/r.png")),
+            "both data URLs out, remote URL kept verbatim");
+        assert.equal(store.getMessages("sess-resp")[0].content, JSON.stringify(m), "byte-identical round-trip");
+        store.close();
+    } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
+    }
+});
+
+test("#4069: sub-floor raw-carrier payloads stay fully inline (no refs at all)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "storage-media-cas-"));
+    try {
+        const store = UnifiedStore.open(path.join(dir, "index.db"));
+        const m = {
+            id: "m-small", role: "user", contentType: "image", text: "[image]", imagePart: true,
+            rawAnthropicBlock: { type: "image", source: { type: "base64", media_type: "image/png", data: SMALL_B64 } },
+            imageBase64: SMALL_B64, imageMediaType: "image/png",
+        };
+        store.ingestSession(planIngest(mkSession("sess-small2", [m])));
+        assert.equal(store.mediaRefCount(SMALL_B64), 0, "below floor: nothing split");
+        assert.equal(store.getMessages("sess-small2")[0].content, JSON.stringify(m), "verbatim passthrough");
+        store.close();
+    } finally {
+        try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }
+    }
+});

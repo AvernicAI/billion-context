@@ -250,12 +250,14 @@ CREATE TABLE IF NOT EXISTS kv_store (
 ) WITHOUT ROWID;
 
 -- #3762/#4069 media CAS: one row per (message, media blob) reference. Message
--- content stores media refs in two shapes: {"$media": hash} in the
--- imageBase64 slot, and data:<type>;base64,$media:<hash> embedded in raw
--- OpenAI wire data URLs (the codec carries the SAME payload in both); the
--- bytes live
--- in the content CAS, refcounted by these mapping rows. Swept with the session
--- (and on idempotent re-receipt undo, same discipline as messages.content).
+-- content stores media refs in three shapes: {"$media": hash} in the
+-- imageBase64 slot; data:<type>;base64,$media:<hash> embedded in raw wire
+-- data URLs (openai parts, responses input_image); bare $media:<hash> as a
+-- base64 value (anthropic source.data, google inlineData). The codecs carry
+-- most payloads in BOTH the sidecar and their raw carrier, so both ride the
+-- CAS; the bytes live in the content CAS, refcounted by these mapping rows.
+-- Swept with the session (and on idempotent re-receipt undo, same discipline
+-- as messages.content).
 CREATE TABLE IF NOT EXISTS message_media (
     session_id      TEXT NOT NULL,
     seq             INTEGER NOT NULL,
