@@ -836,7 +836,10 @@ test("HTTP status separates real usage from a manual-compression estimate and ch
         assert(after.body.contextTokensAt >= before.body.contextTokensAt);
         assert.notEqual(after.body.contextGeneration, before.body.contextGeneration);
         assert.equal(after.body.inputTokens, 10000);
-        assert.equal(after.body.contextLimit, 400000);
+        // #3900: contextLimit is metadata.effectiveContextLimit — the window
+        // nudge/preflight judge against — so it carries the per-request
+        // output-headroom reservation (1024 = this fixture's max_tokens).
+        assert.equal(after.body.contextLimit, 400000 - 1024);
     } finally { await h.close(); }
 });
 

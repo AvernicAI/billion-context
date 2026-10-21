@@ -216,7 +216,11 @@ test("the child's first wire turn sizes on the seeded baseline, not 0 (lane proo
         const deadline = Date.now() + 5_000;
         let nudgeLine: string | undefined;
         for (;;) {
-            nudgeLine = readLog().split("\n").filter((l) => l.includes(child.id)).find((l) => l.includes("nudge"));
+            // Pin the diagNudge decision line's exact "[<id>] nudge" prefix —
+            // #3900 added a [headroom] line that also contains the word
+            // "nudge" and logs before the decision, which a bare substring
+            // find would pick up first.
+            nudgeLine = readLog().split("\n").filter((l) => l.includes(child.id)).find((l) => l.includes(`[${child.id}] nudge`));
             if (nudgeLine || Date.now() >= deadline) break;
             await new Promise((resolve) => setTimeout(resolve, 50));
         }

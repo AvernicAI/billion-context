@@ -197,6 +197,12 @@ test("auto-fold off: no growth fold below the window (growthArmed only when enga
     await once(server, "listening");
     const port = (server.address() as AddressInfo).port;
     process.env.E2E_SUM_KEY = "k";
+    // #3900 realign: give the fixture model an authoritative registry window.
+    // Proxy-direct requests miss the route table, so without this the 50K
+    // resolves as a fallback guess and #282's floor re-inflates the
+    // post-reservation window (48976) back to 100K — the pressure band this
+    // control arm asserts would never warm up.
+    setRegistryForTest({ "test-model": { limit: { context: 50_000 } } });
 
     const turn = await postTurn(port, "autofold-off");
     assert.equal(turn.status, 200);
@@ -498,6 +504,10 @@ test("degenerate sub-MIN growth window: classic nudges still fire (no silent sup
     await once(server, "listening");
     const port = (server.address() as AddressInfo).port;
     process.env.E2E_SUM_KEY = "k";
+    // #3900 realign: authoritative registry window (proxy-direct requests miss
+    // the route table); otherwise #282's fallback floor re-inflates the
+    // post-reservation 7168 back to 100K and the flat 7000-token bill sits cold.
+    setRegistryForTest({ "test-model": { limit: { context: 8192 } } });
 
     const warm = await postTurn(port, "deg-win", 2);
     assert.equal(warm.status, 200, "warm-up turn forwards cleanly");
@@ -545,6 +555,10 @@ test("explicit autoFoldTargetTokens clamped to the window: classic nudges still 
     await once(server, "listening");
     const port = (server.address() as AddressInfo).port;
     process.env.E2E_SUM_KEY = "k";
+    // #3900 realign: same authoritative-registry fix as the auto-fold-off
+    // control arm above — without it the reserved 48976 window is floored to
+    // 100K and the 42K bill never reaches the pressure band.
+    setRegistryForTest({ "test-model": { limit: { context: 50_000 } } });
 
     const warm = await postTurn(port, "deg-target", 36);
     assert.equal(warm.status, 200, "warm-up turn forwards cleanly");

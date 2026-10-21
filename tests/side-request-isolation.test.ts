@@ -541,7 +541,10 @@ test("inspectContextOverflow: exceed_context_size_error pattern + (A / B > W) wi
 
 test("sideRequestGuard: raw-body fit against declared ∩ armed window minus output headroom (#554)", () => {
     const txt = "z".repeat(8000);
-    const body = { model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: txt }] };
+    // No output-budget field: the tolerance/armed/CJK cases below exercise the
+    // guard's comparison math on the declared window itself; the reservation
+    // rows (OpenAI below + the #3900 Anthropic pair) cover the headroom gate.
+    const body = { model: MODEL, stream: true, messages: [{ role: "user", content: txt }] };
     const est = estimateRawBodyTokens(body);
     assert.ok(est > 0);
     assert.equal(sideRequestGuard(body, "anthropic", 0, undefined, undefined, 1).blocked, false, "unknown window → forward as before");
@@ -558,6 +561,15 @@ test("sideRequestGuard: raw-body fit against declared ∩ armed window minus out
     assert.equal(g.limit, oaLimit, "limit reduced by max_completion_tokens");
     assert.equal(g.blocked, true, "boundary after reservation (with tolerance) blocks");
     assert.equal(sideRequestGuard(oa, "openai", oaEst + 2_001, undefined, undefined, 1).blocked, false);
+    // #3900: Anthropic reserves like every other wire (the pre-#3900 exemption is gone) —
+    // same boundary shape as the OpenAI case, both directions.
+    const an = { model: MODEL, max_tokens: 2_000, stream: true, messages: [{ role: "user", content: txt }] };
+    const anEst = estimateRawBodyTokens(an);
+    const anLimit = Math.floor(anEst / 1.15);
+    const ga = sideRequestGuard(an, "anthropic", anLimit + 2_000, undefined, undefined, 1);
+    assert.equal(ga.limit, anLimit, "#3900: anthropic limit reduced by max_tokens");
+    assert.equal(ga.blocked, true, "#3900: boundary after reservation (with tolerance) blocks");
+    assert.equal(sideRequestGuard(an, "anthropic", anEst + 2_001, undefined, undefined, 1).blocked, false, "#3900: fits after reservation → forward");
     // Image tokens count toward the estimate.
     const imgBody = { model: MODEL, max_tokens: 100, messages: [{ role: "user", content: [
         { type: "text", text: "z".repeat(4000) },

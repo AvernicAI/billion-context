@@ -32,6 +32,11 @@ import { listSessions } from "../src/session.ts";
 
 const CODEX_UA = "codex_cli_rs/0.53.0 (linux 6.8.0; x86_64) cli";
 
+// #3900: every wire (incl. Anthropic) reserves min(max_tokens, cap × window)
+// from the effective window, so the reported limits below carry that
+// reservation on top of the clamp under test.
+const FIXTURE_MAX_TOKENS = 1024;
+
 function okJson(model: string): string {
     return JSON.stringify({ id: "msg_s", type: "message", role: "assistant", model, content: [{ type: "text", text: "s" }], stop_reason: "end_turn", usage: { input_tokens: 500, output_tokens: 5 } });
 }
@@ -95,7 +100,7 @@ async function post(rig: Rig, session: string, model: string, codex: boolean, cl
     };
     if (codex) headers["user-agent"] = CODEX_UA;
     if (clientWindow !== undefined) headers["x-bili-plugin-context-window"] = String(clientWindow);
-    const r = await fetch(url(rig), { method: "POST", headers, body: JSON.stringify({ model, max_tokens: 1024, stream: false, messages: [{ role: "user", content: "hi" }] }) });
+    const r = await fetch(url(rig), { method: "POST", headers, body: JSON.stringify({ model, max_tokens: FIXTURE_MAX_TOKENS, stream: false, messages: [{ role: "user", content: "hi" }] }) });
     await r.text();
     return r.status;
 }
@@ -117,7 +122,7 @@ test("e2e: codex UA + in-table model → window clamped to codex's perception", 
     const rig = await startRig();
     try {
         assert.equal(await post(rig, "cw-in", "gpt-5.5", true), 200);
-        assert.equal(effectiveLimit("cw-in"), 272_000, "gpt-5.5: bili table 400K clamped to codex 272K");
+        assert.equal(effectiveLimit("cw-in"), 272_000 - FIXTURE_MAX_TOKENS, "gpt-5.5: bili table 400K clamped to codex 272K (#3900 minus output reservation)");
     } finally {
         await closeRig(rig);
     }
@@ -127,7 +132,7 @@ test("e2e: non-codex client → no clamp", async () => {
     const rig = await startRig();
     try {
         assert.equal(await post(rig, "cw-plain", "gpt-5.5", false), 200);
-        assert.equal(effectiveLimit("cw-plain"), 400_000, "control: built-in table 400K untouched");
+        assert.equal(effectiveLimit("cw-plain"), 400_000 - FIXTURE_MAX_TOKENS, "control: built-in table 400K untouched (#3900 minus output reservation)");
     } finally {
         await closeRig(rig);
     }
@@ -137,7 +142,7 @@ test("e2e: codex UA + prefix-matched model → clamped via longest-prefix", asyn
     const rig = await startRig();
     try {
         assert.equal(await post(rig, "cw-prefix", "gpt-5.5-mini", true), 200);
-        assert.equal(effectiveLimit("cw-prefix"), 272_000, "gpt-5.5-mini → gpt-5.5 (272K)");
+        assert.equal(effectiveLimit("cw-prefix"), 272_000 - FIXTURE_MAX_TOKENS, "gpt-5.5-mini → gpt-5.5 (272K, #3900 minus output reservation)");
     } finally {
         await closeRig(rig);
     }
@@ -147,7 +152,7 @@ test("e2e: codex UA + not-in-table model → clamped to the 272K fallback", asyn
     const rig = await startRig();
     try {
         assert.equal(await post(rig, "cw-fallback", "glm-5", true), 200);
-        assert.equal(effectiveLimit("cw-fallback"), 272_000, "glm-5: bili table 1M clamped to codex's unknown-model 272K");
+        assert.equal(effectiveLimit("cw-fallback"), 272_000 - FIXTURE_MAX_TOKENS, "glm-5: bili table 1M clamped to codex's unknown-model 272K (#3900 minus output reservation)");
     } finally {
         await closeRig(rig);
     }
@@ -157,7 +162,7 @@ test("e2e: codex UA + bili window below perception → untouched (min keeps bili
     const rig = await startRig();
     try {
         assert.equal(await post(rig, "cw-below", "claude-sonnet-4-5", true), 200);
-        assert.equal(effectiveLimit("cw-below"), 200_000, "200K < 272K perception → no clamp");
+        assert.equal(effectiveLimit("cw-below"), 200_000 - FIXTURE_MAX_TOKENS, "200K < 272K perception → no clamp (#3900 minus output reservation)");
     } finally {
         await closeRig(rig);
     }
@@ -167,9 +172,9 @@ test("e2e: per-request resolution — UA disappears, window reverts", async () =
     const rig = await startRig();
     try {
         assert.equal(await post(rig, "cw-perreq", "gpt-5.5", true), 200);
-        assert.equal(effectiveLimit("cw-perreq"), 272_000, "with codex UA → clamped");
+        assert.equal(effectiveLimit("cw-perreq"), 272_000 - FIXTURE_MAX_TOKENS, "with codex UA → clamped (#3900 minus output reservation)");
         assert.equal(await post(rig, "cw-perreq", "gpt-5.5", false), 200);
-        assert.equal(effectiveLimit("cw-perreq"), 400_000, "same session, UA gone → 400K again");
+        assert.equal(effectiveLimit("cw-perreq"), 400_000 - FIXTURE_MAX_TOKENS, "same session, UA gone → 400K again (#3900 minus output reservation)");
     } finally {
         await closeRig(rig);
     }
@@ -181,10 +186,10 @@ test("e2e: live Codex model and capped config override replace the stale 272K fa
     const rig = await startRig();
     try {
         assert.equal(await post(rig, "cw-live", "gpt-6.1-sol", true), 200);
-        assert.equal(effectiveLimit("cw-live"), 828_400);
+        assert.equal(effectiveLimit("cw-live"), 828_400 - FIXTURE_MAX_TOKENS, "#3900 minus output reservation");
         fs.writeFileSync(path.join(codexHome, "config.toml"), "model_context_window = 100000\n");
         assert.equal(await post(rig, "cw-live", "gpt-6.1-sol", true), 200);
-        assert.equal(effectiveLimit("cw-live"), 95_000, "配置降低后，下一次请求必须立即跟随");
+        assert.equal(effectiveLimit("cw-live"), 95_000 - FIXTURE_MAX_TOKENS, "配置降低后，下一次请求必须立即跟随 (#3900 minus output reservation)");
     } finally {
         await closeRig(rig);
         fs.rmSync(path.join(codexHome, "models_cache.json"), { force: true });
@@ -196,9 +201,9 @@ test("e2e: request-declared Codex window outranks the bundled table in both dire
     const rig = await startRig();
     try {
         assert.equal(await post(rig, "cw-declared", "gpt-5.5", true, 800_000), 200);
-        assert.equal(effectiveLimit("cw-declared"), 800_000);
+        assert.equal(effectiveLimit("cw-declared"), 800_000 - FIXTURE_MAX_TOKENS, "#3900 minus output reservation");
         assert.equal(await post(rig, "cw-declared", "gpt-5.5", true, 100_000), 200);
-        assert.equal(effectiveLimit("cw-declared"), 100_000);
+        assert.equal(effectiveLimit("cw-declared"), 100_000 - FIXTURE_MAX_TOKENS, "#3900 minus output reservation");
     } finally {
         await closeRig(rig);
     }
