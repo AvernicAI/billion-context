@@ -19,6 +19,10 @@ test("issue4178: space-joined refs run costs linear time, not exponential (#4178
         ["40 space-joined refs + failing close tail", mk(40, " ") + " </ap"],
         ["40 comma+space refs", mk(40, ", ")],
         ["200 space-joined refs", mk(200, " ")],
+        ["200 space-joined refs + failing close tail", mk(200, " ") + " </ap"],
+        // dangling joiner + partial ref: exercises the PENDING_REF_SPAN /
+        // PARTIAL_TAIL tail arms (aligned to the same unambiguous form)
+        ["40 space-joined refs + dangling joiner + partial ref", mk(40, " ") + " - m0"],
     ] as const) {
         const t0 = Date.now();
         const filter = createTagEchoFilter();

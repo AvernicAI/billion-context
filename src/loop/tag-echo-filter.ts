@@ -122,8 +122,9 @@ const REFS_ONLY = new RegExp("^\\s*" + REFS_RUN + "\\s*$");
 // Superset: the run may also END on an incomplete ref prefix (m / m0 / m00…)
 // or a dangling joiner — refs-shaped so far, verdict pending the next delta.
 // The swallow cap defers its release-vs-drop decision while this holds, or
-// the verdict flips with the chunk boundary (chunk-split determinism).
-const PENDING_REF_SPAN = new RegExp("^\\s*" + REFS_RUN + "(?:\\s*[\\u2013\\u2014,\\-]?\\s*(?:m\\d{0,3})?)?\\s*$");
+// the verdict flips with the chunk boundary (chunk-split determinism). The
+// tail separator keeps the unambiguous one-parse-per-span form (#4178).
+const PENDING_REF_SPAN = new RegExp("^\\s*" + REFS_RUN + "(?:\\s*(?:[\\u2013\\u2014,\\-]\\s*)?(?:m\\d{0,3})?)?\\s*$");
 // Body of a paired render tag: refs-only or empty (#1720/#2023). Anything
 // else is prose wearing tags — PAIRED must not match it.
 const PAIRED_BODY = "\\s*(?:" + REFS_RUN + ")?\\s*";
@@ -190,7 +191,7 @@ const SELF_CLOSE = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?\\/>");
 // ref): a dead unit NEVER consumes the whitespace around it (it is content),
 // in either mode, so chunk-split parity needs no cross-push whitespace
 // memory.
-const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c" + NAME + "\\s*=\\s*[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*(?:\/)?|(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c[^<>]*|(?<![\\w>])\\s*" + REFS_RUN + "(?:\\s*[\\u2013\\u2014,\\-]?\\s*(?:m\\d{0,3})?)?\\s*|(?<![\\w>])\\s*m\\d{0,3})$");
+const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c" + NAME + "\\s*=\\s*[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*(?:\/)?|(?<![\\w>])\\s*" + REFS_RUN + "\\s*\x3c[^<>]*|(?<![\\w>])\\s*" + REFS_RUN + "(?:\\s*(?:[\\u2013\\u2014,\\-]\\s*)?(?:m\\d{0,3})?)?\\s*|(?<![\\w>])\\s*m\\d{0,3})$");
 // An unterminated render-tag opening at the end of a string: \x3c<name> plus
 // attrs, no \x3e — a truncated imitation, never prose (triggers use \x3cacp_).
 // The mangled \x3c<name>=… form counts too: once the `=` is there the tail is
