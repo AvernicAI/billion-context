@@ -341,7 +341,7 @@ test("#4069: delta planner verifies an image boundary through the split hash", (
         store.ingestSession(planIngest(mkSession("sess-delta", [mImg])));
 
         const storedHash = (store as unknown as { db: DbShape }).db
-            .prepare("SELECT content_hash FROM messages WHERE msg_id = ?").get("m-img")!.content_hash;
+            .prepare("SELECT content_hash FROM messages WHERE msg_id = ?").all("m-img")[0]!.content_hash;
         const session2 = mkSession("sess-delta", [mImg, mTxt]);
         // Positive: the stored boundary hash covers the SPLIT serialization;
         // the probe re-splits identically and accepts the delta.
