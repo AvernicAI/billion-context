@@ -1823,22 +1823,32 @@ export const WEB_CLIENT = `(function () {
         });
         return { children: children, roots: roots };
     }
-    // #3917: at-a-glance view of the same folds. Layered top-down (roots on top,
-    // each fold one level below the block that absorbed it), edges drawn as
-    // beziers — a knowledge-graph-ish shape for reading structure, while the
-    // list view stays the place to read concrete messages. A wide tree is scaled
-    // to fit the card rather than hiding nodes behind a horizontal scroll.
+    // #3917: at-a-glance view of the same folds. Layered (roots first, each fold
+    // one level past the block that absorbed it), edges drawn as beziers — a
+    // knowledge-graph-ish shape for reading structure, while the list view stays
+    // the place to read concrete messages. A wide tree is scaled to fit the card
+    // rather than hiding nodes behind a horizontal scroll; when that scale would
+    // drop below GRAPH_MIN_FIT the labels go unreadable (#4173: 180-block session,
+    // 161 leaves → fit 0.052, boxes rendered as ~6px dots), so the graph flips
+    // portrait instead: depth runs along x, siblings stack along y, boxes keep
+    // their natural size and the card scrolls.
     const GRAPH_NODE_W = 118;
     const GRAPH_NODE_H = 36;
     const GRAPH_GAP_X = 16;
+    const GRAPH_GAP_Y = 12;
     const GRAPH_LEVEL_H = 84;
     const GRAPH_FIT_W = 1120;
-    function blockGraphLayout(blocks) {
+    const GRAPH_MIN_FIT = 0.5;
+    function blockGraphLayout(blocks, vertical) {
         const shape = blockTreeShape(blocks);
         const nodes = [];
         const links = [];
         let cursor = 0;
         let maxDepth = 0;
+        // horizontal: siblings along x (NODE_W+GAP_X), depth along y (LEVEL_H);
+        // portrait: siblings along y (NODE_H+GAP_Y), depth along x (NODE_W+GAP_X).
+        const siblingStep = vertical ? GRAPH_NODE_H + GRAPH_GAP_Y : GRAPH_NODE_W + GRAPH_GAP_X;
+        const depthStep = vertical ? GRAPH_NODE_W + GRAPH_GAP_X : GRAPH_LEVEL_H;
         const place = function (b, depth) {
             if (depth > 40) return null;
             const kids = shape.children[b.blockId] || [];
@@ -1847,14 +1857,15 @@ export const WEB_CLIENT = `(function () {
                 const kid = place(k, depth + 1);
                 if (kid) childNodes.push(kid);
             });
-            let x;
+            let s;
             if (!childNodes.length) {
-                x = cursor;
-                cursor += GRAPH_NODE_W + GRAPH_GAP_X;
+                s = cursor;
+                cursor += siblingStep;
             } else {
-                x = (childNodes[0].x + childNodes[childNodes.length - 1].x) / 2;
+                s = (childNodes[0].s + childNodes[childNodes.length - 1].s) / 2;
             }
-            const node = { b: b, x: x, y: depth * GRAPH_LEVEL_H };
+            const dpos = depth * depthStep;
+            const node = vertical ? { b: b, x: dpos, y: s, s: s } : { b: b, x: s, y: dpos, s: s };
             nodes.push(node);
             if (depth > maxDepth) maxDepth = depth;
             childNodes.forEach(function (c) { links.push([node, c]); });
@@ -1862,26 +1873,48 @@ export const WEB_CLIENT = `(function () {
         };
         const roots = shape.roots.length ? shape.roots : blocks;
         roots.forEach(function (r) { place(r, 0); });
-        if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0 };
-        return { nodes: nodes, links: links, width: cursor - GRAPH_GAP_X, height: maxDepth * GRAPH_LEVEL_H + GRAPH_NODE_H };
+        if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0, vertical: Boolean(vertical) };
+        const extentS = cursor - siblingStep;
+        const extentD = maxDepth * depthStep;
+        return vertical
+            ? { nodes: nodes, links: links, width: extentD + GRAPH_NODE_W, height: extentS + GRAPH_NODE_H, vertical: true }
+            : { nodes: nodes, links: links, width: extentS + GRAPH_NODE_W, height: extentD + GRAPH_NODE_H, vertical: false };
     }
     function buildGraphSvg(blocks) {
-        const layout = blockGraphLayout(blocks);
+        let layout = blockGraphLayout(blocks, false);
         if (!layout.nodes.length) return "";
         const pad = 14;
-        const half = GRAPH_NODE_W / 2;
-        const W = Math.ceil(layout.width + pad * 2);
-        const H = Math.ceil(layout.height + pad * 2);
-        const fit = W > GRAPH_FIT_W ? GRAPH_FIT_W / W : 1;
+        let W = Math.ceil(layout.width + pad * 2);
+        let H = Math.ceil(layout.height + pad * 2);
+        let fit = W > GRAPH_FIT_W ? GRAPH_FIT_W / W : 1;
+        if (fit < GRAPH_MIN_FIT) {
+            layout = blockGraphLayout(blocks, true);
+            W = Math.ceil(layout.width + pad * 2);
+            H = Math.ceil(layout.height + pad * 2);
+            fit = 1;
+        }
         const parts = [];
-        parts.push('<svg class="g-svg" viewBox="0 0 ' + W + " " + H + '" width="' + Math.round(W * fit) + '" height="' + Math.round(H * fit) + '" preserveAspectRatio="xMidYMid meet" role="img">');
+        parts.push('<svg class="g-svg' + (layout.vertical ? " g-svg-natural" : "") + '" viewBox="0 0 ' + W + " " + H + '" width="' + Math.round(W * fit) + '" height="' + Math.round(H * fit) + '" preserveAspectRatio="xMidYMid meet" role="img">');
         layout.links.forEach(function (l) {
-            const x1 = l[0].x + pad + half;
-            const y1 = l[0].y + pad + GRAPH_NODE_H;
-            const x2 = l[1].x + pad + half;
-            const y2 = l[1].y + pad;
-            const my = (y1 + y2) / 2;
-            parts.push('<path class="g-edge" d="M' + x1 + " " + y1 + " C" + x1 + " " + my + " " + x2 + " " + my + " " + x2 + " " + y2 + '" fill="none"/>');
+            const p = l[0];
+            const c = l[1];
+            let d;
+            if (layout.vertical) {
+                const x1 = p.x + pad + GRAPH_NODE_W;
+                const y1 = p.y + pad + GRAPH_NODE_H / 2;
+                const x2 = c.x + pad;
+                const y2 = c.y + pad + GRAPH_NODE_H / 2;
+                const mx = (x1 + x2) / 2;
+                d = "M" + x1 + " " + y1 + " C" + mx + " " + y1 + " " + mx + " " + y2 + " " + x2 + " " + y2;
+            } else {
+                const x1 = p.x + pad + GRAPH_NODE_W / 2;
+                const y1 = p.y + pad + GRAPH_NODE_H;
+                const x2 = c.x + pad + GRAPH_NODE_W / 2;
+                const y2 = c.y + pad;
+                const my = (y1 + y2) / 2;
+                d = "M" + x1 + " " + y1 + " C" + x1 + " " + my + " " + x2 + " " + my + " " + x2 + " " + y2;
+            }
+            parts.push('<path class="g-edge" d="' + d + '" fill="none"/>');
         });
         layout.nodes.forEach(function (n) {
             const b = n.b;
@@ -1899,6 +1932,8 @@ export const WEB_CLIENT = `(function () {
         parts.push("</svg>");
         return parts.join("");
     }
+    window.bili_blockGraphLayout = blockGraphLayout;
+    window.bili_buildGraphSvg = buildGraphSvg;
     function refRangeOf(b) {
         if (!b.startRef) return "";
         return b.endRef && b.endRef !== b.startRef ? b.startRef + "–" + b.endRef : String(b.startRef);

@@ -11,6 +11,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetDiskCacheForTest, buildBlockContent, buildMessageContent, buildSessionDetail } from "../src/web/sessions-data.ts";
 import { MESSAGES } from "../src/web/i18n.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
+import { runWebClient } from "./web-trajectory-harness.ts";
 
 process.env.BILI_PERSIST_ZSTD = "0";
 process.env.BILI_STORAGE_UNIFIED = "legacy";
@@ -207,9 +208,90 @@ test("#3917: the web client bundle stays parseable JS after the tree additions",
     assert.match(WEB_CLIENT, /\/block-content\?blockId=/);
     // the graph reading of the same folds: layered boxes + list⇄graph switch
     assert.match(WEB_CLIENT, /function buildGraphSvg\(blocks\)/);
-    assert.match(WEB_CLIENT, /function blockGraphLayout\(blocks\)/);
+    assert.match(WEB_CLIENT, /function blockGraphLayout\(blocks,\s*vertical\)/);
     assert.match(WEB_CLIENT, /"g-node tier-" \+/);
     assert.match(WEB_CLIENT, /data-mode="graph"/);
     assert.match(WEB_CLIENT, /id="tree-graph"/);
     assert.match(WEB_CLIENT, /\.block-node\[data-bid=/);
+});
+
+// #4173: fit-to-card shrinks a wide tree until boxes become sub-pixel dots
+// (the reported session: 161 leaves → 21558px wide, fit 0.052). When the scale
+// would drop below 0.5 the graph flips portrait at natural box size instead.
+interface GraphLayout {
+    nodes: Array<{ b: Record<string, unknown>; x: number; y: number; s: number }>;
+    links: Array<[unknown, unknown]>;
+    width: number;
+    height: number;
+    vertical: boolean;
+}
+
+function cb(id: string, parent?: string, tier = 1): Record<string, unknown> {
+    return { blockId: id, parentBlockId: parent, tier, active: true, compressedTokens: 1000, summaryTokens: 100 };
+}
+
+function loadGraphSeams(): { layout: (blocks: unknown[], vertical?: boolean) => GraphLayout; svgOf: (blocks: unknown[]) => string } {
+    const { window: win } = runWebClient({ hash: "#/sessions", fetchImpl: () => new Promise(() => {}) });
+    const layout = win.bili_blockGraphLayout as (blocks: unknown[], vertical?: boolean) => GraphLayout;
+    const svgOf = win.bili_buildGraphSvg as (blocks: unknown[]) => string;
+    assert.equal(typeof layout, "function", "layout seam exposed on window");
+    assert.equal(typeof svgOf, "function", "svg seam exposed on window");
+    return { layout, svgOf };
+}
+
+test("#4173: a wide tree flips portrait at natural size instead of shrinking to sub-pixel", () => {
+    const { layout, svgOf } = loadGraphSeams();
+    const blocks: Array<Record<string, unknown>> = [cb("R", undefined, 2)];
+    for (let i = 0; i < 30; i++) blocks.push(cb("C" + i, "R"));
+    for (let i = 0; i < 30; i++) for (let j = 0; j < 5; j++) blocks.push(cb("L" + i + "_" + j, "C" + i));
+
+    // horizontal geometry reproduces the reported mechanism: 150 leaves × 134px
+    // − 16 gap = 20084px wide, depth 2 → 204px tall
+    const flat = layout(blocks, false);
+    assert.equal(flat.width, 20084);
+    assert.equal(flat.height, 204);
+    assert.equal(flat.nodes.length, 181);
+    assert.equal(flat.links.length, 180);
+
+    // 20112px would need fit 0.056 (< 0.5) → portrait: depth along x, siblings along y
+    const svg = svgOf(blocks);
+    assert.match(svg, /class="g-svg g-svg-natural"/);
+    assert.match(svg, /viewBox="0 0 414 7216"/);
+    assert.match(svg, /width="414"/);
+    assert.match(svg, /height="7216"/);
+    assert.equal((svg.match(/class="g-edge"/g) || []).length, 180, "every fold still linked");
+    assert.equal((svg.match(/g class="g-node/g) || []).length, 181, "every block still drawn");
+    // root → first-child edge: root at (0, 3576), child C0 at (134, 96), pad 14
+    assert.ok(svg.includes('d="M132 3608 C140 3608 140 128 148 128"'), "portrait edge runs between level columns");
+});
+
+test("#4173: narrow and medium trees keep their original fit-to-card rendering", () => {
+    const { svgOf } = loadGraphSeams();
+
+    const five = [cb("a"), cb("b"), cb("c"), cb("d"), cb("e")];
+    const svg5 = svgOf(five);
+    assert.ok(!svg5.includes("g-svg-natural"), "5 leaves need no scaling at all");
+    assert.match(svg5, /viewBox="0 0 682 64"/);
+    assert.match(svg5, /width="682"/);
+
+    const ten = [...Array(10)].map((_, i) => cb("m" + i));
+    const svg10 = svgOf(ten);
+    assert.ok(!svg10.includes("g-svg-natural"), "10 leaves still fit-to-card (fit 0.83 ≥ 0.5)");
+    assert.match(svg10, /viewBox="0 0 1352 64"/);
+    assert.match(svg10, /width="1120"/);
+    assert.match(svg10, /height="53"/);
+});
+
+test("#4173: the orientation flip sits exactly at the 0.5 readability floor", () => {
+    const { svgOf } = loadGraphSeams();
+
+    const sixteen = [...Array(16)].map((_, i) => cb("k" + i));
+    const svg16 = svgOf(sixteen);
+    assert.ok(!svg16.includes("g-svg-natural"), "16 leaves: fit 0.52 still readable, stays landscape");
+    assert.match(svg16, /width="1120"/);
+
+    const seventeen = [...Array(17)].map((_, i) => cb("k" + i));
+    const svg17 = svgOf(seventeen);
+    assert.match(svg17, /class="g-svg g-svg-natural"/, "17 leaves: fit 0.49 crosses the floor");
+    assert.match(svg17, /viewBox="0 0 146 832"/);
 });

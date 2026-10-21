@@ -266,6 +266,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .tree-mode.active { color: var(--accent); border-color: var(--accent); background: var(--bg-muted); }
 .tree-graph { max-height: 70vh; overflow: auto; border-top: 1px solid var(--border-soft); padding: 12px 8px 8px; background: var(--bg-muted); border-radius: 0 0 10px 10px; }
 .g-svg { display: block; max-width: 100%; height: auto; }
+/* #4173: portrait graphs keep natural box size and scroll inside .tree-graph */
+.g-svg-natural { max-width: none; }
 .g-edge { stroke: var(--accent); stroke-width: 1.6; opacity: .5; }
 .g-node { cursor: pointer; }
 .g-node rect { fill: #fff; stroke: var(--border-soft); stroke-width: 1.4; }
