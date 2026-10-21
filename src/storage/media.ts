@@ -74,7 +74,9 @@ export function isMediaRef(v: unknown): v is { $media: string } {
  *  Returned objects are references INTO the parsed message: mutating their
  *  image_url.url lands on the message itself. Developer-role messages reuse
  *  rawOpenaiContent for the whole original message object — filtered out by
- *  the type check below. */
+ *  the type check below. SCOPE: OpenAI lane only — rawAnthropicBlock /
+ *  rawGoogleParts / rawResponsesItem sidecars keep inline media until #4069
+ *  extends the split to those lanes. */
 export function collectRawOpenaiImageParts(msg: Record<string, unknown>): RawOpenaiImagePart[] {
     const out: RawOpenaiImagePart[] = [];
     const push = (c: unknown): void => {
