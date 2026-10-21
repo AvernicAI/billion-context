@@ -102,7 +102,7 @@ function namespacedToolScript(): string[] {
 
 function compressRound1Script(): string[] {
     // Summary must clear the kernel's 50-char minimum ("Summary too short").
-    const compressArgs = JSON.stringify({ startId: "m00001", endId: "m00002", topic: "e2e", summary: "anthropic e2e compress round trip: fixture history folded into one block" });
+    const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", topic: "e2e", summary: "anthropic e2e compress round trip: fixture history folded into one block" }] });
     return [
         anthropicSse("message_start", {
             type: "message_start",
@@ -225,11 +225,11 @@ interface AnthropicUserMessage {
     content: string | Array<Record<string, unknown>>;
 }
 
-async function callAnthropic(h: Harness, messages: AnthropicUserMessage[], tools?: unknown[]): Promise<{ raw: string; events: SseEvent[]; arrivals: number[] }> {
+async function callAnthropic(h: Harness, messages: AnthropicUserMessage[], tools?: unknown[], sessionId = "e2e-anthropic"): Promise<{ raw: string; events: SseEvent[]; arrivals: number[] }> {
     const started = Date.now();
     const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-acp-session": "e2e-anthropic" },
+        headers: { "content-type": "application/json", "x-acp-session": sessionId },
         body: JSON.stringify({
             model: "claude-test",
             max_tokens: 1024,
@@ -309,9 +309,27 @@ test("e2e anthropic: tool_use reconstruction preserves id, name and full argumen
 test("e2e anthropic: compress tool_use round-trip — 2nd upstream request carries tool_result, round-2 text reaches client", async () => {
     const h = await startHarness([compressRound1Script(), compressRound2Script()]);
     try {
+        // History shaped so the mock's m00001–m00002 fold genuinely SUCCEEDS:
+        // the two leading fillers clear the 5000-char minCompressRange and the
+        // eight trailing fillers push them past the soft-protected recent zone
+        // (preserveRecentTokens walks back 5000 tokens from the tail). A failed
+        // compress ends the turn under #156/#4186 and would un-test this path.
         const { events } = await callAnthropic(h, [
+            { role: "user", content: FILLER },
+            { role: "assistant", content: FILLER },
+            { role: "user", content: FILLER },
+            { role: "assistant", content: FILLER },
+            { role: "user", content: FILLER },
+            { role: "assistant", content: FILLER },
+            { role: "user", content: FILLER },
+            { role: "assistant", content: FILLER },
+            { role: "user", content: FILLER },
+            { role: "assistant", content: FILLER },
             { role: "user", content: "please compress the conversation now" },
-        ]);
+        ], undefined, "e2e-anthropic-compress");
+        // ^ own session id: refs are per-session content hashes, so the mock's
+        // m00001/m00002 only resolve when this is the FIRST turn of the session —
+        // the shared default id would carry earlier tests' refs into this one.
 
         assert.ok(h.captured.length >= 2, `expected >= 2 upstream requests, got ${h.captured.length}`);
 
