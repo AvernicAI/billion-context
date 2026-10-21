@@ -133,7 +133,7 @@ test("P1 chunk-split equivalence: streaming === whole-text", { skip: false }, ()
   for (let iter = 0; iter < 120; iter++) {
     const base = rnd() < 0.1 ? emissionField() : randomText();
     const text = rnd() < 0.2 ? `${pick(PROSE)}${base}${pick(PROSE)}` : base;
-    if (containsRenderTagText(text) || containsEchoResidue(text)) continue; // #4107 family: split-dependence on tag-bearing texts (2 shapes pinned)
+    if (containsRenderTagText(text) || containsEchoResidue(text)) continue; // #4107 family: split-dependence on tag-bearing texts (shape 1 still pinned; shape 2 closed by #4170)
     for (const [name, mk] of FACTORIES) {
       const whole = runStream(mk(), [text]);
       for (const k of splitPoints(text)) {
@@ -338,9 +338,12 @@ test("C#4107 pinned: chunk split leaks dead-ref residue today", () => {
   assert.ok(split.includes("m1255"), "residue no longer leaks? — #4107 may be fixed; flip this pin");
 });
 // #4107 shape 2 (same family, different mechanism): a CLOSE fragment at
-// the chunk boundary — whole-text strips the bare </apc fragment, the
-// split path RELEASES it to the client.
-test("C#4107-2 pinned: close fragment at chunk boundary leaks today", () => {
+// the chunk boundary followed by a nested bare open behind it. CLOSED by
+// #4170: the split path now re-adjudicates the late-arriving open instead
+// of releasing the interior verbatim, so streaming === whole-text. Flipped
+// per the original pin's instruction; kept as a permanent parity pin.
+// (Shape 1, C#4107 dead-ref residue, is still broken and stays pinned.)
+test("C#4107-2 closed by #4170: close fragment + nested bare open no longer leaks", () => {
   const t = 'unicode \u2713 caf\u00e9 \u65e5\u672c <apc>unicode \u2713 caf\u00e9 \u65e5\u672c</apc <apc>quotes " and \' mixed</apc>';
   const run = (chunks: string[]): string => {
     const f = createTagEchoFilter();
@@ -348,6 +351,6 @@ test("C#4107-2 pinned: close fragment at chunk boundary leaks today", () => {
   };
   const whole = run([t]);
   const split = run([t.slice(0, 49), t.slice(49)]);
-  assert.notEqual(whole, split, "#4107 fixed? — flip this pin and re-enable the full P1 domain");
-  assert.ok(split.includes("</apc "), "close fragment no longer leaks? — flip this pin");
+  assert.equal(whole, split, "#4107-2 regressed? — streaming diverged from whole-text again");
+  assert.ok(!split.includes("<apc>"), "nested bare open leaked into body text again");
 });
