@@ -6,10 +6,9 @@
 // plain non-fork traffic stays completely silent.
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
+import fs, { mkdtempSync, rmSync } from "node:fs";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { forkChildVerdict, _maybeForkAdoptBeforeSendForTest, _resetForkGateDiagnosticsForTest, _resetRegisterForTest, type ForkChildVerdict, type PluginContext } from "../src/agent/dsh-native.ts";
