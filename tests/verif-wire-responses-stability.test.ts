@@ -102,27 +102,24 @@ describe("verif: wire responses stability (responsesToCore/coreToResponses/patch
         assert.equal(coreIdsOf(1).length, 2, "multi-part item must split into 2 cores (#3642)");
     });
 
-    it("P1 pinned #4150: text-before-multipart rebuild DROPS the image today", () => {
+    it("P1 #4150 FIXED: text-before-multipart rebuild is verbatim (image survives)", () => {
         const out = coreToResponses(proj.msgs);
-        const flat = JSON.stringify(out);
-        // #4150: adjacent string-content user item ahead of a multi-part item
-        // makes flushUserRun pick the STRING carrier → imageParts=[] → image
-        // silently dropped, and the two items merge. Flip this pin when fixed.
-        assert.ok(!flat.includes("input_image"), "#4150 fixed? — image survives now; flip this pin and restore P1 to deepEqual(STAMPED)");
-        assert.notDeepEqual(out, STAMPED, "#4150 fixed? — rebuild became verbatim; flip this pin");
+        // #4150 fixed: flushUserRun groups the run PER SOURCE ITEM instead of
+        // taking the first sidecar core as THE carrier, so a string-content
+        // item ahead of a multi-part item no longer starves the image cores —
+        // every item round-trips byte-exact, image included.
+        assert.deepEqual(out, STAMPED, "#4150 regressed? — rebuild must be verbatim");
+        assert.ok(JSON.stringify(out).includes("input_image"), "image lost in the #4150 shape");
     });
 
-    it("P1b round-trip WITHOUT the #4150 shape (assistant content stringified — see #4150 comment 2)", () => {
+    it("P1b round-trip WITHOUT the #4150 shape (all items verbatim)", () => {
         const input = INPUT.slice(1); // drop the leading plain-text user item
         const p = responsesToCore({ model: "gpt-5", input });
         const out = coreToResponses(p.msgs);
-        // Documented current form: user multi-part item verbatim (incl. image),
-        // function pair verbatim, assistant array-content STRINGIFIED (no
-        // verbatim fast path on the assistant lane — cross-lane inconsistency
-        // with patchResponsesInput, recorded in #4150), trailing user verbatim.
-        const expect = JSON.parse(JSON.stringify(input));
-        (expect[3] as { content: unknown }).content = "It is 18C and rainy.";
-        assert.deepEqual(out, expect);
+        // #4150 fixed: the assistant array-content item round-trips byte-exact
+        // too (same raw-sidecar fast path as the user lane) — the cross-lane
+        // inconsistency with patchResponsesInput's slot.original is resolved.
+        assert.deepEqual(out, JSON.parse(JSON.stringify(input)));
         assert.ok(JSON.stringify(out).includes("input_image"), "image lost without the #4150 shape?");
     });
 
