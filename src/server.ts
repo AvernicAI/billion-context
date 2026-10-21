@@ -57,6 +57,7 @@ export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, sh
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "./fold-reconcile.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
 import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, RESPONSES_TURN_SEPARATOR_ID_PREFIX } from "./session.js";
+import { localRefusalCovers, noteLocalRefusal } from "./local-refusal.js";
 import { detectStaleInstall } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
@@ -85,7 +86,7 @@ import { auditStartupSummaryCredentials } from "./external-summary-credentials.j
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
-import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
+import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, estimateRawBodyTokens, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type PreflightResult } from "./preflight.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
@@ -2689,13 +2690,7 @@ export function isPreflightFailFast(outcome: Prepared | PreflightFailFast): outc
 // 30s protects every client whose header deadline exceeds 30s (undici's 300s
 // default included); shorter preflights keep full status-code fidelity.
 const PREFLIGHT_KEEPALIVE_MS = 15_000;
-// #2490/#3146: mathematically-doomed forward guard, priced in UTF-8 BYTES of the
-// core text against two bars — window×7.5 (densest live-route billing observed,
-// ~6.8 B/token, #2122) AND an absolute 2MB floor. Module-scoped so both the
-// estimate-only probe (#2313) and the fresh-session forward-once (#3146) share
-// the exact same doom math.
-const DOOMED_PROBE_BYTES_PER_TOKEN = 7.5;
-const DOOMED_PROBE_ABSOLUTE_BYTES = 2_000_000;
+
 
 function preflightHoldGraceMs(): number {
     return knobPreflightHoldGraceMs();
@@ -2720,51 +2715,6 @@ function preflightDeadEndCooldownMs(): number {
 // — NEVER as usage (that field is upstream billing evidence only) — scoped to
 // the route/model/window that saw them; an equal-or-wider refused window
 // covers the current equal-or-tighter one, anything else evaluates fresh.
-interface LocalRefusalRecord {
-    origin: string;
-    model: string;
-    window: number;
-    at: number;
-}
-
-const LOCAL_REFUSAL_MAX_RECORDS = 16;
-
-function readLocalRefusals(metadata: Record<string, unknown>): LocalRefusalRecord[] {
-    const raw = metadata.localRefusals;
-    if (!Array.isArray(raw)) return [];
-    return raw.filter((r): r is LocalRefusalRecord =>
-        !!r && typeof r === "object"
-        && typeof (r as LocalRefusalRecord).origin === "string"
-        && typeof (r as LocalRefusalRecord).model === "string"
-        && typeof (r as LocalRefusalRecord).window === "number",
-    );
-}
-
-/** Record a local 413 refusal for (origin, model, window). A wider refusal in
- *  the same scope already dominates (it covers every tighter window); a
- *  narrower one replaces it so the record tracks the widest verdict seen. */
-function noteLocalRefusal(session: Session, origin: string | undefined, model: string | undefined, window: number): void {
-    if (!origin || !model || !Number.isFinite(window) || window <= 0) return;
-    const records = readLocalRefusals(session.metadata);
-    const existing = records.find((r) => r.origin === origin && r.model === model);
-    if (existing !== undefined && existing.window >= window) return;
-    session.metadata.localRefusals = [
-        ...records.filter((r) => !(r.origin === origin && r.model === model)),
-        { origin, model, window: Math.floor(window), at: Date.now() },
-    ].slice(-LOCAL_REFUSAL_MAX_RECORDS);
-    markDirty(session);
-}
-
-/** True when this session was locally refused (413) by the SAME origin+model
- *  at an equal or WIDER window — the current request may then not reopen any
- *  forward-once escape hatch (#3846). Both sides must be known
- *  (evidence-permitlist discipline: an unprovenanced refusal proves nothing
- *  about an unprovenanced request, and vice versa). */
-function localRefusalCovers(metadata: Record<string, unknown>, origin: string | undefined, model: string | undefined, window: number): boolean {
-    if (!origin || !model) return false;
-    return readLocalRefusals(metadata).some((r) => r.origin === origin && r.model === model && r.window >= window);
-}
-
 /** #568: commit the response early so a long preflight cannot lose the client
  *  to its header timeout. Streaming clients get an SSE stream with keep-alive
  *  comment lines (`: bili-preflight` — a spec-mandated no-op for every SSE

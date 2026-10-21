@@ -31,13 +31,14 @@ import { log as loggerLog } from "../logger.js";
 import { dumpReqAllowed as knobDumpReqAllowed, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
+import { noteLocalRefusal } from "../local-refusal.js";
 import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskUrlForLog } from "../log-mask.js";
 import { pickAdapter, runCompressLoop } from "../loop/index.js";
 import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/tag-echo-filter.js";
 import { dumpsDir } from "../paths.js";
 import { noteKnownAttachmentIds } from "../phantom-attachment.js";
 import { pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, type UpstreamMeta } from "../plugin.js";
-import { estimateCoreMessages } from "../preflight.js";
+import { DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, estimateCoreMessages, estimateCoreMessagesUpperBytes } from "../preflight.js";
 import { reasoningGuardEngages, runReasoningGuard } from "../reasoning-guard.js";
 import { wrapStreamWithRunawayGuard } from "../runaway-guard.js";
 import { diagnoseSuccessWithoutUsage, markDirty, markNativeCompactionBoundary, withSessionLock, type Session } from "../session.js";
@@ -564,6 +565,43 @@ export async function forward(
         // and are forwarded byte-faithfully, untouched.
         if (typeof wireBody === "string") wireBody = scrubLoneSurrogatesOnWire(wireBody);
         applyResign(headers, wireBody);
+    }
+    // #4079 PR① (send-side final window gate, hub fix-plan step 1): preflight
+    // judges on the calibrated ESTIMATE scale — a systematically underestimated
+    // payload (dense content, wire-switch bloat #3872) or one that never
+    // triggered preflight (quiet baseline, sudden client-side growth) can pass
+    // every local check and still arrive over-window at upstream (400/413).
+    // Price the FINAL outbound core text in UTF-8 bytes with the SAME two-bar
+    // doom math as preflight's escape branches (#2490/#3146): bytes/7.5 is a
+    // LOWER bound on token count, so exceeding the window at the lower bound
+    // means no tokenizer can fit it — refuse locally with an honest 413 instead
+    // of burning a guaranteed-reject multi-MB upstream round-trip. Initial send
+    // only: #1195 refold resends re-run preflight (incl. its own doomed check)
+    // against the upstream-STATED window further down. Passthrough carries no
+    // declared window; side requests are owned by #1110; Buffer bodies are raw
+    // passthrough bytes. Deliberately does NOT arm the dead-end cooldown marker:
+    // this verdict is deterministic byte math with zero upstream cost, so
+    // re-evaluating it on retry is free and a cooldown would only add lockout
+    // latency (#4079 Q3).
+    if (prepared && !prepared.sidePassthrough && prepared.protocol && req.method !== "GET" && req.method !== "HEAD" && typeof wireBody === "string") {
+        const windowLimit = typeof prepared.session.metadata?.effectiveContextLimit === "number" ? prepared.session.metadata.effectiveContextLimit : 0;
+        if (windowLimit > 0) {
+            const outMsgs = prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages;
+            const coreTextBytes = estimateCoreMessagesUpperBytes(outMsgs);
+            if (coreTextBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, windowLimit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
+                const byteFloorTokens = Math.ceil(coreTextBytes / DOOMED_PROBE_BYTES_PER_TOKEN);
+                const modelTag = typeof prepared.session.metadata?.lastModel === "string" ? ` (model=${prepared.session.metadata.lastModel})` : "";
+                const message = `outbound payload core text alone is ~${coreTextBytes} bytes — even at the densest tokenizer density observed on a live route (~${DOOMED_PROBE_BYTES_PER_TOKEN} bytes/token, #2122) that is ≥ ~${byteFloorTokens} tokens vs the model window ${windowLimit}${modelTag}; preflight's estimate scale let it through, but no upstream can accept it, so it was NOT forwarded (#4079). Remove or trim the oversized content (e.g. a giant paste or tool result) and retry.`;
+                log("error", `[${prepared.session.id}] send-side window guard fail-fast 413 (retryable=false): ${message}`);
+                noteLocalRefusal(prepared.session, normalizeUpstreamOrigin(upstreamUrl), typeof prepared.session.metadata?.lastModel === "string" ? prepared.session.metadata.lastModel : undefined, windowLimit);
+                if (res.headersSent) emitStreamError(res, prepared.protocol, message, undefined, opts.streamErrorShape);
+                else {
+                    res.writeHead(413, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ error: { type: "request_too_large", stage: "send-window-guard", message } }));
+                }
+                return;
+            }
+        }
     }
     try {
         checkOutboundBody(wireBody);

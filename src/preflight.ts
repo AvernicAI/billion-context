@@ -411,6 +411,15 @@ export function estimateCoreMessagesUpperBytes(messages: CoreMessage[]): number 
     return bytes;
 }
 
+// #2490/#3146/#4079: mathematically-doomed forward guard, priced in UTF-8 BYTES
+// of the core text against two bars — window×7.5 (densest live-route billing
+// observed, ~6.8 B/token, #2122) AND an absolute 2MB floor. Shared by the two
+// preflight escape branches (#2313 probe / #3146 forward-once) AND the
+// send-side final gate in relay.ts (#4079 PR①), so every doom verdict prices
+// the payload with exactly the same math.
+export const DOOMED_PROBE_BYTES_PER_TOKEN = 7.5;
+export const DOOMED_PROBE_ABSOLUTE_BYTES = 2_000_000;
+
 function spanUnitsOf(messages: CoreMessage[], startIdx: number, endIdx: number, countText: (text: string) => number): number {
     let units = 0;
     for (let i = startIdx; i <= endIdx && i < messages.length; i++) {
