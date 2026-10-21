@@ -317,3 +317,91 @@ test("PR-D closure: a REAL mid-history rewrite still flags through the echo norm
   assert.equal(v.ok, false);
   assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"));
 });
+
+// --- #4186 G2/G3: CCR placeholder substitution + emergency-truncation twins --
+
+const ccrPlaceholder = (ref: string, kind: string, tokens: string, title?: string): string =>
+  `\u{1F4E6} [acp-stored #${ref} · ${kind} · ${tokens} tok]${title !== undefined ? ` \`${title}\`` : ""}\n   → acp_retrieve("${ref}") returns the full text`;
+
+const truncatedTwin = (orig: string, keepPrefixChars = 40, keepSuffixChars = 40): string =>
+  `${orig.slice(0, keepPrefixChars)}\n\n...[truncated for context space] — original ~999 tokens]...\n\n${orig.slice(orig.length - keepSuffixChars)}`;
+
+test("I1 CCR-stored tool result: canonical placeholder on exit matches the client's full-text twin (#4186 G2)", () => {
+  const fullText = "total 8\n" + "Fuzz 4-0: pipeline clean, suite green, regions stable, deltas recorded. ".repeat(50);
+  const entry = [
+    mk("user", "text", "run"),
+    mk("tool", "tool-result", fullText, { toolName: "shell", toolCallId: "call_t4" }),
+    mk("assistant", "text", "done"),
+  ];
+  const exit = [
+    entry[0]!,
+    mk("tool", "tool-result", ccrPlaceholder("m00010", "shell output", "4,581", "ls mod-4"), { toolName: "shell", toolCallId: "call_t4" }),
+    entry[2]!,
+  ];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.exempt?.ccr, 1);
+});
+
+test("NEG CCR: prose merely MENTIONING the placeholder shape is not a sanctioned substitution (#1456 strict-parser gate)", () => {
+  const ph = ccrPlaceholder("m00010", "shell output", "4,581", "ls mod-4");
+  const entry = [mk("user", "text", "run"), mk("tool", "tool-result", "real shell bytes here", { toolCallId: "call_t4" }), mk("assistant", "text", "done")];
+  const exit = [entry[0]!, mk("tool", "tool-result", `example: ${ph}`, { toolCallId: "call_t4" }), entry[2]!];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"));
+});
+
+test("NEG CCR: placeholder-shaped body under a changed role/contentType is not exempt", () => {
+  const ph = ccrPlaceholder("m00010", "shell output", "4,581");
+  const entry = [mk("user", "text", "hello"), mk("tool", "tool-result", "real bytes", { toolCallId: "call_t4" }), mk("assistant", "text", "hi")];
+  const exit = [entry[0]!, mk("user", "text", ph), entry[2]!];
+  assert.equal(judgeInboundOutbound(entry, exit).ok, false);
+});
+
+test("I1 emergency-truncation twin: prefix+marker+suffix clip of the same message passes (#4186 G3)", () => {
+  const orig = "Turn 1: analyze module 1. " + "pipeline clean, suite green, regions stable, deltas recorded. ".repeat(80);
+  const entry = [mk("user", "text", orig), mk("assistant", "text", "reply one")];
+  const exit = [mk("user", "text", truncatedTwin(orig)), mk("assistant", "text", "reply one")];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.exempt?.truncate, 1);
+});
+
+test("I1 truncated twin directly before a fold carrier keeps carrier pinning green (live fuzz-1592 geometry)", () => {
+  const orig = "Turn 1: analyze module 1. " + "pipeline clean, suite green, regions stable, deltas recorded. ".repeat(80);
+  const entry = [mk("user", "text", orig), mk("assistant", "text", "old-1"), mk("user", "text", "new question")];
+  const exit = [
+    mk("user", "text", truncatedTwin(orig)),
+    mk("user", "text", "[Compressed conversation section]\nfolded", { summaryOfBlockId: "b9" }),
+    mk("user", "text", "new question"),
+  ];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+  assert.equal(v.folded, true);
+});
+
+test("NEG truncation: marker present but prefix NOT from the inbound message stays red (fabricated clip)", () => {
+  const orig = "Turn 1: analyze module 1. " + "alpha beta gamma delta epsilon zeta eta theta. ".repeat(80);
+  const fabricated = `Completely different opening words here\n\n...[truncated for context space] — original ~999 tokens]...\n\n${orig.slice(-40)}`;
+  const entry = [mk("user", "text", orig), mk("assistant", "text", "a")];
+  const exit = [mk("user", "text", fabricated), mk("assistant", "text", "a")];
+  assert.equal(judgeInboundOutbound(entry, exit).ok, false);
+});
+
+test("NEG truncation: plain shrink WITHOUT the marker stays red (no marker, no sanction)", () => {
+  const orig = "long body " + "word ".repeat(300);
+  const entry = [mk("user", "text", orig), mk("assistant", "text", "a")];
+  const exit = [mk("user", "text", orig.slice(0, 60)), mk("assistant", "text", "a")];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite" || x.kind === "mid-history-drop"));
+});
+
+test("NEG truncation: INFLATED body carrying the marker stays red (#3935 regression shape)", () => {
+  const orig = "short original";
+  const inflated = `${orig}\n\n...[truncated for context space] — original ~999 tokens]...\n\n${orig}`;
+  const entry = [mk("user", "text", orig), mk("assistant", "text", "a")];
+  const exit = [mk("user", "text", inflated), mk("assistant", "text", "a")];
+  assert.equal(judgeInboundOutbound(entry, exit).ok, false);
+});

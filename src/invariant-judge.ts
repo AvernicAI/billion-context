@@ -11,7 +11,9 @@
 //     named, count-bounded exemption list — chain checkpoint / acp_summary
 //     carriers (outbound-injected, or inbound-ECHOED by stateful hosts, which
 //     match their own twin by identity), policy reasoning drops, crush
-//     envelopes.
+//     envelopes, CCR-stored tool results (canonical placeholder substitutes
+//     the client's full text, #4186), emergency-truncation twins (kernel
+//     prefix+marker+suffix clip of the same message, #4186).
 //   I2 (fold): all divergence is confined to [earliest-fold-start, end); the
 //     bytes before the fold point stay identical, and the fold carrier stays
 //     pinned (anchor drift is a violation too).
@@ -33,7 +35,7 @@
 // Pure: no I/O, no mutation. `judgeInboundOutbound` never throws on well-formed
 // input; the runtime wrapper records events only and never blocks traffic.
 
-import type { CoreMessage } from "acp-kernel";
+import { parseStoredPlaceholder, type CoreMessage } from "acp-kernel";
 import { openaiToCore, anthropicToCore, responsesToCore, googleToCore } from "acp-kernel/wire";
 import { log as loggerLog } from "./logger.js";
 import { invariantJudgeEnabled } from "./knobs.js";
@@ -72,7 +74,7 @@ export interface JudgeVerdict {
   total: number;
   violations: Violation[];
   /** Named-exemption volume consumed this request (#3842 count-bounded list). */
-  exempt?: { carrier: number; reasoning: number; crush: number };
+  exempt?: { carrier: number; reasoning: number; crush: number; ccr: number; truncate: number };
   /** Egress lane the verdict came from — main first-send vs loop round-2+. */
   lane?: "main" | "loop";
 }
@@ -127,6 +129,40 @@ function isCrushedToolResult(m: CoreMessage): boolean {
   }
 }
 
+// #4186 G2: CCR-stored tool results ride outbound as canonical placeholders
+// while the inbound twin is still the client's full text. Recognized via the
+// kernel's STRICT whole-body parser (#1456 discipline) — never a substring scan.
+function isCcrStoredResult(m: CoreMessage): boolean {
+  return m.contentType === "tool-result" && parseStoredPlaceholder(m.text ?? "") !== null;
+}
+
+// #4186 G3: emergency truncation (kernel truncateLargeToolOutputs) clips an old
+// message to prefix + marker line + suffix. Marker line shape mirrors
+// kernel/src/truncate-tools.ts:109 — the token blurb after the marker may drift,
+// the "...[truncated for context space]..." line does not. Non-global on purpose:
+// at most one marker per message (the kernel skips already-truncated text).
+const TRUNCATION_LINE_RE = /\n\.\.\.\[truncated for context space\][^\n]*\n/;
+
+function isTruncationExit(m: CoreMessage): boolean {
+  return TRUNCATION_LINE_RE.test(m.text ?? "");
+}
+
+// Directional structural proof that b is the sanctioned clip of a: b must be
+// prefix(a) + marker + suffix(a), strictly shorter. A fabricated or rewritten
+// body containing the marker fails the containment check and stays flagged.
+function isTruncatedTwin(a: CoreMessage, b: CoreMessage): boolean {
+  const bt = b.text ?? "";
+  const m = TRUNCATION_LINE_RE.exec(bt);
+  if (!m) return false;
+  const at = a.text ?? "";
+  if (!at || at.length <= bt.length) return false;
+  const strip = (s: string): string => s.replace(RENDER_TAG_RE, "").trim();
+  const pre = strip(bt.slice(0, m.index));
+  const post = strip(bt.slice(m.index + m[0].length));
+  const na = strip(at);
+  return pre.length > 0 && post.length > 0 && na.startsWith(pre) && na.endsWith(post);
+}
+
 function fp(m: CoreMessage): string {
   const id = m.toolCallId ? `#${m.toolCallId}` : "";
   const name = m.contentType === "tool-call" && m.toolName ? `:${m.toolName}` : "";
@@ -141,6 +177,8 @@ function stableEqual(a: CoreMessage, b: CoreMessage): boolean {
   if (a.role !== b.role || a.contentType !== b.contentType) return false;
   if (a.contentType === "tool-call" && a.toolName && b.toolName && a.toolName !== b.toolName) return false;
   if (isCrushedToolResult(b)) return true;
+  if (a.contentType === "tool-result" && isCcrStoredResult(b)) return true; // #4186 G2
+  if (isTruncatedTwin(a, b)) return true; // #4186 G3
   return normText(a) === normText(b);
 }
 
@@ -232,12 +270,14 @@ export function judgeInboundOutbound(
   const carrierExempt = exit.filter(isCarrier).length;
   const reasoningExempt = exit.filter(isReasoning).length;
   const crushExempt = exit.filter(isCrushedToolResult).length;
-  const exemptTotal = carrierExempt + reasoningExempt + crushExempt;
+  const ccrExempt = exit.filter(isCcrStoredResult).length;
+  const truncateExempt = exit.filter(isTruncationExit).length;
+  const exemptTotal = carrierExempt + reasoningExempt + crushExempt + ccrExempt + truncateExempt;
   if (exemptTotal > maxExempt) {
     violations.push({
       kind: "exemption-overflow",
       index: -1,
-      detail: `named-exemption volume ${exemptTotal} exceeds cap ${maxExempt} (carrier=${carrierExempt} reasoning=${reasoningExempt} crush=${crushExempt})`,
+      detail: `named-exemption volume ${exemptTotal} exceeds cap ${maxExempt} (carrier=${carrierExempt} reasoning=${reasoningExempt} crush=${crushExempt} ccr=${ccrExempt} truncate=${truncateExempt})`,
     });
   }
 
@@ -248,7 +288,7 @@ export function judgeInboundOutbound(
     matched,
     total,
     violations,
-    exempt: { carrier: carrierExempt, reasoning: reasoningExempt, crush: crushExempt },
+    exempt: { carrier: carrierExempt, reasoning: reasoningExempt, crush: crushExempt, ccr: ccrExempt, truncate: truncateExempt },
   };
 }
 
@@ -304,9 +344,9 @@ function defaultSink(sessionId: string | undefined, lane: "main" | "loop"): Sink
     const where = `[${sessionId ?? "unknown"}] [invariant-judge${v.lane ? `/${v.lane}` : ``}]`;
     if (!v.ok) {
       const head = v.violations[0];
-      loggerLog("warn", `${where} I${v.folded ? 2 : 1} violation: ${head.kind} @${head.index} — ${head.detail} (${v.violations.length} finding(s), matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush}` : ``})`);
+      loggerLog("warn", `${where} I${v.folded ? 2 : 1} violation: ${head.kind} @${head.index} — ${head.detail} (${v.violations.length} finding(s), matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``})`);
     } else {
-      loggerLog("debug", `${where} clean ${v.folded ? "fold" : "growth"} verdict: matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush}` : ``}`);
+      loggerLog("debug", `${where} clean ${v.folded ? "fold" : "growth"} verdict: matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``}`);
     }
   };
 }
