@@ -73,6 +73,7 @@ const CORPUS: Array<{ name: string; text: string }> = [
     { name: "prose wearing pair #1720", text: "see \x3cacp tokens=\"2\" type=\"text\"\x3ethe module notes\x3c/acp\x3e for details." },
     { name: "bare ref citation", text: "as recorded in m00123 the build stayed green." },
     { name: "orphan ref close #2023", text: "Answer. m00123 m00124\x3c/acp\x3e tail." },
+    { name: "orphan ref run word-glued head #4179", text: "textm00123\u2013m00124\x3c/acp\x3e tail." },
     { name: "wrapped odd quotes", text: "Answer.\n\x3cacp tokens=\"1\" text=\"text\x3cparameter=ref\x3em00608\x3c/parameter\x3e\x3c/function\x3e tail." },
     { name: "broken attrs run-in", text: "Answer.\n\x3cacp tokens=\"1\" \x3ctool\u003e call \x3c/tool\u003e then \x3c/acp\x3e tail prose." },
     { name: "marker line #717", text: "Answer.\n📦 [ACP] Compressed m00120–m0300 → 1 block(s), ~12K tokens saved.\ntail." },

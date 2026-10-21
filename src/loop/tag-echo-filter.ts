@@ -1135,9 +1135,20 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             // The lookbehind class extends across the chunk boundary: a run at
             // the buffer head preceded by an emitted word char is word-like
             // (xm01233), and one preceded by \x3e is tag-structure residue
-            // (#644) — neither is an orphan.
+            // (#644) — neither is an orphan. Voiding that HEAD match must not
+            // abandon the run: REFS_RUN may start at ANY ref (joiners are not
+            // \w), so a valid MID-RUN start (a ref preceded by a joiner) can sit
+            // inside the voided span. Re-scan from just past the voided head so
+            // that start is found instead of lost — otherwise the drop depends
+            // on where the chunk boundary fell (#4179). Any match at index \x3e 0
+            // already passes the lookbehind gate by construction, so one re-scan
+            // suffices.
             let r = ORPHAN_REF_CLOSE.exec(buf);
-            if (r !== null && /[\w>]/.test(charBeforeRun(r, buf))) r = null;
+            if (r !== null && /[\w>]/.test(charBeforeRun(r, buf))) {
+                const rescan = new RegExp(ORPHAN_REF_CLOSE.source, "g");
+                rescan.lastIndex = r.index + 1;
+                r = rescan.exec(buf);
+            }
             // A mangled open (<name=...>) is a complete self-contained tag:
             // drop it in place, no swallow (a following close dies via
             // LONE_CLOSE on its own).
