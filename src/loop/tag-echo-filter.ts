@@ -110,8 +110,13 @@ const REF_TOKEN = "m\\d{4,}";
 // shapes the compress machinery prints (single ref, mNNNNN–mMMMMM ranges,
 // comma-separated range lists) that models imitate inside or beside render
 // tags (#2023). A bare run is never prose: prose cites ONE ref among words,
-// never a sequence of them.
-const REFS_RUN = REF_TOKEN + "(?:\\s*[\\u2013\\u2014,\\-]?\\s*" + REF_TOKEN + ")*";
+// never a sequence of them. The separator is written UNAMBIGUOUSLY — leading
+// spaces, then optionally ONE joiner plus its trailing spaces — so a given
+// span has exactly one parse. The equivalent two-arm form lets both \s*
+// arms claim the same spaces; when a later alternative fails the engine
+// replays 2^N partitions over an N-ref run (#4178: one push of 28
+// space-joined refs took 11s; 34 refs ~ 1.2h — comma-joined was 2ms).
+const REFS_RUN = REF_TOKEN + "(?:\\s*(?:[\u2013\u2014,\-]\\s*)?" + REF_TOKEN + ")*";
 // Whole string is a refs run (optionally padded): tag content, not prose.
 const REFS_ONLY = new RegExp("^\\s*" + REFS_RUN + "\\s*$");
 // Superset: the run may also END on an incomplete ref prefix (m / m0 / m00…)
