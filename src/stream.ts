@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { activeBlockSpans, collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
+import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, hideConsumedCompressCalls, indexToRef, parseBoundary, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
 import { excludeDeadRefRanges, handleAcpStatus, liveCompressionRanges } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, residentPressure, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
@@ -607,7 +607,21 @@ const DEGENERATE_FOLD_COVERAGE = 0.8;
  *  DEAD (the host commits applyCompression's cloned state even when zero blocks
  *  were created), and the receipt blames "content-changed" — none of which is
  *  true: the refs are intact and the view self-heals on the next model request
- *  (rememberPluginMessages after forward). Null = no refusal, proceed. */
+ *  (rememberPluginMessages after forward).
+ *
+ *  #3859: WHICH empty-view calls may still be handed to the kernel is decided
+ *  by the kernel's own dead-ref test, not by span overlap. danglingMessageRefs
+ *  records a requested ref dead exactly when that BOUNDARY ref is known to this
+ *  session but not visible and not inside any active block's effectiveMessageIds
+ *  — so a range that overlaps one block while its boundary refs sit in gaps
+ *  between blocks passed the old overlap gate and got its live refs tombstoned.
+ *  The gate now yields only when every requested range's message-ref boundaries
+ *  are point-covered by some active block (block-ref boundaries carry no raw id
+ *  and can never be tombstoned). That is also exactly the set of shapes the
+ *  kernel could ever serve from state alone (#403/#2748 restoredInline refold,
+ *  already-compressed warnings): with a truly empty view nothing else anchors,
+ *  so every uncovered-boundary shape can only fail or corrupt.
+ *  Null = no refusal, proceed. */
 export function noVisibleContextRefusal(
     ctx: RewriteCtx,
     ranges: ParsedRange[],
@@ -616,23 +630,25 @@ export function noVisibleContextRefusal(
     const view = ctx.compressMessages ?? ctx.messages;
     const mappedRefs = Object.keys(ctx.session.state.messageRefs?.byRef ?? {}).length;
     if (view.length > 0 || mappedRefs === 0) return null;
-    // #398/#403 in-place refold works FROM state alone: after an inline
-    // decompress the originals leave the wire view (proxy mode) yet a
-    // re-compress of the restored span must still land on its block. The
-    // refusal therefore applies only when NO active block touches ANY
-    // requested ref — then nothing in the call can be served without live
-    // messages and every retry fails identically. Any overlap hands the
-    // decision back to the kernel, which keeps its own honest diagnostics
-    // for those shapes (refold / already-compressed / no-net-shrink).
-    const spans = activeBlockSpans(ctx.session.state);
-    const touchable = ranges.some((r) => {
-        const lo = refNum(r.startRef);
-        const hi = refNum(r.endRef);
-        if (lo === 0 || hi === 0) return true;
-        const a = Math.min(lo, hi), b = Math.max(lo, hi);
-        return spans.some((s) => refNum(s.startRef) <= b && refNum(s.endRef) >= a);
-    });
-    if (touchable) return null;
+    // #3859: yield to the kernel only when its own dead-ref test cannot fire on
+    // anything here — i.e. every requested message-ref boundary is point-covered
+    // by an active block (mirrors danglingMessageRefs: same byRef lookup, same
+    // effectiveMessageIds coverage; block-ref boundaries carry no raw id and are
+    // skipped there too). Any uncovered boundary would be recorded DEAD on this
+    // empty view while still live on disk. A boundary with no known rawId is
+    // yielded deliberately: the kernel then only re-records ids already dead
+    // (#3302, idempotent) or skips unknown ones — it can never corrupt a live ref.
+    const byRef = ctx.session.state.messageRefs?.byRef ?? {};
+    const coveredRawIds = new Set(
+        ctx.session.state.blocks.filter((b) => b.active).flatMap((b) => b.effectiveMessageIds),
+    );
+    const unvouchable = ranges.some((r) => [r.startRef, r.endRef].some((ref) => {
+        const parsed = parseBoundary(ref);
+        if (!parsed || parsed.kind !== "message") return false;
+        const rawId = byRef[parsed.raw] ?? byRef[indexToRef(parsed.numericId)];
+        return Boolean(rawId) && !coveredRawIds.has(rawId);
+    }));
+    if (!unvouchable) return null;
     const detail = ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ");
     // #3918: the "self-heals on the next model request" promise holds ONLY when
     // the reloaded session survives between requests. When this session's
