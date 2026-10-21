@@ -1201,22 +1201,99 @@ const dshForkAdopter = createForkAdopter((line) => {
     persistClientEvent(`bili-native-dsh: ${line}`);
 });
 
-/** A seeded fork child of the current initiator, or undefined. The gate is
- *  header.isSeeded === true (set only by dsh's fork seed path): subagent
- *  sessions carry parentSession WITHOUT isSeeded — they run fresh task
- *  contexts, never replay the parent history, and must NOT inherit. */
-function forkChildOf(ctx: PluginContext): { sid: string; parent: string } | undefined {
-    let session: AgentLike["session"];
+// #4215/C10a: structured diagnostics for every skipped fork-adoption entry
+// gate. The #4215 incident (seeded child with the correct parentSession, ZERO
+// adoption trace in the whole log) showed that silent early returns make the
+// fired predicate undiagnosable after the fact: this path had eight ways out
+// and none of them wrote anything, so "not a fork" vs "a fork we could not
+// see" was unanswerable from the log. The verdict names every shape; the
+// caller warns once per session for seeded candidates blocked at a gate and
+// notes the ambient-blind shapes ONCE per process (they fire on every
+// agentless dispatch — title lanes, disposed scopes — so per-request lines
+// would be pure noise). Plain non-fork traffic stays completely silent.
+export type ForkChildSkipReason =
+    | "initiator-threw"
+    | "initiator-missing"
+    | "session-missing"
+    | "sid-missing"
+    | "header-missing"
+    | "not-seeded"
+    | "parent-missing"
+    | "parent-is-self";
+
+export type ForkChildVerdict =
+    | { ok: true; sid: string; parent: string }
+    | { ok: false; reason: ForkChildSkipReason; sid?: string; detail?: string };
+
+/** A seeded fork child of the current initiator, or the named reason it is
+ *  not (or cannot be determined). The fork gate is header.isSeeded === true
+ *  (set only by dsh's fork seed path): subagent sessions carry parentSession
+ *  WITHOUT isSeeded — they run fresh task contexts, never replay the parent
+ *  history, and must NOT inherit ("not-seeded" is intentional and stays
+ *  silent — it is the documented majority of all traffic). */
+export function forkChildVerdict(ctx: PluginContext): ForkChildVerdict {
+    let init: AgentLike | undefined;
     try {
-        session = ctx.agents?.currentInitiator?.()?.session;
-    } catch {
-        return undefined;
+        init = ctx.agents?.currentInitiator?.();
+    } catch (err) {
+        return { ok: false, reason: "initiator-threw", detail: err instanceof Error ? err.message : String(err) };
     }
-    const sid = typeof session?.id === "string" && session.id.length > 0 ? session.id : undefined;
-    if (sid === undefined || session?.header === undefined) return undefined;
+    if (init === undefined || init === null) return { ok: false, reason: "initiator-missing" };
+    const session = init.session;
+    if (session === undefined || session === null) return { ok: false, reason: "session-missing" };
+    const sid = typeof session.id === "string" && session.id.length > 0 ? session.id : undefined;
+    if (sid === undefined) return { ok: false, reason: "sid-missing" };
+    if (session.header === undefined) return { ok: false, reason: "header-missing", sid };
     const parent = session.header.parentSession;
-    if (session.header.isSeeded !== true || typeof parent !== "string" || parent.length === 0 || parent === sid) return undefined;
-    return { sid, parent };
+    if (session.header.isSeeded !== true) return { ok: false, reason: "not-seeded", sid };
+    if (typeof parent !== "string" || parent.length === 0) return { ok: false, reason: "parent-missing", sid };
+    if (parent === sid) return { ok: false, reason: "parent-is-self", sid };
+    return { ok: true, sid, parent };
+}
+
+const forkGateNoted = new Set<string>();
+let noticedForkBlindSpot = false;
+
+function noteForkGateOnce(key: string, level: "info" | "warn", line: string): void {
+    if (forkGateNoted.has(key)) return;
+    forkGateNoted.add(key);
+    logHostEvent(level, "[dsh-client]", line);
+}
+
+function noteForkVerdict(verdict: Extract<ForkChildVerdict, { ok: false }>): void {
+    switch (verdict.reason) {
+        case "not-seeded":
+            return; // intentional non-inheritance — see forkChildVerdict
+        case "parent-missing":
+            noteForkGateOnce(`lineage:${verdict.sid}`, "warn",
+                `bili-native-dsh: fork adoption for ${verdict.sid} skipped — the session header says isSeeded but carries no usable parentSession; the child starts without inherited compression state (#4215)`);
+            return;
+        case "parent-is-self":
+            noteForkGateOnce(`lineage:${verdict.sid}`, "warn",
+                `bili-native-dsh: fork adoption for ${verdict.sid} skipped — the session header carries its own id as parentSession; the child starts without inherited compression state (#4215)`);
+            return;
+        default: {
+            // Blind shapes: the ambient read could not determine whether this
+            // dispatch was a seeded fork child at all. Once per process — these
+            // fire on EVERY agentless dispatch, so per-request lines would be
+            // noise. The scoped-attribution state is part of the message: with
+            // #4082 active the sid rides the request object while fork
+            // detection still reads only the ambient initiator — that split is
+            // exactly what #4215 needs named in the log (C10b).
+            if (noticedForkBlindSpot) return;
+            noticedForkBlindSpot = true;
+            const scoped = sidScope.getStore();
+            const scopedActive = typeof scoped === "string" && scoped.length > 0;
+            const shape =
+                verdict.reason === "initiator-threw" ? `threw (${verdict.detail ?? "unknown"})`
+                    : verdict.reason === "initiator-missing" ? "returned no agent"
+                        : verdict.reason === "session-missing" ? "the agent has no session"
+                            : verdict.reason === "sid-missing" ? "the session has no usable id"
+                                : "the session has no epoch header";
+            logHostEvent("info", "[dsh-client]",
+                `bili-native-dsh: fork discovery blind on this dispatch — ambient currentInitiator ${shape}${scopedActive ? "; scoped llm/stream attribution WAS active but fork detection does not use it yet (#4082)" : ""}; a seeded fork child dispatched this way leaves NO adoption trace (#4215)`);
+        }
+    }
 }
 
 function bodyJsonOf(init: RequestInit | undefined): unknown {
@@ -1240,14 +1317,33 @@ function bodyJsonOf(init: RequestInit | undefined): unknown {
 
 
 async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | undefined): Promise<void> {
-    if (!register.toolsReady) return;
-    const child = forkChildOf(ctx);
-    if (child === undefined) return;
+    const child = forkChildVerdict(ctx);
+    if (!child.ok) {
+        noteForkVerdict(child);
+        return;
+    }
+    if (!register.toolsReady) {
+        noteForkGateOnce(`gate:tools-ready:${child.sid}`, "warn",
+            `bili-native-dsh: fork adoption for ${child.sid} skipped at the tools-ready gate — this request arrived before bili tool registration completed; later requests can still adopt (#4215)`);
+        return;
+    }
     const body = bodyJsonOf(init);
-    if (body === undefined) return;
-    if (sideShapedBody(body)) return;
+    if (body === undefined) {
+        noteForkGateOnce(`gate:body-parse:${child.sid}`, "warn",
+            `bili-native-dsh: fork adoption for ${child.sid} skipped at the body-parse gate — the request body was not parseable JSON, so the replay cannot be projected (#4215)`);
+        return;
+    }
+    if (sideShapedBody(body)) {
+        noteForkGateOnce(`gate:side-shaped:${child.sid}`, "info",
+            `bili-native-dsh: fork adoption for ${child.sid} deferred for a side-shaped request (no tools, budget <= 200) — the adoption window stays open for the main request (#4215)`);
+        return;
+    }
     const base = register.base;
-    if (base === undefined) return;
+    if (base === undefined) {
+        noteForkGateOnce(`gate:proxy-base:${child.sid}`, "warn",
+            `bili-native-dsh: fork adoption for ${child.sid} skipped at the proxy-base gate — the proxy origin is not known yet, so the fork protocol cannot be reached (#4215)`);
+        return;
+    }
     await dshForkAdopter.maybeAdopt({ base, parent: child.parent, child: child.sid, body });
 }
 
@@ -2406,8 +2502,9 @@ export function apply(ctx: PluginContext): void {
 }
 
 /** Test hook: reset the module-level registration lifecycle so suites can
- *  drive apply() repeatedly with a fresh mock ctx. */
-export function _resetRegisterForTest(base: string | undefined): void {
+ *  drive apply() repeatedly with a fresh mock ctx. (#4215: optional
+ *  toolsReady so gate scenarios can arm the registration state directly.) */
+export function _resetRegisterForTest(base: string | undefined, toolsReady = false): void {
     // #3616: invalidate every in-flight recovery chain from earlier scenarios —
     // their late landings must not write this scenario's register/state.
     originGen += 1;
@@ -2422,7 +2519,7 @@ export function _resetRegisterForTest(base: string | undefined): void {
     state.respawn = undefined;
     state.onGiveUp = undefined;
     register.base = base;
-    register.toolsReady = false;
+    register.toolsReady = toolsReady;
     register.dead = false;
     register.retryAt = 0;
     register.pending = undefined;
@@ -2441,6 +2538,18 @@ export function _resetRegisterForTest(base: string | undefined): void {
  *  path without fabricating model traffic. */
 export function maybeRetryForTest(ctx: PluginContext): void {
     maybeRetry(ctx);
+}
+
+/** Test hook (#4215): drive the fork-adoption entry gate directly without
+ *  arming apply() (the fetch patch is not installed under NODE_TEST_CONTEXT). */
+export function _maybeForkAdoptBeforeSendForTest(ctx: PluginContext, init: RequestInit | undefined): Promise<void> {
+    return maybeForkAdoptBeforeSend(ctx, init);
+}
+
+/** Test hook (#4215): reset the fork-gate diagnostics throttle state. */
+export function _resetForkGateDiagnosticsForTest(): void {
+    forkGateNoted.clear();
+    noticedForkBlindSpot = false;
 }
 
 /** Test hook (#2604): reset the host-title channel (dedup map + resolved
