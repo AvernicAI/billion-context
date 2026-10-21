@@ -2186,6 +2186,7 @@ const mergeBranch = (
     if (defInfo) moduleStack.push(defInfo);
     try {
     const inner: Frame = { vars: new Map(frame.vars) }; // lexical closure
+    const innerState: RunState = runState0();
     // bind parameters (earlier params visible to later default exprs)
     fn.parameters.forEach((prm, pi) => {
       const pv: SymVal | undefined = args[pi] ?? (prm.initializer ? evalExpr(prm.initializer, inner, innerState, depth + 1) : undefined);
@@ -2196,8 +2197,7 @@ const mergeBranch = (
         inner.vars.set(el.name.text, elementAccess(pd, { kind: "num", t: num(ctx, j) }, el, st));
       });
     });
-    const innerState: RunState = runState0();
-    const body = ts.isFunctionDeclaration(fn) ? fn.body : fn.body;
+    const body = fn.body;
     if (!body) return { kind: "any" };
     if (ts.isBlock(body)) {
       execStmt(body, inner, innerState, depth + 1);
