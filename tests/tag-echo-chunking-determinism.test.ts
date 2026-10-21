@@ -87,6 +87,15 @@ const CORPUS: Array<{ name: string; text: string }> = [
     { name: "pair split shape mid-tag", text: "Answer. \x3cacp to\nkens=\"2\" type=\"text\"\x3em00123\x3c/acp\x3e tail." },
     { name: "plain prose control", text: "the acpi.h include and caption and app stay untouched, a<b c>d." },
     { name: "empty", text: "" },
+    // #4164: dead ref-close unit settled ahead of an ambiguous tail — the
+    // tail's fate (acplike tag vs prose vs EOF) decides whether the unit dies
+    // or stays content, and the decision must not depend on the chunk split.
+    { name: "dead unit before open #4164", text: " m1234\x3c/ap\x3cACP\x3e" },
+    { name: "dead unit drift name #4164", text: " m1234\x3c/ap\x3caccessp\x3e" },
+    { name: "two dead units before open #4164", text: "m1111\x3c/ap x m2222\x3c/ap\x3cacp\x3e" },
+    { name: "dead unit prose follow #4164", text: " m1234\x3c/ap\x3cdiv\x3emore" },
+    { name: "dead unit dangling lt #4164", text: " m1234\x3c/ap\x3c" },
+    { name: "dead unit non-acplike close #4164", text: " m1234\x3c/ap\x3c/div\x3e" },
 ];
 
 test("tag-echo filter: chunk-boundary determinism (same input, any chunking, byte-identical output)", () => {
