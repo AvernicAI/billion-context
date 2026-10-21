@@ -13,6 +13,7 @@ import {
 import { keepaliveStatusFor } from "./cache-keepalive.js";
 import { conflictClientOf, conflictEventsOf, formatConflictSection } from "./conflict-watch.js";
 import { getOpenUpstreamCircuits } from "./upstream-alerts.js";
+import { activeThrottleHolds } from "./upstream-throttle.js";
 import { dshLedgerFloorTokens } from "./server/budget.js";
 import { getBlindTunnelStats } from "./mitm.js";
 import { pckAblations } from "./pck-probe.js";
@@ -321,6 +322,18 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             extra.push(`UPSTREAM CIRCUIT OPEN — ${c.host}: ${c.consecutiveFailures} consecutive pre-response failures since ${c.openedAt !== null ? new Date(c.openedAt).toISOString() : "?"} · last failure ${c.lastFailure ? `${c.lastFailure.kind}${c.lastFailure.detail ? ` (${c.lastFailure.detail})` : ""} @ ${new Date(c.lastFailure.at).toISOString()}` : "?"}; next probe ${c.nextProbeAt !== null ? new Date(c.nextProbeAt).toISOString() : "soon"}. Requests to this host fail fast until the probe succeeds.`);
         }
         if (openCircuits.length > 4) extra.push(`UPSTREAM CIRCUIT OPEN — (+${openCircuits.length - 4} more host(s))`);
+    }
+    // #4204: display counterpart of the egress-side 429 governor — holds are
+    // per origin+credential and answer locally (zero egress) while armed, so
+    // hosts/models can see WHY sends are held back and when the next probe
+    // fires. Display-only; no wire decision lives here.
+    const throttleHolds = activeThrottleHolds();
+    if (throttleHolds.length > 0) {
+        for (const h of throttleHolds.slice(0, 4)) {
+            extra.push("");
+            extra.push(`UPSTREAM 429 HOLD — ${h.host}: ${h.streak} consecutive upstream 429(s); outbound sends answered locally until ${new Date(h.nextAttemptAt).toISOString()} (${h.terminal ? "TERMINAL — local 424 outside SDK retry sets until a probe succeeds" : "backoff window"}); zero egress while held, clears on the next non-429 response (#4204).`);
+        }
+        if (throttleHolds.length > 4) extra.push(`UPSTREAM 429 HOLD — (+${throttleHolds.length - 4} more origin+credential key(s))`);
     }
     const shrinkAt = ctx.session.stats.emergencyShrinkAt;
     if (typeof shrinkAt === "number") {

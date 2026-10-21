@@ -10,8 +10,8 @@ entries:
     site_group: proc
     desc_en: "Transport timeouts, watchdogs and replay policy for upstream calls."
     desc_zh: "上游调用的传输超时、看门狗与重放策略。"
-    site_en: "<code>network</code> — transport timeouts &amp; replays: <span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000</span>."
-    site_zh: "<code>network</code> —— 传输超时与重放：<span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000</span>。"
+    site_en: "<code>network</code> — transport timeouts, replays &amp; the 429 egress governor: <span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000</span>."
+    site_zh: "<code>network</code> —— 传输超时、重放与 429 出站治理：<span class='mech'>upstreamTimeoutMs 720000 · requestWatchdogMs 2× · replayRetryMax 3 · replayRetryBaseMs 1500 · keepAliveTimeoutMs 5000 · clientErrorBackstopMs 30000 · exposureLogIntervalMs 3600000 · streamKeepAliveMs 15000 · preflightHoldMs 30000 · preflightDeadEndCooldownMs 300000 · proxyKeepAliveMaxMs 55000 · throttle429Enabled true · throttle429MaxConsecutive 5 · throttle429BaseDelayMs 2000 · throttle429MaxDelayMs 30000</span>。"
   - key: network.upstreamTimeoutMs
     type: number
     default: "720000"
@@ -82,6 +82,34 @@ entries:
     group: process
     desc_en: "Base backoff delay between replays (exponential)."
     desc_zh: "重放之间的基础退避延迟（指数增长）。"
+  - key: network.throttle429Enabled
+    type: boolean
+    default: "true"
+    env: BILI_THROTTLE_429
+    group: process
+    desc_en: "Egress-side 429 governor (#4204): after consecutive upstream 429s, further sends to that origin+credential are answered locally with zero egress instead of being forwarded; set false to restore the legacy always-forward behavior."
+    desc_zh: "出站 429 治理器（#4204）：同一 origin+凭据连续收到上游 429 后，后续请求在本地应答（零出站）而不再转发；设为 false 恢复旧的总是转发行为。"
+  - key: network.throttle429MaxConsecutive
+    type: number
+    default: "5"
+    env: BILI_THROTTLE_429_MAX_CONSECUTIVE
+    group: process
+    desc_en: "Consecutive upstream 429s before the hold turns terminal (local 424 outside every known SDK retry set); one probe per backoff window keeps checking until any non-429 response clears it."
+    desc_zh: "连续上游 429 达到该次数后 hold 转为终局（本地 424，不在任何已知 SDK 重试集合内）；每个退避窗口仍放行一次探测，直到出现非 429 响应清除。"
+  - key: network.throttle429BaseDelayMs
+    type: number
+    default: "2000"
+    env: BILI_THROTTLE_429_BASE_DELAY_MS
+    group: process
+    desc_en: "Base backoff for the 429 hold (doubles per consecutive 429, jittered into [0.5×, 1×], capped by throttle429MaxDelayMs; an upstream Retry-After wins when larger)."
+    desc_zh: "429 hold 的基础退避（每连续一次 429 翻倍、抖动到 [0.5×, 1×]、以 throttle429MaxDelayMs 封顶；上游 Retry-After 更大时优先）。"
+  - key: network.throttle429MaxDelayMs
+    type: number
+    default: "30000"
+    env: BILI_THROTTLE_429_MAX_DELAY_MS
+    group: process
+    desc_en: "Ceiling for the 429 hold backoff and for the terminal-phase probe interval."
+    desc_zh: "429 hold 退避的上限，也是终局阶段探测间隔的上限。"
   - key: network.maxShrinkPerCompress
     type: number
     default: "unset"

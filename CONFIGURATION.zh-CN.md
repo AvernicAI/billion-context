@@ -159,6 +159,10 @@
 | `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | 死胡同 preflight 后，对同一会话重试校准的冷却时长。 |
 | `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | 同一请求在向上游暴露错误前的最大传输失败重放次数。 |
 | `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | 重放之间的基础退避延迟（指数增长）。 |
+| `network.throttle429Enabled` | boolean | true | BILI_THROTTLE_429 | 出站 429 治理器（#4204）：同一 origin+凭据连续收到上游 429 后，后续请求在本地应答（零出站）而不再转发；设为 false 恢复旧的总是转发行为。 |
+| `network.throttle429MaxConsecutive` | number | 5 | BILI_THROTTLE_429_MAX_CONSECUTIVE | 连续上游 429 达到该次数后 hold 转为终局（本地 424，不在任何已知 SDK 重试集合内）；每个退避窗口仍放行一次探测，直到出现非 429 响应清除。 |
+| `network.throttle429BaseDelayMs` | number | 2000 | BILI_THROTTLE_429_BASE_DELAY_MS | 429 hold 的基础退避（每连续一次 429 翻倍、抖动到 [0.5×, 1×]、以 throttle429MaxDelayMs 封顶；上游 Retry-After 更大时优先）。 |
+| `network.throttle429MaxDelayMs` | number | 30000 | BILI_THROTTLE_429_MAX_DELAY_MS | 429 hold 退避的上限，也是终局阶段探测间隔的上限。 |
 | `network.maxShrinkPerCompress` | number | unset | BILI_MAX_SHRINK_PER_COMPRESS | 单次压缩允许收缩历史的上限（防塌缩护栏）。 |
 | `network.proxyKeepAliveMaxMs` | number | 55000 (0 = one-shot connections) | BILI_PROXY_KEEPALIVE_MAX_MS | 经出站代理的连接最大存活时长，到期强制重建（规避陈旧 NAT 映射）。 |
 | `network.postResponseLingerMs` | number | 5000 | BILI_POST_RESPONSE_LINGER_MS | 代理主动发起的响应后关闭的优雅关闭预算：socket 挂起等待对端 FIN/TLS close_notify，到点销毁（reason=linger-backstop）。 |
@@ -1824,6 +1828,10 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
+| `BILI_THROTTLE_429` | `network.throttle429Enabled` | true |
+| `BILI_THROTTLE_429_BASE_DELAY_MS` | `network.throttle429BaseDelayMs` | 2000 |
+| `BILI_THROTTLE_429_MAX_CONSECUTIVE` | `network.throttle429MaxConsecutive` | 5 |
+| `BILI_THROTTLE_429_MAX_DELAY_MS` | `network.throttle429MaxDelayMs` | 30000 |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | 180000 |
 | `BILI_UPDATE_POLICY_URL` | `update.policyUrl` | official repo raw URL |
 | `BILI_UPDATE_REGISTRY` | `update.registry` | "npmjs" (registry.npmjs.org) |

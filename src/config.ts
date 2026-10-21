@@ -1985,6 +1985,20 @@ type FileConfig = {
         replayRetryMax?: number;
         /** Replay backoff base delay (was BILI_REPLAY_RETRY_BASE_MS; default 1500). */
         replayRetryBaseMs?: number;
+        /** Egress-side 429 throttle governor master switch (#4204; was env-only BILI_THROTTLE_429; default true).
+         *  After consecutive upstream 429s, further sends to that origin+credential are answered locally
+         *  (429 + Retry-After, then a terminal 424) instead of being forwarded, so host-driven retry loops
+         *  cannot pin a concurrency-style provider limit. false restores the legacy always-forward behavior. */
+        throttle429Enabled?: boolean;
+        /** Consecutive upstream 429s before the hold turns terminal — local 424 answers outside every known
+         *  client-SDK retry set, so hosts stop re-driving (#4204; was env-only BILI_THROTTLE_429_MAX_CONSECUTIVE; default 5). */
+        throttle429MaxConsecutive?: number;
+        /** 429-hold backoff base delay in ms — exponential ×2 per consecutive 429, jittered, capped by
+         *  throttle429MaxDelayMs (#4204; was env-only BILI_THROTTLE_429_BASE_DELAY_MS; default 2000). */
+        throttle429BaseDelayMs?: number;
+        /** 429-hold backoff ceiling in ms; also the probe cadence once the hold is terminal (#4204;
+         *  was env-only BILI_THROTTLE_429_MAX_DELAY_MS; default 30000). */
+        throttle429MaxDelayMs?: number;
         /** Per-compress shrink steering factor in (0,1] (was BILI_MAX_SHRINK_PER_COMPRESS; default unset). */
         maxShrinkPerCompress?: number;
         /** Outbound proxy keep-alive ceiling, 0 for one-shot (was BILI_PROXY_KEEPALIVE_MAX_MS; default 55000). */

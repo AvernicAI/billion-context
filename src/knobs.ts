@@ -108,6 +108,43 @@ export function replayBaseDelayMs(): number {
     return Number.isFinite(v) && v >= 0 ? v : REPLAY_BASE_DELAY_MS;
 }
 
+// --- #4204 egress-side 429 throttle governor ---
+
+const THROTTLE_429_MAX_CONSECUTIVE = 5;
+const THROTTLE_429_BASE_DELAY_MS = 2_000;
+const THROTTLE_429_MAX_DELAY_MS = 30_000;
+
+/** BILI_THROTTLE_429 > network.throttle429Enabled > true. The egress 429
+ *  governor (#4204) is ON by default: consecutive upstream 429s put sends to
+ *  that origin+credential on local backoff instead of amplifying a
+ *  concurrency-style provider limit. "0"/"false" restores the legacy
+ *  always-forward behavior. Read per request so the switch flips live. */
+export function throttle429Enabled(): boolean {
+    const envRaw = process.env.BILI_THROTTLE_429;
+    if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
+    return fileNetwork().throttle429Enabled !== false;
+}
+
+/** BILI_THROTTLE_429_MAX_CONSECUTIVE > network.throttle429MaxConsecutive > 5.
+ *  Consecutive upstream 429s before the hold turns TERMINAL (local 424 answers
+ *  outside every known SDK retry set, so hosts stop re-driving). */
+export function throttle429MaxConsecutive(): number {
+    const v = tInt("BILI_THROTTLE_429_MAX_CONSECUTIVE", fileNetwork().throttle429MaxConsecutive);
+    return Number.isInteger(v) && v >= 1 ? v : THROTTLE_429_MAX_CONSECUTIVE;
+}
+
+/** BILI_THROTTLE_429_BASE_DELAY_MS > network.throttle429BaseDelayMs > 2000. */
+export function throttle429BaseDelayMs(): number {
+    const v = tNum("BILI_THROTTLE_429_BASE_DELAY_MS", fileNetwork().throttle429BaseDelayMs);
+    return Number.isFinite(v) && v >= 0 ? v : THROTTLE_429_BASE_DELAY_MS;
+}
+
+/** BILI_THROTTLE_429_MAX_DELAY_MS > network.throttle429MaxDelayMs > 30000. */
+export function throttle429MaxDelayMs(): number {
+    const v = tNum("BILI_THROTTLE_429_MAX_DELAY_MS", fileNetwork().throttle429MaxDelayMs);
+    return Number.isFinite(v) && v >= 0 ? v : THROTTLE_429_MAX_DELAY_MS;
+}
+
 /** BILI_MAX_SHRINK_PER_COMPRESS > network.maxShrinkPerCompress > unset (no steering). */
 export function maxShrinkPerCompress(): number | undefined {
     const v = tNum("BILI_MAX_SHRINK_PER_COMPRESS", fileNetwork().maxShrinkPerCompress);

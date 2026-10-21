@@ -159,6 +159,10 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `network.preflightDeadEndCooldownMs` | number | 300000 | BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS | Cooldown after a dead-end preflight before retrying reconciliation for the same session. |
 | `network.replayRetryMax` | number | 3 (1 disables replays) | BILI_REPLAY_RETRY_MAX | Maximum transport-failure replays of an identical request before surfacing the error. |
 | `network.replayRetryBaseMs` | number | 1500 (0 disables the delay) | BILI_REPLAY_RETRY_BASE_MS | Base backoff delay between replays (exponential). |
+| `network.throttle429Enabled` | boolean | true | BILI_THROTTLE_429 | Egress-side 429 governor (#4204): after consecutive upstream 429s, further sends to that origin+credential are answered locally with zero egress instead of being forwarded; set false to restore the legacy always-forward behavior. |
+| `network.throttle429MaxConsecutive` | number | 5 | BILI_THROTTLE_429_MAX_CONSECUTIVE | Consecutive upstream 429s before the hold turns terminal (local 424 outside every known SDK retry set); one probe per backoff window keeps checking until any non-429 response clears it. |
+| `network.throttle429BaseDelayMs` | number | 2000 | BILI_THROTTLE_429_BASE_DELAY_MS | Base backoff for the 429 hold (doubles per consecutive 429, jittered into [0.5×, 1×], capped by throttle429MaxDelayMs; an upstream Retry-After wins when larger). |
+| `network.throttle429MaxDelayMs` | number | 30000 | BILI_THROTTLE_429_MAX_DELAY_MS | Ceiling for the 429 hold backoff and for the terminal-phase probe interval. |
 | `network.maxShrinkPerCompress` | number | unset | BILI_MAX_SHRINK_PER_COMPRESS | Cap on how much one compression may shrink history (anti-collapse guard). |
 | `network.proxyKeepAliveMaxMs` | number | 55000 (0 = one-shot connections) | BILI_PROXY_KEEPALIVE_MAX_MS | Max lifetime of a connection through an outbound egress proxy before forcing reconnection (avoids stale NAT mappings). |
 | `network.postResponseLingerMs` | number | 5000 | BILI_POST_RESPONSE_LINGER_MS | Graceful-close budget for proxy-initiated closes after the response completed: the socket is held waiting for the peer's FIN/TLS close_notify and destroyed at the deadline (reason=linger-backstop). |
@@ -1825,6 +1829,10 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
+| `BILI_THROTTLE_429` | `network.throttle429Enabled` | true |
+| `BILI_THROTTLE_429_BASE_DELAY_MS` | `network.throttle429BaseDelayMs` | 2000 |
+| `BILI_THROTTLE_429_MAX_CONSECUTIVE` | `network.throttle429MaxConsecutive` | 5 |
+| `BILI_THROTTLE_429_MAX_DELAY_MS` | `network.throttle429MaxDelayMs` | 30000 |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | 180000 |
 | `BILI_UPDATE_POLICY_URL` | `update.policyUrl` | official repo raw URL |
 | `BILI_UPDATE_REGISTRY` | `update.registry` | "npmjs" (registry.npmjs.org) |

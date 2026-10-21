@@ -54,6 +54,7 @@ import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.
 import { clearUpstreamAlertsForHost, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind } from "../upstream-alerts.js";
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
 import { withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
+import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, upstreamThrottleLocalReject } from "../upstream-throttle.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { recordPckAblation } from "../pck-probe.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
@@ -740,6 +741,26 @@ export async function forward(
             hint: "upstream circuit open — the endpoint is unreachable and bili is failing fast instead of resending full context until a probe succeeds",
         });
     }
+    // #4204: egress-side 429 throttle governor — while consecutive sends to this
+    // origin+credential came back 429, answer LOCALLY (429 + Retry-After under
+    // budget, then a terminal 424 outside every known SDK retry set) instead of
+    // forwarding: a host-driven retry loop must not be amplified into egress
+    // that pins a concurrency-style provider limit for the whole account. Zero
+    // egress while held; one probe per backoff window keeps recovery automatic.
+    if (req.method !== "GET" && req.method !== "HEAD") {
+        const throttleReject = upstreamThrottleLocalReject(upstreamUrl, headers);
+        if (throttleReject !== undefined) {
+            log(throttleReject.status === 424 ? "warn" : "debug", `[${prepared?.session.id ?? "passthrough"}] [acp-proxy] 429-hold: answered locally with ${throttleReject.status} without egress (#4204)`);
+            if (res.headersSent) emitStreamError(res, prepared?.protocol ?? "openai", throttleReject.message, undefined, opts.streamErrorShape);
+            else {
+                res.writeHead(throttleReject.status, throttleReject.retryAfterSec !== null
+                    ? { "content-type": "application/json", "retry-after": String(throttleReject.retryAfterSec) }
+                    : { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: { type: "rate_limit_error", code: throttleReject.code, stage: "forward", message: throttleReject.message, retryable: throttleReject.status === 429 } }));
+            }
+            return;
+        }
+    }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     // #3701: the catch below replaces upstreamResult on a shrunken resend; capture the
     // FIRST attempt's timer handle separately because upstreamResult may never have been
@@ -1373,6 +1394,15 @@ export async function forward(
         if (bodyText.length > 600) snippet += " …";
         if (!snippet) snippet = "(no body)";
         loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}`);
+        // #4204: feed the egress throttle governor with this send's FINAL verdict
+        // (one observation per request — in-request refolds/resends above all
+        // converge into this same response handling). A 429 arms/extends the
+        // hold; ANY other resolved status proves the endpoint is processing
+        // again and clears it.
+        if (req.method !== "GET" && req.method !== "HEAD") {
+            if (upstream.status === 429) noteUpstreamThrottle429(upstreamUrl, headers, upstream.headers.get("retry-after"));
+            else noteUpstreamThrottleResolved(upstreamUrl, headers, upstream.status);
+        }
         // #762: persist the exact forwarded body on 4xx (env-gated: BILI_DUMP_4XX=1).
         if (upstream.status >= 400 && upstream.status < 500) {
             dumpRejectedBody(upstream.status, errSid, wireBody);
@@ -1414,6 +1444,11 @@ export async function forward(
         if (prepared !== null) respHeaders["x-bili-session"] = prepared.session.id;
         res.writeHead(upstream.status, respHeaders);
     }
+    // #4204: success-side counterpart of the non-2xx observation above — a
+    // resolved 2xx proves the endpoint is accepting sends again, so clear any
+    // hold on this origin+credential (counterpart needed because the non-ok
+    // branch returns early and never reaches this point).
+    if (req.method !== "GET" && req.method !== "HEAD") noteUpstreamThrottleResolved(upstreamUrl, headers, upstream.status);
     // #3376: idle prompt-cache keepalive — snapshot the EXACT accepted bytes
     // and arm the TTL-refresh timer. Pipeline-prepared requests only
     // (passthrough stays out of scope); internally gated to anthropic-wire
