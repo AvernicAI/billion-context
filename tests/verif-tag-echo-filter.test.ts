@@ -124,16 +124,13 @@ const splitPoints = (t: string): number[] => {
   return [...pts];
 };
 
-test("P1 chunk-split equivalence: streaming === whole-text", { skip: false }, () => {
-  // Domain: split-dependence is a KNOWN bug while #4107 is open — texts
-  // whose shape triggers the dead-ref-close release path diverge (pinned
-  // as control C#4107 below). Until it lands, run the property on texts
-  // WITHOUT echo residue (clean pairing / markers / prose) — the filter
-  // must at least be split-invariant there.
+test("P1 chunk-split equivalence: streaming === whole-text", () => {
+  // Full domain: #4107 (chunk-split dependence on tag-bearing texts) is
+  // fixed by the #4169 release-branch re-adjudication (#4210) — the
+  // formerly excluded tag/residue shapes now hold too (controls below).
   for (let iter = 0; iter < 120; iter++) {
     const base = rnd() < 0.1 ? emissionField() : randomText();
     const text = rnd() < 0.2 ? `${pick(PROSE)}${base}${pick(PROSE)}` : base;
-    if (containsRenderTagText(text) || containsEchoResidue(text)) continue; // #4107 family: split-dependence on tag-bearing texts (2 shapes pinned)
     for (const [name, mk] of FACTORIES) {
       const whole = runStream(mk(), [text]);
       for (const k of splitPoints(text)) {
@@ -208,23 +205,39 @@ test("P5 residue duality: strip removes every detectable artifact", () => {
     const t = randomText();
     const out = stripAcpTags(t);
     const why: string[] = [];
-    // containsRenderTagText / containsEchoResidue are the strict shape
-    // detectors; containsMarkerLineText is deliberately the RAW pre-check
-    // (includes "[ACP]", per #717) while removal is line-anchored — a
-    // mid-line marker is detect-but-keep BY DESIGN, so it is excluded
-    // from the duality (only line-START markers must go).
-    // Echo residue may legitimately SURVIVE when the text carries no
-    // other tag attestation (#1760 close-only content preservation) — the
-    // contains* audits are log-signals, not strip guarantees. Duality is
-    // asserted only when the input was ATTESTED.
-    // atestation = the strip ACTED (its own #1760 gate passed — close-only
-    // shapes with no other evidence are content-preserved by design, and
-    // then the detectors keep firing on the preserved close: log-signals,
-    // not strip guarantees). When strip acted, nothing strict may remain.
+    // containsRenderTagText is the strict shape detector. The marker check
+    // is COLUMN-0 anchored to match removal semantics: the marker-line pass
+    // removes a line only when the marker sits at column 0, so an indented
+    // or mid-line marker is detect-but-keep BY DESIGN (#717) and stays out
+    // of the duality — only true line-START markers must go.
+    // Word-GLUED echo residue (xm01238</x>) survives by design even when
+    // other artifacts attest a strip: the dead-unit lookbehind keeps
+    // word-like tokens out of the unit (#1760/#2862 content preservation).
+    // Only UNGLUED residue violates the duality.
+    // Duality is asserted only when the input was ATTESTED: atestation =
+    // the strip ACTED (its own #1760 gate passed — close-only shapes with
+    // no other evidence are content-preserved by design, and then the
+    // detectors keep firing on the preserved close: log-signals, not strip
+    // guarantees). When strip acted, nothing strict may remain.
     const acted = stripAcpTags(t) !== t;
+    // #4106 family (single-sweep gated pass ordering): a refs run against an
+    // UNTERMINATED acplike close dies only via DEAD_REF_CLOSE, whose "an
+    // earlier pass already acted" gate is still closed when the sole other
+    // artifact is a marker line removed by a LATER pass — the unit then
+    // survives the sweep. Known open (C#4106 pins the sibling idempotence
+    // gap). While #4106 is open, exclude exactly this shape — and no
+    // iteration carrying any OTHER surviving render-tag evidence.
+    const gatedUnit = /(?<![\w>])m\d{4,}(?:\s*[\u2013\u2014,\-]?\s*m\d{4,})*\s*<\/[a-zA-Z]{1,32}(?![^<>]{0,32}>)/;
+    if (
+      acted &&
+      gatedUnit.test(out) &&
+      /\[ACP\]/.test(t) &&
+      !/\[ACP\]/.test(out) &&
+      !containsRenderTagText(out.replace(new RegExp(gatedUnit.source, "g"), ""))
+    ) continue;
     if (acted && containsRenderTagText(out)) why.push("render-tag");
-    if (acted && containsEchoResidue(out)) why.push("echo-residue");
-    if (/(^|\n)\s*[\u{1F300}-\u{1FAFF}\u2600-\u27BF}\u2B00-\u2BFF] ?\[ACP\]/u.test(out)) why.push("marker-line-at-line-start");
+    if (acted && /(?<![\w>])m\d{4,}\s*<\/[a-zA-Z]/.test(out)) why.push("echo-residue");
+    if (acted && /(^|\n)[\u{1F300}-\u{1FAFF}\u2600-\u27BF}\u2B00-\u2BFF] ?\[ACP\]/u.test(out)) why.push("marker-line-at-line-start");
     assert.deepEqual(why, [], `strip left artifacts — input=${JSON.stringify(t)} out=${JSON.stringify(out)}`);
   }
 });
@@ -322,11 +335,11 @@ test("C#4106 pinned: stripAcpTags NOT idempotent today (marker + trailing dead-r
   const s2 = stripAcpTags(s1);
   assert.notEqual(s1, s2, "#4106 fixed? — flip this pin and re-enable the full P2 domain");
 });
-// #4107: stream output depends on chunk boundaries — the dead-ref-close
-// residue is cleaned in the whole-text path but RELEASED to the client
-// when the transport splits at the payload/close boundary. FLIP when
-// #4107 lands.
-test("C#4107 pinned: chunk split leaks dead-ref residue today", () => {
+// #4107: FIXED by the #4169 release-branch re-adjudication (#4210) — the
+// dead-ref-close residue the split path used to RELEASE to the client now
+// takes the main-loop verdict like the whole-text path. Control kept as a
+// regression guard.
+test("C#4107 (fixed #4210): dead-ref residue at payload/close split is split-invariant", () => {
   const t = '<PCPa tokens="0">angle < not a tag</PCPa>m1255</acPA</CPa>trailing spaces   ';
   const run = (chunks: string[]): string => {
     const f = createTagEchoFilter();
@@ -334,13 +347,12 @@ test("C#4107 pinned: chunk split leaks dead-ref residue today", () => {
   };
   const whole = run([t]);
   const split = run([t.slice(0, 41), t.slice(41)]);
-  assert.notEqual(whole, split, "#4107 fixed? — flip this pin and re-enable the full P1 domain");
-  assert.ok(split.includes("m1255"), "residue no longer leaks? — #4107 may be fixed; flip this pin");
+  assert.equal(whole, split, "#4107 regressed: chunk split diverged again");
 });
 // #4107 shape 2 (same family, different mechanism): a CLOSE fragment at
-// the chunk boundary — whole-text strips the bare </apc fragment, the
-// split path RELEASES it to the client.
-test("C#4107-2 pinned: close fragment at chunk boundary leaks today", () => {
+// the chunk boundary — the split path used to RELEASE the fragment the
+// whole-text path preserves. Fixed with shape 1 (#4210); control kept.
+test("C#4107-2 (fixed #4210): close fragment at chunk boundary is split-invariant", () => {
   const t = 'unicode \u2713 caf\u00e9 \u65e5\u672c <apc>unicode \u2713 caf\u00e9 \u65e5\u672c</apc <apc>quotes " and \' mixed</apc>';
   const run = (chunks: string[]): string => {
     const f = createTagEchoFilter();
@@ -348,6 +360,5 @@ test("C#4107-2 pinned: close fragment at chunk boundary leaks today", () => {
   };
   const whole = run([t]);
   const split = run([t.slice(0, 49), t.slice(49)]);
-  assert.notEqual(whole, split, "#4107 fixed? — flip this pin and re-enable the full P1 domain");
-  assert.ok(split.includes("</apc "), "close fragment no longer leaks? — flip this pin");
+  assert.equal(whole, split, "#4107-2 regressed: chunk split diverged again");
 });

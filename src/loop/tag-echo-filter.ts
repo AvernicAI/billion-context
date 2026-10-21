@@ -951,6 +951,13 @@ export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): Ta
 
 export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidueWarn?: (snippet: string) => void, absorbInstructed?: boolean, requestText?: string): TagEchoFilter {
     let held = "";
+    /** Settled prose deferred alongside a NON-definite tag-head tail: it
+     *  carries a dead ref-close unit whose verdict is content-determined
+     *  only at the tail's resolution — a resolved tag records a drop (gate
+     *  opens, unit stripped) while a prose tail leaves the gate closed
+     *  (#1760). Folded back at process() entry so the main loop re-runs
+     *  adjudication once the tail resolves (#4107 family, fifth shape). */
+    let preHeld = "";
     /** Last character actually emitted ("" at stream start). Extends the
      *  [\w>] orphan-unit lookbehind ACROSS chunk boundaries: a refs run
      *  arriving at the buffer head was preceded by whatever was emitted
@@ -1033,6 +1040,11 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
         }
         return out + s.slice(last);
     };
+    const deadUnitIn = (s: string): boolean => {
+        if (!s.includes("\x3c/")) return false;
+        const re = new RegExp(DEAD_REF_CLOSE.source, "g");
+        return re.exec(s) !== null;
+    };
     /** Character immediately before the refs run of an orphan-unit match —
      *  within the buffer, or the last emitted char when the run sits at the
      *  buffer head (chunk boundary). */
@@ -1042,11 +1054,32 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
         return pos === 0 ? lastEmitted : s[pos - 1];
     };
     const process = (input: string): string => {
-        let buf = input;
+        // Deferred settled prose re-enters ahead of fresh input so its dead
+        // unit takes the verdict of whatever the pending tail resolves to.
+        let buf = preHeld + input;
+        preHeld = "";
         let out = "";
         for (;;) {
             if (swallowUntilClose) {
                 const combined = swallowed + buf;
+                // #2190/#4107: a completed degenerate unit at the payload
+                // head (single-ref body against any short close) dies
+                // atomically in whole-text (DEGEN_PAIR) whatever else follows
+                // — including a later acplike close, which would otherwise win
+                // the resolution race and release the body as prose with its
+                // dead close still inside (#4107 family, seventh shape).
+                // Consume such units before the loose-close resolution; the
+                // session ends here exactly as on the no-acplike-close path.
+                if (swallowReleases) {
+                    const dspan = degenCloseAfterRef(combined);
+                    if (dspan !== null) {
+                        dropSwallowSpan(combined.slice(0, dspan.end));
+                        swallowed = "";
+                        swallowUntilClose = false;
+                        buf = combined.slice(dspan.end);
+                        continue;
+                    }
+                }
                 const span = looseCloseSpan(combined);
                 if (span !== null) {
                     // Only a refs-only body is tag content (#1720/#2023): a
@@ -1083,21 +1116,6 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     swallowed = "";
                     swallowUntilClose = false;
                     continue;
-                }
-                if (swallowReleases) {
-                    // #2190: a degenerate close ends the span too. The body is
-                    // ref-shaped by construction (degenCloseAfterRef), so the
-                    // drop-whole rule applies unconditionally — wrapped mode
-                    // never reaches here (its payload may contain arbitrary
-                    // markup and must be discarded whole).
-                    const dspan = degenCloseAfterRef(combined);
-                    if (dspan !== null) {
-                        dropSwallowSpan(combined.slice(0, dspan.end));
-                        swallowed = "";
-                        swallowUntilClose = false;
-                        buf = combined.slice(dspan.end);
-                        continue;
-                    }
                 }
                 if (combined.length > swallowLimit) {
                     if (swallowReleases) {
@@ -1211,19 +1229,41 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     const cap = definite ? TAG_OPEN_CAP : refsShaped ? IMITATION_SWALLOW_CAP : HOLD_LIMIT;
                     // The settled prefix may already hold a dead unit while
                     // only the trailing head stays held — clean it on release.
-                    const pre = stripDeadRefCloses(buf.slice(0, buf.length - t[0].length));
+                    // A definite tail is guaranteed attestation: it always
+                    // resolves into a recorded drop (complete tag → match
+                    // drop, a second \x3c → broken-attrs drop, EOF →
+                    // TRUNC_OPEN/TRUNC_CLOSE flush drop), so force the gate
+                    // for the prefix ahead of it — otherwise a unit settling
+                    // before the tail survives when the tail's closing \x3e
+                    // lands in a later chunk, while whole-text strips it
+                    // (#4107 family, third shape).
+                    // A NON-definite tail may still resolve either way, so a
+                    // unit settled ahead of it cannot be judged yet: defer
+                    // the whole prefix with the tail (preHeld) and let the
+                    // main loop re-adjudicate at resolution — a resolved
+                    // tag records a drop and opens the gate, a prose tail
+                    // leaves it closed (#1760) (#4107 family, fifth shape).
+                    const rawPre = buf.slice(0, buf.length - t[0].length);
                     if (t[0].length <= cap) {
                         held = t[0];
-                        out += pre;
+                        if (definite) {
+                            preHeld = "";
+                            out += stripDeadRefCloses(rawPre, true);
+                        } else {
+                            preHeld = deadUnitIn(rawPre) ? rawPre : "";
+                            if (preHeld === "") out += rawPre;
+                        }
                     } else if (definite) {
                         drop(t[0]);
                         // The dropped tail IS this response's attestation even
                         // though its drop was only just recorded — force the
                         // gate or a settled unit ahead of it leaks raw.
-                        out += stripDeadRefCloses(buf.slice(0, buf.length - t[0].length), true);
+                        preHeld = "";
+                        out += stripDeadRefCloses(rawPre, true);
                     } else {
                         // Same release-as-prose semantics as the short path:
                         // a settled dead unit dies when an echo is attested.
+                        preHeld = "";
                         out += stripDeadRefCloses(buf);
                     }
                 } else {
@@ -1254,6 +1294,22 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             // session's first counted span; every other match is self-contained.
             if (m === o) {
                 const bare = !OPEN_WITH_ATTRS.test(m[0]);
+                if (bare) {
+                    // A single-ref body against any short close is a
+                    // degenerate pair: whole-text drops the unit WHOLE
+                    // (DEGEN_PAIR) whatever else shares the chunk — dropping
+                    // only the open here would leave the body's fate to
+                    // whether a later open landed in the same buffer
+                    // (#4107 family). One logical artifact: the open records,
+                    // the body+close counts.
+                    const dspan = degenCloseAfterRef(buf);
+                    if (dspan !== null) {
+                        recordDrop(m[0]);
+                        drop(buf.slice(0, dspan.end));
+                        buf = buf.slice(dspan.end);
+                        continue;
+                    }
+                }
                 if (bare && (PAIRED.exec(buf) !== null || LONE_OPEN.exec(buf) !== null)) {
                     drop(m[0]);
                     continue;
@@ -1344,8 +1400,9 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             // #2862: dead ref-close units die before the truncate branches —
             // TRUNC_CLOSE would otherwise eat the \x3c/name tail at EOF and
             // shadow the unit down to a bare ref (#2348 v4 ordering).
-            const rest = stripDeadRefCloses(swallowed + held);
+            const rest = stripDeadRefCloses(preHeld + swallowed + held);
             const wasSwallowing = swallowUntilClose;
+            preHeld = "";
             swallowed = "";
             held = "";
             swallowUntilClose = false;
@@ -1375,7 +1432,55 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                         dropSwallowSpan(rest);
                         result = "";
                     } else {
-                        result = rest;
+                        // Payload accumulated under the session may carry
+                        // COMPLETE structures the main loop never saw (they
+                        // arrived in later pushes while the session held) —
+                        // whole-text strips them, verbatim release leaked
+                        // them raw (#4107 family, sixth shape). Re-run the
+                        // main loop over the payload and drain whatever it
+                        // defers at true EOF with the same verdicts.
+                        let r = "";
+                        let payload = rest;
+                        let prev = "";
+                        for (let guard = 0; ; guard++) {
+                            const emitted = process(payload);
+                            if (emitted.length > 0) lastEmitted = emitted[emitted.length - 1];
+                            r += emitted;
+                            payload = preHeld + swallowed + held;
+                            preHeld = "";
+                            swallowed = "";
+                            held = "";
+                            swallowUntilClose = false;
+                            if (payload === "") break;
+                            const t2 = new RegExp(TRUNC_OPEN.source).exec(payload);
+                            if (t2 !== null) {
+                                dropSwallowSpan(t2[0]);
+                                r += payload.slice(0, t2.index);
+                                break;
+                            }
+                            const tc2 = new RegExp(TRUNC_CLOSE.source).exec(payload);
+                            if (tc2 !== null) {
+                                dropSwallowSpan(tc2[0]);
+                                r += payload.slice(0, tc2.index);
+                                break;
+                            }
+                            // Refs-only drop applies to the WHOLE payload only
+                            // (an imitated marker list, #2023) — once prose
+                            // ahead of a refs tail was emitted, the tail is a
+                            // prose-cited ref and must be released (#1760).
+                            if (r === "" && REFS_ONLY.test(payload)) {
+                                dropSwallowSpan(payload);
+                                break;
+                            }
+                            if (payload === prev || guard >= 64) {
+                                // No progress possible (pure partial tail) or
+                                // pathological nesting — release what remains.
+                                r += payload;
+                                break;
+                            }
+                            prev = payload;
+                        }
+                        result = r;
                     }
                 }
             } else {
@@ -1410,7 +1515,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             return droppedAny;
         },
         pending(): boolean {
-            return held.length > 0 || swallowUntilClose;
+            return held.length > 0 || preHeld.length > 0 || swallowUntilClose;
         },
         stats(): TagEchoFilterStats {
             return { inputChars, outputChars, dropped: droppedAny, dropCount };
