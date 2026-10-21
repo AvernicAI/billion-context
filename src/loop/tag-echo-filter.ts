@@ -1352,9 +1352,13 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
             return r;
         },
         flush(): string {
+            let preOut = "";
             if (tcHold !== "off") {
                 // The field ended while its head was held: decide the whole
-                // field, then hand any non-emission rest to the normal path.
+                // field, then hand any non-emission rest to the settle below.
+                // No early returns of process() output here: process can leave
+                // a partial tail in held or a live swallow session, and
+                // returning directly dropped both silently at EOF.
                 tcHold = "off";
                 const field = held;
                 held = "";
@@ -1364,23 +1368,23 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     if (span !== null) {
                         if (!emissionEchoesRequest(field.slice(span.start, span.end), requestText)) {
                             drop(field.slice(0, span.end));
-                            const rest = field.slice(span.end);
-                            if (rest.length === 0) return "";
-                            const r = process(rest);
-                            outputChars += r.length;
-                            return r;
+                            preOut += process(field.slice(span.end));
+                        } else {
+                            // The span mirrors the request verbatim (m00885):
+                            // the user asked for this fragment as the whole
+                            // response — it is user intent, so it flows
+                            // through untouched.
+                            preOut += process(field);
                         }
-                        // The span mirrors the request verbatim (m00885): the
-                        // user asked for this fragment as the whole response —
-                        // it is user intent, so it flows through untouched.
                     } else if (isOrphanToolCallTail(field)) {
                         drop(field);
                         return "";
+                    } else {
+                        preOut += process(field);
                     }
+                } else {
+                    preOut += process(field);
                 }
-                const r = process(field);
-                outputChars += r.length;
-                return r;
             }
             // #2862: dead ref-close units die before the truncate branches —
             // TRUNC_CLOSE would otherwise eat the \x3c/name tail at EOF and
@@ -1442,6 +1446,11 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                 drop(result.slice(cut.index));
                 result = result.slice(0, cut.index);
             }
+            // #4164: EOF resolves any still-held settle as prose — no tag ever
+            // completed to attest it, so the units survive (#1760), in input
+            // order ahead of the settled tail. preOut (tcHold path) precedes
+            // both.
+            result = preOut + resolvePendingSettle(false) + result;
             if (result.length > 0) lastEmitted = result[result.length - 1];
             if (result.length > 0 && onResidueWarn && containsEchoResidue(result)) onResidueWarn(result);
             outputChars += result.length;
