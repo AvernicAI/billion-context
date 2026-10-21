@@ -1057,13 +1057,31 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void, onResidu
                     const inner = combined.slice(0, span.start);
                     if (REFS_ONLY.test(inner) || !swallowReleases) {
                         dropSwallowSpan(combined.slice(0, span.end));
+                        buf = combined.slice(span.end);
                     } else {
-                        out += inner;
-                        dropSwallowSpan(combined.slice(span.start, span.end));
+                        // #4169: the body is released as prose, but its own
+                        // tag-shaped echoes take the SAME verdicts as any other
+                        // text — whole-text strips a nested bare open inside an
+                        // attrs payload (LONE_OPEN pass), and streaming must
+                        // agree on the same bytes. Consume only the close and
+                        // splice the body back ahead of the remainder so the
+                        // main loop re-adjudicates it. A nested open left
+                        // TRUNCATED at the body's end is one broken attrs run
+                        // with this close (whole-text wrappedSpan semantics) —
+                        // drop both together instead of holding the head past
+                        // the close for content that arrived before it.
+                        const t = TRUNC_OPEN.exec(inner);
+                        if (t !== null) {
+                            out += stripDeadRefCloses(inner.slice(0, t.index));
+                            dropSwallowSpan(combined.slice(t.index, span.end));
+                            buf = combined.slice(span.end);
+                        } else {
+                            dropSwallowSpan(combined.slice(span.start, span.end));
+                            buf = inner + combined.slice(span.end);
+                        }
                     }
                     swallowed = "";
                     swallowUntilClose = false;
-                    buf = combined.slice(span.end);
                     continue;
                 }
                 if (swallowReleases) {

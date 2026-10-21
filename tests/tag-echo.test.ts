@@ -505,6 +505,38 @@ test("streaming filter still drops a ref echo whose open tag arrives alone in a 
     assert.ok(f.dropped());
 });
 
+// #4169: a nested bare open inside an attrs payload must take the same verdict
+// in streaming as in whole-text (LONE_OPEN pass) — the close-resolution release
+// used to hand the body to the client verbatim, leaking the nested tag while
+// whole-text stripped it.
+test("streaming strips a nested bare open inside an attrs payload like whole-text, at every split (#4169)", () => {
+    const full = `A ${OPEN}tokens="1" type="text">junk${LT}acp>text${CLOSE}B.`;
+    const expected = stripAcpTags(full);
+    assert.equal(expected, "A junktextB.", "whole-text reference strips the nested bare open");
+    for (let split = 0; split <= full.length; split++) {
+        const f = createTagEchoFilter();
+        const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+        assert.equal(out, expected, `split=${split}`);
+    }
+});
+
+test("streaming matches whole-text for nested structures inside attrs payloads (#4169)", () => {
+    const shapes = [
+        `A ${OPEN}tokens="1" type="text">x${LT}acp>y${CLOSE}z${CLOSE}B.`,
+        `A ${OPEN}tokens="1" type="text">x${LT}acp tokens="2">y${CLOSE}z${CLOSE}B.`,
+        `A ${OPEN}tokens="1" type="text">${LT}acp>m00001${CLOSE}${CLOSE}B.`,
+        `A ${OPEN}tokens="1" type="text">x${LT}acp tokens="2 y${CLOSE}z`,
+    ];
+    for (const full of shapes) {
+        const expected = stripAcpTags(full);
+        for (let split = 0; split <= full.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+            assert.equal(out, expected, `split=${split} full=${JSON.stringify(full)}`);
+        }
+    }
+});
+
 // #1731 replaced the old open-side attr caps ({0,256}/{0,512}): a longer run
 // escaped every open-tag matcher while the loose close still went, leaving
 // orphan markup on the wire. [^<>] cannot cross a bracket, so the uncapped
