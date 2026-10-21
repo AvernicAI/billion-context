@@ -153,6 +153,18 @@ function userDisplayText(
   return !text || (hasImage && !hasTextPart) ? "[image]" : text;
 }
 
+/** Parse-side twin of the split gate in responsesToCore: does this part
+ *  produce exactly one user core (non-empty text part, or image part with a
+ *  string URL)? Rebuild-side full coverage counts parts with THIS predicate
+ *  so its count matches the cores the parse actually emitted. */
+function producesUserCore(part: ResponseContentPart): boolean {
+  if (typeof part !== "object" || part === null) return false;
+  if (part.type === "input_text" || part.type === "output_text")
+    return typeof part.text === "string" && part.text.length > 0;
+  if (part.type === "input_image") return typeof part.image_url === "string";
+  return false;
+}
+
 /** Extract the reasoning text from a responses reasoning item. The host
  *  carries it in `content` (reasoning_text parts); the primeFold mirror
  *  carries it in `summary` (summary_text parts). Both must yield the same
@@ -747,91 +759,155 @@ export function coreToResponses(
   customToolCallIds: Set<string> = new Set(),
 ): ResponseInputItem[] {
   const out: ResponseInputItem[] = [];
-  // #3642: canonical granularity splits one user item into one core per
-  // part, so consecutive user cores are a RUN that rebuilds as ONE wire
-  // item. Full coverage (every part's core present, run length == part
-  // count) rebuilds the original item VERBATIM — byte-exact for the
-  // untouched case. A partial run (some parts' cores folded away) rebuilds
-  // a FILTERED view: only the surviving parts, never resurrecting folded
-  // content from the raw sidecar.
+  // Single-core rendering (historical single-core path, byte-identical):
+  // verbatim when the core's text matches the item's display text, image
+  // items re-emit their input_image parts, otherwise plain text.
+  const flushUserCore = (message: CoreMessage) => {
+    const raw = (message as BiliMessage)
+      .rawResponsesItem as ResponseInputItem | undefined;
+    const rawMessage =
+      raw?.type === "message" ? (raw as ResponseInputMessage) : undefined;
+    if (
+      rawMessage &&
+      userDisplayText(
+        rawMessage.content,
+        messageContent(rawMessage.content),
+      ) === (message.text ?? "")
+    )
+      out.push(rawMessage);
+    else if (
+      ((message as BiliMessage).imagePart ||
+        (message as BiliMessage).text === CANONICAL_IMAGE_TEXT) &&
+      rawMessage &&
+      Array.isArray(rawMessage.content)
+    )
+      out.push({
+        type: "message",
+        role: "user",
+        content: rawMessage.content.filter(
+          (part) => part.type === "input_image",
+        ),
+      });
+    else
+      out.push({
+        type: "message",
+        role: "user",
+        content: message.text ?? "",
+      });
+  };
+  // #3642/#4150: canonical granularity splits one user item into one core
+  // per part, so consecutive user cores form a RUN that spans ITEMS — each
+  // source item contributes its own contiguous slice of the run. The run is
+  // therefore rebuilt PER SOURCE ITEM: groups are keyed by wireIndex (the
+  // item's position in body.input), falling back to sidecar identity for
+  // foreign cores without wireIndex, and standalone for cores with neither.
+  // #4150 was exactly the conflation of this span: the FIRST sidecar core
+  // was taken as THE carrier for the whole run, so a string-content item
+  // ahead of a multi-part item starved the image cores of their parts (the
+  // image silently dropped) and the items merged into one. Per group:
+  //   full coverage + unchanged bytes ⇒ the original item VERBATIM
+  //     (byte-exact untouched case, cross-lane consistent with
+  //     patchResponsesInput's slot.original fast path);
+  //   partial survival ⇒ a FILTERED view of that item's surviving parts —
+  //     images resolved from the group's OWN item, never resurrecting
+  //     folded content from the raw sidecar (#3642 contract);
+  //   no raw sidecar (text-only split item) ⇒ synthesize from the cores.
+  // Single-core groups keep the historical rendering exactly.
   const flushUserRun = (run: CoreMessage[]) => {
     if (run.length === 0) return;
     if (run.length === 1) {
-      const message = run[0]!;
-      const raw = (message as BiliMessage)
-        .rawResponsesItem as ResponseInputItem | undefined;
-      const rawMessage =
-        raw?.type === "message" ? (raw as ResponseInputMessage) : undefined;
-      if (
-        rawMessage &&
-        userDisplayText(
-          rawMessage.content,
-          messageContent(rawMessage.content),
-        ) === (message.text ?? "")
-      )
-        out.push(rawMessage);
-      else if (
-        ((message as BiliMessage).imagePart ||
-          (message as BiliMessage).text === CANONICAL_IMAGE_TEXT) &&
-        rawMessage &&
-        Array.isArray(rawMessage.content)
-      )
-        out.push({
-          type: "message",
-          role: "user",
-          content: rawMessage.content.filter(
-            (part) => part.type === "input_image",
-          ),
-        });
-      else
-        out.push({
-          type: "message",
-          role: "user",
-          content: message.text ?? "",
-        });
+      flushUserCore(run[0]!);
       return;
     }
-    const rawCarrier = run.find(
-      (m) => (m as BiliMessage).rawResponsesItem !== undefined,
-    ) as BiliMessage | undefined;
-    const rawItem = rawCarrier?.rawResponsesItem as
-      | ResponseInputItem
-      | undefined;
-    const rawMessage =
-      rawItem?.type === "message"
-        ? (rawItem as ResponseInputMessage)
-        : undefined;
-    const fullCover =
-      rawMessage &&
-      Array.isArray(rawMessage.content) &&
-      rawMessage.content.length === run.length;
-    if (fullCover && rawMessage) {
-      out.push(rawMessage);
-      return;
-    }
-    const imageParts =
-      rawMessage && Array.isArray(rawMessage.content)
-        ? rawMessage.content.filter((part) => part.type === "input_image")
-        : [];
-    let img = 0;
-    const parts: ResponseContentPart[] = [];
+    type RunGroup = {
+      wire?: number;
+      rawKey?: unknown;
+      raw?: ResponseInputMessage;
+      cores: CoreMessage[];
+    };
+    const groups: RunGroup[] = [];
     for (const message of run) {
       const bili = message as BiliMessage;
-      // Image-ness is structural (parse-time flag), never text equality:
-      // render/ref-tag injection rewrites the marker, and image parts have
-      // no text slot to carry a tag.
-      if (bili.imagePart && bili.rawResponsesItem) {
-        const part = imageParts[img++];
-        if (part) parts.push(part);
-      } else if (bili.text) {
-        parts.push({ type: "input_text", text: bili.text });
+      const rawItem = bili.rawResponsesItem as ResponseInputItem | undefined;
+      let group = groups[groups.length - 1];
+      const joinsCurrent =
+        group !== undefined &&
+        (bili.wireIndex !== undefined
+          ? bili.wireIndex === group.wire
+          : group.rawKey !== undefined &&
+            group.rawKey === bili.rawResponsesItem);
+      if (group === undefined || !joinsCurrent) {
+        group = {
+          ...(bili.wireIndex !== undefined
+            ? { wire: bili.wireIndex }
+            : { rawKey: rawItem }),
+          cores: [],
+        };
+        groups.push(group);
       }
+      if (!group.raw && rawItem?.type === "message")
+        group.raw = rawItem as ResponseInputMessage;
+      group.cores.push(message);
     }
-    out.push({
-      type: "message",
-      role: "user",
-      content: parts.length > 0 ? parts : "",
-    });
+    for (const group of groups) {
+      if (group.cores.length === 1) {
+        flushUserCore(group.cores[0]!);
+        continue;
+      }
+      const raw = group.raw;
+      if (raw && Array.isArray(raw.content)) {
+        const producing = raw.content.filter(producesUserCore);
+        const full = producing.length === group.cores.length;
+        const unchanged =
+          full &&
+          group.cores.every((m, k) => {
+            const part = producing[k];
+            const bili = m as BiliMessage;
+            if (part?.type === "input_image")
+              return (
+                bili.imagePart === true ||
+                bili.text === CANONICAL_IMAGE_TEXT
+              );
+            return (
+              (bili.text ?? "") ===
+              (typeof part?.text === "string" ? part.text : "")
+            );
+          });
+        if (full && unchanged) {
+          out.push(raw);
+          continue;
+        }
+        const imageParts = raw.content.filter(
+          (part) => part.type === "input_image",
+        );
+        let img = 0;
+        const parts: ResponseContentPart[] = [];
+        for (const m of group.cores) {
+          const bili = m as BiliMessage;
+          // Structural flag only, no text-equality fallback here (unlike
+          // flushUserCore): every split image core carries imagePart, while
+          // a user text part may legitimately read "[image]" — equality
+          // would misclassify it and steal an image slot.
+          if (bili.imagePart === true) {
+            const part = imageParts[img++];
+            if (part) parts.push(part);
+          } else if (bili.text) {
+            parts.push({ type: "input_text", text: bili.text });
+          }
+        }
+        if (parts.length > 0)
+          out.push({ ...raw, content: parts } as ResponseInputItem);
+        continue;
+      }
+      const parts = group.cores.flatMap((m) => {
+        const bili = m as BiliMessage;
+        return bili.text
+          ? [{ type: "input_text" as const, text: bili.text }]
+          : [];
+      });
+      if (parts.length > 0)
+        out.push({ type: "message", role: "user", content: parts });
+    }
   };
   let userRun: CoreMessage[] = [];
   for (const message of messages) {
@@ -851,11 +927,30 @@ export function coreToResponses(
       });
       } else if (message.role === "assistant") {
       if (message.contentType === "text") {
-        out.push({
-          type: "message",
-          role: "assistant",
-          content: message.text ?? "",
-        });
+        // #4150 observation 2: the assistant lane gets the same raw-sidecar
+        // verbatim fast path the user lane has — an array-content item whose
+        // text survived unrewritten round-trips BYTE-EXACT (shape included);
+        // stringified output diverged from patchResponsesInput's
+        // slot.original on the same state (prefix-cache seam, #3837 family).
+        // Rewritten text (ref-tag/render/demoted-thinking split) fails the
+        // equality and keeps the synthesized string form below.
+        const rawMessage =
+          raw?.type === "message"
+            ? (raw as ResponseInputMessage)
+            : undefined;
+        if (
+          rawMessage &&
+          rawMessage.role === "assistant" &&
+          Array.isArray(rawMessage.content) &&
+          messageContent(rawMessage.content) === (message.text ?? "")
+        )
+          out.push(rawMessage);
+        else
+          out.push({
+            type: "message",
+            role: "assistant",
+            content: message.text ?? "",
+          });
       } else if (message.contentType === "tool-call") {
         const callId = message.toolCallId ?? `call_${message.id}`;
         if (customToolCallIds.has(callId)) {
