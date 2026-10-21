@@ -31,11 +31,14 @@
 # disable.ts) registers BEFORE that preset resolves. Per that module's own
 # contract the guarantee covers only GATED ("protected") presets; an ungated
 # custom preset resolves by import order, which the upstream plugin explicitly
-# warns not to rely on. If such a preset resolves before the overlay registers,
-# its compaction-basic AND command-compact rows are never disabled -> a dsh
-# compaction checkpoint lands outside bili's knowledge and destroys the
-# compression substrate (#3354/#1772/#1729). Your own `auto: false` stops only
-# AUTO-trigger; it does NOT cover command-compact.
+# warns not to rely on. This is a TIMING WINDOW, not a certainty: if such a
+# preset happens to resolve before the overlay registers, its compaction-basic
+# AND command-compact rows may never be disabled. The direct effect is silent
+# misbehavior (the preset loads, but compaction is armed when it should not be);
+# the worst case is a dsh compaction checkpoint landing outside bili's knowledge
+# and destroying the compression substrate (#3354/#1772/#1729) — which needs
+# compaction to actually run. Your own `auto: false` blocks auto-trigger for
+# compaction-basic but NOT command-compact.
 #
 # If your profile uses custom preset ids, SELF-GATE each one by adding
 #     inject: [biliBasicCompactionPolicy]
