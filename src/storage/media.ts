@@ -59,7 +59,7 @@ export const SPLIT_MEDIA_URL = /^data:([^;,]+);base64,\$media:([0-9a-f]{64})$/;
 const SPLIT_MARKERS = ["\"imageBase64\"", "\"rawOpenaiContent\"", "\"rawOpenaiContentParts\""];
 export const HYDRATE_MARKERS = ["\"$media\"", "$media:"];
 
-export interface MediaRef { hash: string; bytes: string }
+interface MediaRef { hash: string; bytes: string }
 
 interface RawOpenaiImagePart { image_url: { url: unknown } }
 
