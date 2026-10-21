@@ -224,3 +224,25 @@ test("formatConflictSection: mixed orphan + suspected ledger keeps the existing 
     assert.ok(text.includes("confirm each named plugin"), text);
     assert.ok(text.endsWith(CONFLICT_DOCS_POINTER), text);
 });
+
+test("formatConflictSection: id-churn-adoption-only ledger gets bili-own re-mint framing, not the [suspected]-plugin bucket (#4131 review)", () => {
+    const adoption = (at: number): ConflictEvent[] => [
+        { at, kind: "id-churn-adoption", detail: "95/392 incoming message(s) carry pre-turn refs of 387 known; fold-reconcile re-anchored every covered id (0 unmatched) — bili-side id re-mint across builds (#3642), not a client rewrite — no compaction boundary (#4131)" },
+    ];
+
+    const activeText = formatConflictSection(adoption(Date.now() - 60_000), Date.now(), "opencode").join("\n");
+    assert.ok(activeText.includes("bili's OWN cross-build id re-mints"), activeText);
+    assert.ok(activeText.includes("NO second compressor to hunt for"), activeText);
+    // the misclassification this test pins: no external-interference header, no
+    // plugin-hunt advice, no per-client remediation footer on a bili-owned event
+    assert.ok(!activeText.includes("something outside bili touched"), activeText);
+    assert.ok(!activeText.includes("Two compressors on one conversation"), activeText);
+    assert.ok(!activeText.includes("confirm each named plugin"), activeText);
+    assert.ok(!activeText.includes("Fix (opencode):"), activeText);
+    assert.ok(!activeText.endsWith(CONFLICT_DOCS_POINTER), activeText);
+
+    const stockText = formatConflictSection(adoption(Date.now() - 30 * DAY), Date.now()).join("\n");
+    assert.ok(stockText.includes("historical stock"), stockText);
+    assert.ok(stockText.toLowerCase().includes("clear this ledger"), stockText);
+    assert.ok(!stockText.endsWith(CONFLICT_DOCS_POINTER), stockText);
+});

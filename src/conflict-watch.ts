@@ -203,10 +203,17 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
     // landing was fully rebased onto (#2372/#2432) — handled, no ongoing risk. Gated to the
     // pure case so mixed ledgers keep their existing tier verbatim.
     const handledNativeOnly = meaningful.length > 0 && meaningful.every((e) => e.kind === "native-compaction");
+    // #4131 review: an adoption-only ledger is bili's OWN fully-handled cross-build
+    // id re-mint (#3642 D1) — not external interference; the [suspected]-plugin
+    // tiers below would misframe it (same class as #2802 orphan-only / #2912
+    // handled-native-only).
+    const adoptionOnly = meaningful.length > 0 && meaningful.every((e) => e.kind === "id-churn-adoption");
     const activeConfirmed = confirmed.some((e) => now - e.at <= CONFLICT_ACTIVE_WINDOW_MS);
     lines.push(`COMPRESSION CONFLICTS — ${events.length} event(s) in this session (${active.length} active · ${historical.length} historical; active = within ${CONFLICT_ACTIVE_WINDOW_MS / 86_400_000} days). ${foreignConfirmed || nativePresent
         ? "Two compressors on one conversation (bili + another compression plugin — third-party or bili's own sibling — or client native compaction) double-compress and corrupt message refs:"
-        : "Diagnostic evidence that something outside bili touched this conversation — how strong that evidence is is tiered below:"}`);
+        : adoptionOnly
+            ? "Bili's own cross-build id re-mints (#3642/#4131), adopted with full fold re-anchor — nothing outside bili touched this conversation:"
+            : "Diagnostic evidence that something outside bili touched this conversation — how strong that evidence is is tiered below:"}`);
     for (const e of events.slice(-10)) {
         lines.push(`  [${fmtTime(e.at)}] ${e.kind} — ${e.detail}`);
     }
@@ -222,6 +229,7 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
     //   foreign confirmed        -> strong one-compressor command (live) or verify-then-clear (stock)
     //   native landing (no foreign)-> host-side explanation, no plugin hunt (#2432)
     //   identity-orphan only     -> host-lane identity loss, no second compressor (#2802 review)
+    //   id-churn-adoption only   -> bili's own re-mint adopted, no external cause (#4131 review)
     //   pure [suspected]         -> #1736 soft wording
     //   unconfirmed signals      -> "cause not identified" framing, never imperative
     let advice: string;
@@ -247,6 +255,14 @@ export function formatConflictSection(events: ConflictEvent[], now: number = Dat
         advice = active.length > 0
             ? "The events above are client-native compaction landings bili ALREADY rebased onto (#2372/#2432): each detected checkpoint rebuilt the fold base, so there is no ongoing double-compression risk and nothing to disable. If you did not expect these sessions to auto-compact, review the client's own auto-compaction setting; otherwise clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>."
             : "All events above are client-native compaction landings older than 7 days (historical stock) that bili already rebased onto (#2372/#2432): handled at the time, no ongoing risk. Clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear?session=<id>.";
+    } else if (adoptionOnly) {
+        // #4131 review: bili ADOPTED its own cross-build id re-mint with full fold
+        // re-anchor — no external cause exists, so neither the [suspected]-plugin
+        // wording nor any remediation command applies (same misframing class as
+        // #2802/#2912).
+        advice = active.length > 0
+            ? "The events above are bili's OWN cross-build id re-mints (#3642/#4131): after an upgrade restart bili re-minted non-text message ids and fold-reconcile re-anchored every covered id, so it ADOPTED the re-minted history instead of marking a destructive compaction boundary — there is NO second compressor to hunt for and nothing to disable. If you did not expect this upgrade churn, check your auto-update settings; otherwise clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear."
+            : "All events above are bili's own cross-build id re-mints older than 7 days (historical stock): each was adopted with full fold re-anchor at the time, no ongoing risk. Clear this ledger — Web UI conflict banner / session page, or POST /__bili/conflicts/clear.";
     } else if (orphanOnly) {
         // #2802 review: identity-loss takeover (#2791 family) — bili KNOWS what
         // happened (its own resolver detected the headerless replay of this
