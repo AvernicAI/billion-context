@@ -420,7 +420,30 @@ export function stripMarkerLines(text: string): string {
     return text.replace(MARKER_LINE, "");
 }
 
-export function stripAcpTags(text: string, dropToolCallEmission = false, requestText?: string): string {
+// #4106: input-side attestation for the DEAD_REF_CLOSE gate. Evidence produced
+// by channels that run AFTER the gate (a truncated open at EOF, a forged
+// marker line, a bili chain carrier / header block) is computed ONCE on the
+// original text here, before any pass mutates it. The old gate (`out !==
+// text`, evaluated mid-pipeline) only saw what earlier channels had already
+// deleted, so a marker line stripped later in the SAME call never attested —
+// and a second cleanup call shrank the bytes further: the verdict depended on
+// prior cleanup state, not on content. Close-side channels (TRUNC_CLOSE /
+// TRUNC_REF_CLOSE) are deliberately NOT attestation: they are the same
+// close-only family the gate protects (#1760/#644 — a lone truncated close
+// without other echo evidence stays content-preserved, bare ref included).
+const MARKER_LINE_PROBE = new RegExp(MARKER_LINE.source, "mu"); // MARKER_LINE is /gmu — .test() on it is lastIndex-stateful
+function laterChannelAttested(text: string): boolean {
+    return TRUNC_OPEN.test(text)
+        || MARKER_LINE_PROBE.test(text)
+        || nextChainSpan(text) !== null
+        || headBlockCut(text) >= 0;
+}
+
+/** One application of the full channel pipeline over one field. `attested`
+ *  carries the input-side evidence computed once on the ORIGINAL text
+ *  (#4106); `out !== text` adds this pass's own earlier-channel removals as
+ *  evidence. */
+function stripPass(text: string, dropToolCallEmission: boolean, requestText: string | undefined, attested: boolean): string {
     // A whole-field tool-call emission first: the field IS the call, so the
     // span goes whole (see toolCallEmissionSpan). Gated by the caller; the
     // m00885 echo check keeps a span the user asked to be emitted verbatim.
@@ -469,10 +492,14 @@ export function stripAcpTags(text: string, dropToolCallEmission = false, request
     // passes: their removals ARE the same-text attestation (an unclosed open or
     // a degen pair count too, not just an already-stripped span), and stripping
     // an open also un-glues a ref that sat right after its \x3e so the [\w>]
-    // lookbehind admits it. A close-only shape with no other echo evidence
-    // leaves out === text and stays content-preserved (#1760); such sightings
-    // remain observable via the residue audits.
-    if (out !== text) {
+    // lookbehind admits it. The gate is `attested || out !== text`: this pass's
+    // own earlier-channel removals, plus the input-side evidence computed once
+    // on the original text (#4106 — later channels' shapes count too, so the
+    // verdict rides the CONTENT, not on what an earlier cleanup already did).
+    // A close-only shape with no other echo evidence leaves both terms false
+    // and stays content-preserved (#1760); such sightings remain observable via
+    // the residue audits.
+    if (attested || out !== text) {
         out = out.replace(new RegExp(DEAD_REF_CLOSE.source, "g"), "");
     }
     out = out
@@ -481,6 +508,26 @@ export function stripAcpTags(text: string, dropToolCallEmission = false, request
         .replace(new RegExp(TRUNC_REF_CLOSE.source), "")
         .replace(MARKER_LINE, "");
     return stripBiliArtifacts(out);
+}
+
+// Cascade cap for the fixed-point walk below: every non-stable pass strictly
+// shortens the text, so the walk terminates anyway; the cap bounds adversarial
+// cascade depth (cross-stage exposures layered more than this deep keep their
+// residue rather than burn CPU on attacker-shaped fields).
+const STRIP_PASS_CAP = 8;
+
+/** Whole-text ACP artifact strip. Returns a FIXED POINT: a repeated call never
+ *  removes anything further (#4106 — retry/rebuild paths re-normalize already
+ *  cleaned messages, so one call must do everything repeat calls would). */
+export function stripAcpTags(text: string, dropToolCallEmission = false, requestText?: string): string {
+    const attested = laterChannelAttested(text);
+    let out = text;
+    for (let i = 0; i < STRIP_PASS_CAP; i++) {
+        const next = stripPass(out, dropToolCallEmission, requestText, attested);
+        if (next === out) return out;
+        out = next;
+    }
+    return out;
 }
 
 /** Whole-text echo normalization for parity judges (the invariant judge,

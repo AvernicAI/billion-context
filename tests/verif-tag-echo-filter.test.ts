@@ -166,14 +166,12 @@ test("P1b absorb-instructed emission hold is split-stable", () => {
 });
 
 test("P2 stripAcpTags / normalizeEchoArtifacts are idempotent", () => {
-  // Domain: idempotence is a KNOWN bug while #4106 is open — the marker-
-  // line pass enables a later TRUNC_REF_CLOSE strip on the second call
-  // (pinned as control C#4106 below). Until it lands, assert idempotence
-  // on texts without the triggering shape (marker line AND trailing
-  // dead-ref-close together).
+  // Full domain since #4106 landed: stripAcpTags returns a fixed point
+  // (input-side gate attestation + bounded fixed-point walk), so a second
+  // call never removes anything further — marker lines and trailing
+  // dead-ref-closes included.
   for (let iter = 0; iter < 400; iter++) {
     const t = randomText();
-    if (/\[ACP\]/.test(t) && /m\d{4,}\s*<\//.test(stripAcpTags(t))) continue; // #4106 domain exclusion
     const s1 = stripAcpTags(t);
     assert.equal(stripAcpTags(s1), s1, `strip not idempotent — input=${JSON.stringify(t)}`);
     const n1 = normalizeEchoArtifacts(t);
@@ -313,14 +311,15 @@ test("C#2405: a pair split across pushes counts as ONE drop", () => {
 });
 
 // ------------------------------------------------ pinned bugs
-// #4106: stripAcpTags not idempotent — the marker-line pass (LAST) enables
-// the gated DEAD_REF_CLOSE / end-anchored TRUNC_REF_CLOSE passes on the
-// SECOND call. FLIP this control (assert idempotence) when #4106 lands.
-test("C#4106 pinned: stripAcpTags NOT idempotent today (marker + trailing dead-ref)", () => {
+// #4106 FIXED: cleanup is a fixed point — the marker line attests on the
+// INPUT side, so the trailing dead-ref closes die in the SAME call and a
+// second call removes nothing further. This control guards the regression.
+test("C#4106 pinned FIXED: stripAcpTags idempotent (marker + trailing dead-ref)", () => {
   const t = "angle < not a tag\nm7385</CpA\nm3117</cPa\n\u{1F4E6} [ACP] Compressed m00120\u2013m0300 \u2192 1 block(s)";
   const s1 = stripAcpTags(t);
   const s2 = stripAcpTags(s1);
-  assert.notEqual(s1, s2, "#4106 fixed? — flip this pin and re-enable the full P2 domain");
+  assert.equal(s1, s2, "#4106 regressed — a second cleanup call shrank the text further");
+  assert.ok(!s1.includes("</CpA") && !s1.includes("</cPa"), "attested dead-ref closes must die in the first call");
 });
 // #4107: stream output depends on chunk boundaries — the dead-ref-close
 // residue is cleaned in the whole-text path but RELEASED to the client
