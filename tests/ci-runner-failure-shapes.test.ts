@@ -9,9 +9,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
     classifyPhaseFailure,
+    describeDrainPass,
     describeRetryOutcome,
+    extractDrainCancelledTests,
     extractSwallowedFiles,
     extractTapCounts,
+    shouldDrainPass,
 } from "../scripts/ci-failure-shapes.mjs";
 
 const baseToFile = new Map([
@@ -181,4 +184,56 @@ test("extractTapCounts: missing '# cancelled' line defaults to 0; indented looka
     const c = extractTapCounts(indented);
     assert.ok(c !== null && c.fail === 0 && c.pass === 4352);
     assert.equal(extractTapCounts("no summary here"), null);
+});
+
+// #4212 (#3665 round 3): the twice-drained merge-gate downgrade. Gate
+// discipline (#3617): both directions asserted — downgraded when it should be,
+// strict everywhere else.
+test("shouldDrainPass: twice-drained + merge-gating event -> downgraded to warning-pass", () => {
+    const v = classifyPhaseFailure(DRAIN_TAP, baseToFile);
+    assert.equal(shouldDrainPass(v, v, "pull_request"), true);
+    assert.equal(shouldDrainPass(v, v, "merge_group"), true);
+});
+
+test("shouldDrainPass: fresh-runner probe events and local runs stay strict", () => {
+    const v = classifyPhaseFailure(DRAIN_TAP, baseToFile);
+    for (const ev of ["push", "schedule", "workflow_dispatch", ""]) {
+        assert.equal(shouldDrainPass(v, v, ev), false, `event=${JSON.stringify(ev)}`);
+    }
+});
+
+test("shouldDrainPass: only the TWICE-drained signature downgrades — any other shape pair fails (any event)", () => {
+    const drain = classifyPhaseFailure(DRAIN_TAP, baseToFile);
+    const swallowed = classifyPhaseFailure(SWALLOWED_TAP, baseToFile);
+    const concrete = classifyPhaseFailure(CONCRETE_TAP, baseToFile);
+    assert.equal(shouldDrainPass(swallowed, drain, "pull_request"), false);
+    assert.equal(shouldDrainPass(drain, swallowed, "pull_request"), false);
+    assert.equal(shouldDrainPass(drain, concrete, "pull_request"), false);
+    assert.equal(shouldDrainPass(concrete, drain, "pull_request"), false);
+});
+
+test("extractDrainCancelledTests: names the drain-cancelled top-level tests", () => {
+    assert.deepEqual(extractDrainCancelledTests(DRAIN_TAP), [
+        "preflight rejects malformed proxy args",
+    ]);
+});
+
+test("extractDrainCancelledTests: concrete failures and swallowed file deaths are not drain names", () => {
+    assert.deepEqual(extractDrainCancelledTests(CONCRETE_TAP), []);
+    assert.deepEqual(extractDrainCancelledTests(SWALLOWED_TAP), []);
+});
+
+test("describeDrainPass: counts both attempts, names the lost tests, never claims a genuine failure", () => {
+    const v = classifyPhaseFailure(DRAIN_TAP, baseToFile);
+    if (v.kind !== "cancelled-drain") {
+        assert.fail("fixture must classify as cancelled-drain");
+        return;
+    }
+    const msg = describeDrainPass(v, v, ["preflight rejects malformed proxy args"], "pull_request");
+    assert.match(msg, /DRAIN-PASS/);
+    assert.match(msg, /pass=4352 fail=0 cancelled=5/);
+    assert.match(msg, /preflight rejects malformed proxy args/);
+    assert.match(msg, /pull_request/);
+    assert.match(msg, /fresh runners and stay strict/);
+    assert.doesNotMatch(msg, /genuine failure/);
 });

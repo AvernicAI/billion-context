@@ -42,9 +42,19 @@
 // ci-failure-shapes.mjs (unit-tested there); the action mirrors #3029 minus the
 // isolated re-runs: retry the whole shard once, exit 0 only if that retry is
 // green. A deterministic hang reproduces on the retry and still fails.
+//
+// #4212 (#3665 round 3): the same-runner retry provably cannot recover a
+// persistent drain (it reproduced 8/8 across jobs in a 30-min window on
+// 2026-10-21, then a fresh-runner full matrix went green). So a TWICE-drained
+// phase on a merge-gating event (pull_request/merge_group) now passes WITH a
+// loud ::warning naming the cancelled tests instead of going red and waiting
+// for a human to draw a fresh runner (PR #4206 sat red ~40 min with zero
+// assertion failures). push/schedule/dispatch — the fresh-runner probes — and
+// every non-drain shape fail exactly as before, so a genuinely deterministic
+// drain is still caught within one push run / the 30-min scheduled cadence.
 import { execFileSync, spawn } from "node:child_process";
 import { LIVE_FILES } from "./live-files.mjs";
-import { classifyPhaseFailure, describeRetryOutcome } from "./ci-failure-shapes.mjs";
+import { classifyPhaseFailure, describeDrainPass, describeRetryOutcome, extractDrainCancelledTests, shouldDrainPass } from "./ci-failure-shapes.mjs";
 import { readdirSync, readFileSync } from "node:fs";
 import { freemem, loadavg, totalmem } from "node:os";
 import { join } from "node:path";
@@ -298,6 +308,22 @@ function runIsolated(fileRel) {
     // a code regression — the old fixed "genuine failure" line mislabelled it
     // (#3665 round-2 log). Reclassify before printing the conclusion.
     const retryVerdict = classifyPhaseFailure(retry.out, baseToFile);
+    // #4212 (#3665 round 3): twice-drained + merge-gating event = zero
+    // assertion failures on both attempts on this runner — pass with a loud
+    // warning instead of blocking merges on a runner-pool condition no repo
+    // change can fix. push/schedule/dispatch (fresh-runner probes), local runs
+    // (no GITHUB_EVENT_NAME), and every non-drain shape fail exactly as before.
+    const eventName = process.env.GITHUB_EVENT_NAME ?? "";
+    if (shouldDrainPass(verdict, retryVerdict, eventName)) {
+        const cancelledTests = extractDrainCancelledTests(retry.out);
+        console.error(
+            `::warning::DRAIN-PASS (#3665/#4212): both attempts on this runner lost tests to event-loop ` +
+                `drain with ZERO assertion failures — merge gate not blocked. Cancelled: ` +
+                `${cancelledTests.join("; ") || "see TAP above"}`,
+        );
+        console.error(`[ci-tests] ${describeDrainPass(verdict, retryVerdict, cancelledTests, eventName)}`);
+        process.exit(0);
+    }
     console.error(
         `[ci-tests] full retry also FAILED (exit=${retry.code} signal=${retry.signal}) -> ` +
             describeRetryOutcome(retryVerdict),
