@@ -329,13 +329,20 @@ test("reserveOutputHeadroom: degenerate maxOutput >= window stays a no-op even w
     assert.equal(reserveOutputHeadroom(100_000, 150_000, 0.25), 100_000);
 });
 
-// Protocol gate: Anthropic's Messages API enforces the input limit
-// independently of max_tokens (separate output budget), so reserving there
-// would shift every nudge/truncate band down by maxOutput for no safety gain.
-// OpenAI-family APIs count output against the window — reserve there.
-test("shouldReserveOutputHeadroom: anthropic exempt, other protocols reserve", () => {
-    assert.equal(shouldReserveOutputHeadroom("anthropic"), false, "Anthropic: output budget is separate from the context window");
+// #4205: every wire reserves by default. The anthropic family is exempt ONLY
+// with positive separate-output-budget evidence (real-Claude routing —
+// api.anthropic.com or a claude-* model id): the blanket protocol exemption
+// was what let wrapper providers on that wire bill completion against the
+// same window and 400 at the wall (#3900). Both directions pinned (#3617).
+test("shouldReserveOutputHeadroom: reserve-by-default, real-Claude routing exempt (#4205)", () => {
     assert.equal(shouldReserveOutputHeadroom("openai"), true);
     assert.equal(shouldReserveOutputHeadroom("responses"), true);
+    assert.equal(shouldReserveOutputHeadroom("google"), true);
     assert.equal(shouldReserveOutputHeadroom(undefined), true, "unknown protocol → conservative (reserve)");
+    assert.equal(shouldReserveOutputHeadroom("anthropic"), true, "no route evidence → conservative (reserve)");
+    assert.equal(shouldReserveOutputHeadroom("anthropic", "https://api.deepseek.com"), true, "wrapper origin → reserve");
+    assert.equal(shouldReserveOutputHeadroom("anthropic", "https://api.anthropic.com", "claude-sonnet-4-5"), false, "canonical Anthropic host → exempt");
+    assert.equal(shouldReserveOutputHeadroom("anthropic", "http://127.0.0.1:8787", "claude-test"), false, "claude-* model id → exempt (gateway front)");
+    assert.equal(shouldReserveOutputHeadroom("anthropic", "http://127.0.0.1:8787", "DeepSeek-V3.2-Exp"), true, "#3900 shape: deepseek model on the anthropic wire → reserve");
+    assert.equal(shouldReserveOutputHeadroom("anthropic", "https://api.anthropic.com.evil.example"), true, "host match is exact — no suffix tricks");
 });

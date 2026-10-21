@@ -550,14 +550,24 @@ test("sideRequestGuard: raw-body fit against declared ∩ armed window minus out
     assert.equal(sideRequestGuard(body, "anthropic", Math.floor(est / 1.10), undefined, undefined, 1).blocked, false, "within the 15% estimator tolerance → forward");
     assert.equal(sideRequestGuard(body, "anthropic", 1_000_000, undefined, undefined, 1, Math.floor(est / 1.15)).blocked, true, "armed smaller (beyond tolerance) → blocks");
     assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined, undefined, 1, 1_000_000).blocked, false, "armed larger than declared is ignored");
-    // OpenAI wire: the output budget counts against the window → headroom reserved.
+    // OpenAI wire: the output budget counts against the window → headroom
+    // reserved. #4205: the reservation policy is passed from the call site —
+    // these rows pin the reserving direction explicitly.
     const oa = { model: MODEL, max_completion_tokens: 2_000, stream: true, messages: [{ role: "user", content: txt }] };
     const oaEst = estimateRawBodyTokens(oa);
     const oaLimit = Math.floor(oaEst / 1.15);
-    const g = sideRequestGuard(oa, "openai", oaLimit + 2_000, undefined, undefined, 1);
+    const g = sideRequestGuard(oa, "openai", oaLimit + 2_000, undefined, undefined, 1, 0, undefined, true);
     assert.equal(g.limit, oaLimit, "limit reduced by max_completion_tokens");
     assert.equal(g.blocked, true, "boundary after reservation (with tolerance) blocks");
-    assert.equal(sideRequestGuard(oa, "openai", oaEst + 2_001, undefined, undefined, 1).blocked, false);
+    assert.equal(sideRequestGuard(oa, "openai", oaEst + 2_001, undefined, undefined, 1, 0, undefined, true).blocked, false);
+    // #4205: wrapper providers on the anthropic wire reserve too — same
+    // mechanics, policy decided by the caller (route + model evidence).
+    // The rows above with default (false) pin the non-reserving real-Claude
+    // route; these pin the reserving wrapper route (#3617 both directions).
+    const gw = sideRequestGuard(body, "anthropic", Math.floor(est / 1.15) + 100, undefined, undefined, 1, 0, undefined, true);
+    assert.equal(gw.limit, Math.floor(est / 1.15), "anthropic wrapper route: limit reduced by max_tokens");
+    assert.equal(gw.blocked, true, "anthropic wrapper route: boundary after reservation blocks");
+    assert.equal(sideRequestGuard(body, "anthropic", est + 101, undefined, undefined, 1, 0, undefined, true).blocked, false, "anthropic wrapper route: within tolerance after reservation forwards");
     // Image tokens count toward the estimate.
     const imgBody = { model: MODEL, max_tokens: 100, messages: [{ role: "user", content: [
         { type: "text", text: "z".repeat(4000) },
