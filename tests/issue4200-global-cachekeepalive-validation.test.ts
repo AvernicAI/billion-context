@@ -120,3 +120,37 @@ test("#4200: null global block means absent (web save contract) — loads clean"
         setLogCapture(null);
     }
 });
+
+// ---- web whole-file save facet (#4200 follow-up) ---------------------------
+
+async function putWholeFile(rawText: string): Promise<{ status: number; payload: Record<string, unknown> }> {
+    const req = new Readable({ read() {} });
+    req.push(Buffer.from(JSON.stringify({ file: rawText })));
+    req.push(null);
+    let status = 0;
+    let payloadText = "";
+    const res = {
+        writeHead(s: number) { status = s; return this; },
+        end(b?: string | Buffer) { payloadText = typeof b === "string" ? b : String(b ?? ""); },
+    };
+    await handleConfigPut(req as unknown as IncomingMessage, res as unknown as ServerResponse, undefined, 8787);
+    return { status, payload: JSON.parse(payloadText) as Record<string, unknown> };
+}
+
+test("#4200 web: invalid global block in a whole-file save gets a clean 400 naming the field", async () => {
+    const f = pointAt("web-bad-global.json");
+    fs.writeFileSync(f, "{}");
+    const r = await putWholeFile(JSON.stringify({ cacheKeepalive: { ttlFactor: "high" } }));
+    assert.equal(r.status, 400);
+    assert.match(String(r.payload.error), /cacheKeepalive\.ttlFactor must be a number/);
+    assert.equal(fs.readFileSync(f, "utf8"), "{}", "the file is never written");
+});
+
+test("#4200 web: valid global block still saves (no over-strictening)", async () => {
+    const f = pointAt("web-valid-global.json");
+    fs.writeFileSync(f, "{}");
+    const r = await putWholeFile(JSON.stringify({ cacheKeepalive: { enabled: true, ttlFactor: 0.5 } }));
+    assert.equal(r.status, 200);
+    const saved = JSON.parse(fs.readFileSync(f, "utf8")) as Record<string, unknown>;
+    assert.deepEqual(saved.cacheKeepalive, { enabled: true, ttlFactor: 0.5 });
+});
