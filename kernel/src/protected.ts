@@ -6,8 +6,77 @@ import type { Config, CoreMessage } from "./types.js";
  *  treats past compress calls as load-bearing metadata. acp_rule calls record
  *  persistent user rules that are re-injected every turn — compressing them
  *  away would silently lose what the rules state. Letting any of these be
- *  compressed away breaks decompress and the "summary is historical" contract. */
+ *  compressed away breaks decompress and the "summary is historical" contract.
+ *
+ *  Exception (billion-context#4289): a compress exchange whose paired result
+ *  is a TOTAL-FAILURE receipt (COMPRESS_FAILED_RECEIPT_PREFIX — zero ranges
+ *  applied) carries no summary carrier: no block cites its arguments, so
+ *  decompress/search lose nothing folding it. Keeping such exchanges exempt
+ *  forever pins every failed retry into context and raises the fold floor
+ *  (measured: ~75% of a 227K context was compression residue). isMessageProtected
+ *  lifts the exemption for exactly those exchanges when the caller passes the
+ *  matching collectFailedCompressCallIds set; success/partial receipts
+ *  ("[Compressed …") and result-less in-flight calls keep it. */
 export const ALWAYS_PROTECTED_TOOLS = ["compress", "acp_rule"] as const;
+
+/** Receipt prefix emitted by a compress invocation that applied ZERO ranges —
+ *  the total-failure form. Successful AND partial-success receipts start with
+ *  "[Compressed …" instead, so this prefix identifies total failure without
+ *  parsing the body (billion-context#4289). */
+export const COMPRESS_FAILED_RECEIPT_PREFIX = "[Compression FAILED";
+
+/** True when a tool-result text is a total-failure compress receipt. */
+export function isFailedCompressReceiptText(
+  text: string | undefined,
+): boolean {
+  return (
+    typeof text === "string" &&
+    text.trimStart().startsWith(COMPRESS_FAILED_RECEIPT_PREFIX)
+  );
+}
+
+/** True when `name` denotes a `compress` call: the host dialect recognizer
+ *  (#2970 isCompressTool covers e.g. MCP's "mcp__bili__compress") wins when
+ *  set; otherwise the canonical bare name only. */
+function isCompressToolName(
+  name: string | undefined,
+  config: Pick<Config, "isCompressTool">,
+): boolean {
+  if (!name) return false;
+  if (config.isCompressTool) return config.isCompressTool(name);
+  return name === "compress";
+}
+
+/** Tool-call ids of compress exchanges whose paired result is a TOTAL-FAILURE
+ *  receipt (#4289). Such exchanges carry no summary carrier — zero ranges were
+ *  applied, so no block cites their arguments and decompress/search never read
+ *  them — yet they enjoyed compress's permanent exemption, pinning every
+ *  failed retry into the context forever. Callers feed the returned set into
+ *  isMessageProtected / collectProtectedToolCallIds /
+ *  isMessageProtectedWithPairing to lift the exemption for exactly those
+ *  exchanges. Success/partial receipts and result-less (in-flight) calls do
+ *  NOT enter the set: their summaries are load-bearing (conservative). A
+ *  result lacking any recognizable tool name (own or paired) is not marked —
+ *  it stays protected, as before. O(n) + one id→name map. */
+export function collectFailedCompressCallIds(
+  messages: CoreMessage[],
+  config: Pick<Config, "isCompressTool">,
+): Set<string> {
+  const ids = new Set<string>();
+  const callNameById = new Map<string, string>();
+  for (const m of messages) {
+    if (m.contentType === "tool-call" && m.toolCallId && m.toolName) {
+      callNameById.set(m.toolCallId, m.toolName);
+    }
+  }
+  for (const m of messages) {
+    if (m.contentType !== "tool-result" || !m.toolCallId) continue;
+    if (!isFailedCompressReceiptText(m.text)) continue;
+    const name = m.toolName ?? callNameById.get(m.toolCallId);
+    if (isCompressToolName(name, config)) ids.add(m.toolCallId);
+  }
+  return ids;
+}
 
 /** Tool results that must NEVER participate in the soft-protected recent zone
  *  (preserveRecentMessages / preserveRecentTokens / last user message).
@@ -202,6 +271,10 @@ export function virtualToolPathOf(
 export function isMessageProtected(
   msg: CoreMessage,
   config: Pick<Config, "protectedTools" | "isToolProtected" | "isMessageProtected" | "messagePathOf">,
+  /** #4289: total-failure compress exchanges (from collectFailedCompressCallIds
+   *  over the SAME message array class) lose their hard-coded exemption — see
+   *  the ALWAYS_PROTECTED_TOOLS note above. Unset = legacy behavior. */
+  failedCompressCallIds?: ReadonlySet<string>,
 ): boolean {
   // Host-declared message-level protection (#2419): applies to ANY content
   // type and outranks everything below — the host owns the decision.
@@ -226,8 +299,21 @@ export function isMessageProtected(
     return false;
   }
 
-  // Hard-coded protection: ACP metadata tools are never compressible.
-  if ((ALWAYS_PROTECTED_TOOLS as readonly string[]).includes(msg.toolName)) {
+  // #4289: total-failure compress exchange (both halves identified by their
+  // shared toolCallId in the failed set). Lifts ONLY the hard-coded exemption
+  // below — the pattern hooks still run, so a host that explicitly pins these
+  // via protectedTools/isToolProtected wins (conservative).
+  const failedCompress =
+    failedCompressCallIds !== undefined &&
+    !!msg.toolCallId &&
+    failedCompressCallIds.has(msg.toolCallId);
+
+  // Hard-coded protection: ACP metadata tools are never compressible (except
+  // failed compress exchanges above — they carry no summary carrier).
+  if (
+    !failedCompress &&
+    (ALWAYS_PROTECTED_TOOLS as readonly string[]).includes(msg.toolName)
+  ) {
     return true;
   }
 
@@ -235,7 +321,9 @@ export function isMessageProtected(
     if (matchToolMessagePattern(msg, pattern)) return true;
   }
 
-  if (config.isToolProtected?.(msg.toolName, msg.text)) return true;
+  if (!failedCompress && config.isToolProtected?.(msg.toolName, msg.text)) {
+    return true;
+  }
 
   return false;
 }
@@ -247,13 +335,14 @@ export function isMessageProtected(
 export function collectProtectedToolCallIds(
   messages: CoreMessage[],
   config: Pick<Config, "protectedTools" | "isToolProtected">,
+  failedCompressCallIds?: ReadonlySet<string>,
 ): Set<string> {
   const ids = new Set<string>();
   for (const m of messages) {
     if (
       m.contentType === "tool-call" &&
       m.toolCallId &&
-      isMessageProtected(m, config)
+      isMessageProtected(m, config, failedCompressCallIds)
     ) {
       ids.add(m.toolCallId);
     }
@@ -267,8 +356,9 @@ export function isMessageProtectedWithPairing(
   msg: CoreMessage,
   config: Pick<Config, "protectedTools" | "isToolProtected">,
   protectedCallIds: Set<string>,
+  failedCompressCallIds?: ReadonlySet<string>,
 ): boolean {
-  if (isMessageProtected(msg, config)) return true;
+  if (isMessageProtected(msg, config, failedCompressCallIds)) return true;
   if (
     msg.contentType === "tool-result" &&
     msg.toolCallId &&

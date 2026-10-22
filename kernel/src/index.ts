@@ -326,10 +326,13 @@ export {
   listSearchAlgorithms,
 } from "./search.js";
 export {
+  COMPRESS_FAILED_RECEIPT_PREFIX,
+  collectFailedCompressCallIds,
   collectLatestProtected,
   collectProtectedToolCallIds,
   hasMediaPayload,
   hasUnrecoverableMediaPayload,
+  isFailedCompressReceiptText,
   isMessageLatestProtected,
   isMessageProtected,
   isMessageProtectedWithPairing,

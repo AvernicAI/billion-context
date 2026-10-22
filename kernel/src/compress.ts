@@ -28,6 +28,7 @@ import { activeBlockSpans } from "./block-map.js";
 import { createRenderRefsNode } from "./render-refs.js";
 import type { RenderStrategy } from "./render-refs.js";
 import {
+  collectFailedCompressCallIds,
   collectLatestProtected,
   collectProtectedToolCallIds,
   hasUnrecoverableMediaPayload,
@@ -1000,6 +1001,15 @@ const assignRefsNode: PipelineNode = {
     const latest = hasProtection
       ? collectLatestProtected(io.messages, ctx.config)
       : undefined;
+    // #4289: total-failure compress exchanges (receipt "[Compression FAILED",
+    // zero ranges applied) carry no summary carrier — lift their hard-coded
+    // exemption so they fold and get reclaimed like ordinary messages.
+    // Success/partial receipts and in-flight calls stay exempt. Computed only
+    // when some protection machinery is active, mirroring `latest` (otherwise
+    // nothing is BLOCKED anyway and behavior stays byte-identical).
+    const failedCompressCallIds = hasProtection
+      ? collectFailedCompressCallIds(io.messages, ctx.config)
+      : undefined;
     // Refs keep the exact pre-#1947 layout for name-only patterns (a
     // protected call's unnamed result keeps a foldable ref; actual folding
     // paths pair via filterProtectedToolMessages). #1947 path patterns
@@ -1011,7 +1021,11 @@ const assignRefsNode: PipelineNode = {
     );
     const pathProtectedCallIds =
       hasProtection && hasPathPatterns
-        ? collectProtectedToolCallIds(io.messages, ctx.config)
+        ? collectProtectedToolCallIds(
+            io.messages,
+            ctx.config,
+            failedCompressCallIds,
+          )
         : undefined;
     // Unrecoverable media (remote URLs / file refs with no stored bytes) ride
     // outside msg.text; folding one destroys it permanently with no restore
@@ -1022,8 +1036,13 @@ const assignRefsNode: PipelineNode = {
       hasUnrecoverableMediaPayload(m) ||
       (hasProtection
         ? (pathProtectedCallIds
-            ? isMessageProtectedWithPairing(m, ctx.config, pathProtectedCallIds)
-            : isMessageProtected(m, ctx.config)) ||
+            ? isMessageProtectedWithPairing(
+                m,
+                ctx.config,
+                pathProtectedCallIds,
+                failedCompressCallIds,
+              )
+            : isMessageProtected(m, ctx.config, failedCompressCallIds)) ||
           (latest ? isMessageLatestProtected(m, latest) : false)
         : false);
     const refResult = assignRefs(io.messages, {

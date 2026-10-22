@@ -2,6 +2,7 @@ import { activeBlocks, blockById, isLiveCheckpointCarrier } from "./state.js";
 import { resolveBoundaries, blockVisibleInRange } from "./boundaries.js";
 import { isSummaryMessageId } from "./prune.js";
 import {
+  collectFailedCompressCallIds,
   collectLatestProtected,
   hasUnrecoverableMediaPayload,
   isMessageLatestProtected,
@@ -461,9 +462,12 @@ function filterProtectedToolMessages(
   const protectedCallIds = new Set<string>();
   const removedIds = new Set<string>();
   const latest = collectLatestProtected(messages, config);
+  // #4289: same failed-compress exemption as the refs/recommend sites — the
+  // apply-side judgment must agree with what assignRefs made foldable.
+  const failedCompressCallIds = collectFailedCompressCallIds(messages, config);
   for (const id of latest.callIds) protectedCallIds.add(id);
   for (const msg of messages) {
-    if (isMessageProtected(msg, config) && msg.toolCallId) {
+    if (isMessageProtected(msg, config, failedCompressCallIds) && msg.toolCallId) {
       protectedCallIds.add(msg.toolCallId);
     }
   }
@@ -473,7 +477,7 @@ function filterProtectedToolMessages(
     if (!msg) continue;
     if (
       hasUnrecoverableMediaPayload(msg) ||
-      isMessageProtected(msg, config) ||
+      isMessageProtected(msg, config, failedCompressCallIds) ||
       isMessageLatestProtected(msg, latest)
     ) {
       removedIds.add(id);
