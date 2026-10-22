@@ -126,6 +126,29 @@ export function assignRefs(
       continue;
     }
 
+    // #4316 layer 3: store-served views stamp ledgerSeq — the unified
+    // transcript position, assigned once and never re-minted. The ref IS the
+    // ledger number (direct display), so byte churn cannot renumber
+    // citations. Collisions (should be impossible — (session, seq) is a PK)
+    // fall through to the counter path; the cursor advances past the stamp so
+    // later counter-allocated refs never collide with future stamps either.
+    const ledgerSeq: number | undefined = message.ledgerSeq;
+    if (
+      typeof ledgerSeq === "number" &&
+      Number.isInteger(ledgerSeq) &&
+      ledgerSeq >= MIN_INDEX &&
+      ledgerSeq <= MAX_INDEX
+    ) {
+      const text = indexToRef(ledgerSeq);
+      if (!map.byRef[text]) {
+        map.byRaw[message.id] = text;
+        map.byRef[text] = message.id;
+        newlyAssigned++;
+        if (ledgerSeq >= cursor) cursor = ledgerSeq + 1;
+        continue;
+      }
+    }
+
     const ref = allocateFreeRef(map, cursor);
     cursor = ref.index + 1;
     map.byRaw[message.id] = ref.text;

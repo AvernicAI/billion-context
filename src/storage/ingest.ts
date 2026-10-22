@@ -356,16 +356,33 @@ function finishPlan(
         ...(e.media && e.media.length > 0 ? { media: e.media } : {}),
     }));
 
+    // #4316 layer 3: the ledger positions of a block's covered messages —
+    // min/max seq over the rows its coverage resolves to. Ghost ids (no row
+    // in this plan's log) are skipped; a block whose coverage resolves to no
+    // row keeps the -1/-1 "unknown bounds" shape (pre-layer-3
+    // rows stored 0/0 placeholders; both are simply "no interval evidence"). These bounds are the durable interval form of coverage:
+    // independent of message ids, so byte churn can never invalidate them.
+    const seqById = new Map<string, number>();
+    for (const e of log) if (!seqById.has(e.msgId)) seqById.set(e.msgId, e.seq);
+
     const blocks: BlockRow[] = session.state.blocks.map((b, ord) => {
         const views = completeBlockContents(session.blockContents, session.state.blocks).get(b.blockId);
         const full = views?.full ?? { text: b.summary, count: 0 };
         const one = views?.one ?? null;
         const covered = { effectiveMessageIds: b.effectiveMessageIds, directMessageIds: b.directMessageIds };
+        let startSeq = -1;
+        let endSeq = -1;
+        for (const id of b.effectiveMessageIds) {
+            const s = seqById.get(id);
+            if (s === undefined) continue;
+            if (startSeq === -1 || s < startSeq) startSeq = s;
+            if (s > endSeq) endSeq = s;
+        }
         return {
             blockId: b.blockId,
             ord,
-            startSeq: 0,
-            endSeq: 0,
+            startSeq,
+            endSeq,
             startRef: b.startRef !== undefined ? refToIndex(b.startRef) : null,
             endRef: b.endRef !== undefined ? refToIndex(b.endRef) : null,
             tier: b.tier,

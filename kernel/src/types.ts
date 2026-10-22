@@ -30,6 +30,16 @@ export interface CoreMessage {
    *  inactive/unknown block folds normally. Reserved-prefix ids
    *  (`acp_summary_*`) stay kernel-internal and never need this marker. */
   summaryOfBlockId?: string;
+  /** #4316 layer 3 — server-ledger numbering. Set by store-served views
+   *  (snapshot-render prefix rows, incremental canonical rows): the unified
+   *  transcript's (session, seq) for this message, assigned once at ingest
+   *  and never re-minted. When present, assignRefs issues the ref as the
+   *  direct display of this number, so client-side byte churn (model-switch
+   *  re-stamps, image re-encodes) cannot renumber the model's citations.
+   *  Callers must guarantee per-session uniqueness; a collision falls back
+   *  to the counter path for the loser. Not serialized into wire payloads —
+   *  it rides CoreMessage sidecars and the persisted store rows verbatim. */
+  ledgerSeq?: number;
 }
 
 export type CompressionTier = 1 | 2 | 3;

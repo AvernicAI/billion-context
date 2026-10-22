@@ -109,7 +109,16 @@ function parseRow(content: string, seq: number): BiliMessage | null {
     try {
         const parsed = JSON.parse(content) as { id?: unknown; role?: unknown };
         if (typeof parsed.id !== "string" || typeof parsed.role !== "string") return null;
-        return parsed as BiliMessage;
+        const msg = parsed as BiliMessage;
+        // #4316 layer 3: the row's (session, seq) is the message's permanent
+        // ledger position — stamp it so assignRefs issues the ref as the
+        // direct display of the seq (never re-minted across byte churn).
+        // Store seqs are 0-based; the ref display space is 1-based
+        // (MIN_INDEX=1, "m00001" is the first number) — the stamp carries the
+        // DISPLAY index. Rows written before this change simply lack the
+        // field; the kernel counter path keeps serving them unchanged.
+        msg.ledgerSeq = seq + 1;
+        return msg;
     } catch {
         return null;
     }

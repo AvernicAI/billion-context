@@ -5,6 +5,11 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Added
+
+- **seq ledger foundations — block interval bounds + ledger-numbered refs (#4316 layer 3, phase 1).** Block coverage now carries its ledger interval: `planIngest` fills `blocks.start_seq/end_seq` with the min/max unified-store seq of the covered messages (`-1/-1` when no rows resolve) — coverage bounds are id-independent, so client-side byte churn can never invalidate them. `CoreMessage.ledgerSeq` sidecar: store-served views (snapshot-render prefix rows) stamp the row's `(session, seq)`; `assignRefs` issues the ref as the direct display of that number (seq+1 in the 1-based display space), advancing the allocation cursor past the stamp so counter-issued refs never collide with future stamps. A store-served message's number is assigned once at ingest and is structurally immune to the #4316 churn family (model-switch re-stamps, image re-encodes re-minting every content-hash id). Stakes first in `tests/seq-ledger.test.ts`: interval bounds (S1), ref-set stability across a full id re-mint under snapshot render (S2), and the kernel seam (S3). Follow-ups: incremental-lane stamping, fork `cloneRows` number-preserving copy, and the one-time legacy re-mint window handling — tracked in #4316.
+
+
 ### Changed (storage correctness wave 3, #4242)
 
 - **State hydration can no longer drift from `mergeState`** (#4192): `COMPRESSION_STATE_FIELDS` in the new `src/state-hydration.ts` is derived mechanically from `Object.keys(mergeState(createInitialState()))` — the ingest/restore field list is generated from the same source as hydration, so a future field can never be restored-but-never-ingested (the `sweptOrphanCallIds`/`pendingOrphanSweepMinRef` loss class). Pinned by a parity test that fails the moment `createInitialState()` grows a key the list does not know.
