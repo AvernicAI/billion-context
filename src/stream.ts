@@ -18,6 +18,7 @@ import { attachSubagentSessions, subagentSessionNote, subagentSessionsOf, syncSu
 import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
+import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
 
 export type RewriteCtx = {
     core: CompressionCore;
@@ -605,6 +606,31 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
     // Partial failures stay silent too: the model still owes the errors an answer
     // before any "you are done" verdict (pi #521 gate).
     if (!cleanSuccess || tier !== null) return "";
+    // #4331: offer exhaustion is NOT proof the context is at its minimum — the
+    // verdict only sees this call's pre-fold offer, and mid-history runs can sit
+    // outside every active block AND outside the offer (disjoint folds, dead-ref
+    // holes, integrity withdrawals). Audit before making the global claim; the
+    // verbatim contract string (#1387) stays intact for genuinely-drained
+    // sessions. Advisory only: audit failure degrades to the old wording path.
+    try {
+        const runs = uncoveredHistoryRuns({
+            core: ctx.core,
+            messages: ctx.messages,
+            state: ctx.session.state,
+            config: ccrEnabled(ctx.session) ? ctx.config : { ...ctx.config, ccr: undefined },
+            tokenCount: statusInputBaseline(ctx.session),
+            contentStore: contentStoreOf(ctx.session),
+            applyView: ctx.compressMessages,
+            actionableSpans: remaining,
+        });
+        if (runs.length > 0) {
+            const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
+            const totalTok = runs.reduce((s, r) => s + r.tokens, 0);
+            return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect with acp_status(scope:"uncompressed").`;
+        }
+    } catch {
+        // Fall through to the contract wording below.
+    }
     return `\n\n${NO_RANGES_REMAIN_TEXT}`;
 }
 

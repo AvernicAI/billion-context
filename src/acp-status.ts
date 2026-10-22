@@ -19,6 +19,7 @@ import { pckAblations } from "./pck-probe.js";
 import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
+import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
@@ -242,10 +243,12 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     const lastCause = compressLastFailureCause(ctx.session);
     const staleRef = lastCause !== undefined && lastCause.startsWith("stale-ref");
     const substrateDestroyed = lastCause !== undefined && lastCause.startsWith("substrate-destruction");
+    let offeredSpans: Array<{ startRef: string; endRef: string }> | undefined;
     try {
         const live = liveCompressionRanges(ctx);
         if (live) {
             const { nudge, ranges } = live;
+            offeredSpans = ranges;
             extra.push("");
             extra.push(nudge.shouldInject ? `Nudge: ACTIVE — ${nudge.reason}` : `Nudge: idle — ${nudge.reason}`);
             // #2366: high billed pressure + exhausted compressible mass is the
@@ -274,6 +277,30 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         }
     } catch {
         // Base-only report; never fall back to a stale snapshot.
+    }
+    // #4331: uncovered history — contiguous runs outside every active block AND
+    // outside the live offer above (older than the protected recent window).
+    // They keep going upstream raw while no surface names them; additive
+    // section, rendered only when non-trivial. Advisory: any failure skips it.
+    try {
+        const runs = uncoveredHistoryRuns({
+            core: ctx.core,
+            messages: ctx.messages,
+            state: ctx.session.state,
+            config: ccrLoopConfig(ctx.session, ctx.config),
+            tokenCount: billed,
+            contentStore: contentStoreOf(ctx.session),
+            applyView: ctx.compressMessages,
+            actionableSpans: offeredSpans ?? [],
+        });
+        if (runs.length > 0) {
+            const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
+            const totalTok = runs.reduce((s, r) => s + r.tokens, 0);
+            extra.push("");
+            extra.push(`UNCOVERED HISTORY — ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are absent from the Compressible-ranges list above (older than the protected recent window): ${describeUncoveredRuns(runs)}. They keep going upstream raw (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect their rows with scope:"uncompressed".`);
+        }
+    } catch {
+        // Advisory section; never break the status report.
     }
     // #2362: dead refs — known to the session but no longer backed by any
     // visible or folded message (client history rewrite / host-native
