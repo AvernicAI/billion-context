@@ -4,7 +4,7 @@ import tls from "node:tls";
 import { Pool, ProxyAgent } from "undici";
 import type { ProviderRoutes } from "./config.js";
 import { log as loggerLog } from "./logger.js";
-import { maskHostInText, maskUrlForLog } from "./log-mask.js";
+import { maskHostInText, maskHostPortForDisplay, maskUrlForLog } from "./log-mask.js";
 import { upstreamTimeoutMs } from "./fetch-util.js";
 import { classifyUpstreamFailure, hintWithSkippedProxy, isTlsTrustCode, redactProxyUrl, tlsTrustRemediation, type SkippedProxyInfo, type UpstreamFailureDetail } from "./upstream-fail.js";
 import { upstreamCaIdentity, upstreamExtraCa } from "./upstream-ca.js";
@@ -540,7 +540,12 @@ export function describeUpstreamFailure(error: unknown, url: string, proxyUrl?: 
     // Error text from undici/OS layers embeds the endpoint identity
     // ("connect ECONNREFUSED 10.0.0.5:8443", "getaddrinfo ENOTFOUND
     // relay.internal") — swap in the placeholder when the upstream is a
-    // non-public host so the failure log leaks nothing either.
+    // non-public host so the failure log leaks nothing either. The free-text
+    // `message` stays fully masked (#255); #4254 surfaces the actionable endpoint
+    // only through the structured `host` field below (loopback-exempt), so one
+    // free-text message never mixes a raw host next to a masked <private-host>.
+    let targetHostPort = "";
+    try { targetHostPort = new URL(url).host; } catch { /* not a URL — no display host */ }
     const maskHostIn = (s: string): string => {
         try {
             return maskHostInText(s, new URL(url).hostname);
@@ -567,7 +572,7 @@ export function describeUpstreamFailure(error: unknown, url: string, proxyUrl?: 
         hint = `${hint}; ${tlsTrustRemediation()}`;
     }
     parts.push(`hint=${hint}`);
-    return { message: parts.join(" "), detail: { kind, ...(codeValue !== undefined ? { code: String(codeValue) } : {}), hint } };
+    return { message: parts.join(" "), detail: { kind, ...(codeValue !== undefined ? { code: String(codeValue) } : {}), ...(targetHostPort !== "" ? { host: maskHostPortForDisplay(targetHostPort) } : {}), hint } };
 }
 
 export function formatUpstreamError(error: unknown, url: string, proxyUrl?: string, skipped?: SkippedProxyInfo): string {

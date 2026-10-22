@@ -32,7 +32,7 @@ import { log as loggerLog } from "../logger.js";
 import { dumpReqAllowed as knobDumpReqAllowed, limitsWsOutboundBytes, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { applyLaneCredential, laneCredential } from "../lane-credentials.js";
-import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskUrlForLog } from "../log-mask.js";
+import { CREDENTIAL_HEADER_RE, maskHeaderForLog, maskHeadersForLog, maskHostPortForDisplay, maskUrlForLog } from "../log-mask.js";
 import { pickAdapter, runCompressLoop } from "../loop/index.js";
 import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "../loop/tag-echo-filter.js";
 import { dumpsDir } from "../paths.js";
@@ -51,9 +51,9 @@ import { rewriteResponsesJsonResponseAsync } from "../stream-responses.js";
 import { observeResponsesTerminalState } from "../stream-terminal.js";
 import { rewriteJsonResponseAsync, type RewriteCtx } from "../stream.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
-import { clearUpstreamAlertsForHost, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind } from "../upstream-alerts.js";
+import { clearUpstreamAlertsForHost, noteCircuitFailFastLog, recordUpstreamAlert, recordUpstreamCircuitFailure, recordUpstreamCircuitSuccess, upstreamCircuitBlockReason, upstreamCircuitLastFailureKind, upstreamCircuitRetryAfterSeconds } from "../upstream-alerts.js";
 import { describeUpstreamFailure, formatUpstreamError, proxyDispatcher, recordUpstreamConnection } from "../upstream-proxy.js";
-import { withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
+import { markExpectedFailFast, withUpstreamFailure, type UpstreamFailureKind } from "../upstream-fail.js";
 import { applyEstimateCalibration, currentCalibrationFactor, inspectContextOverflow, MIN_ASSUMED_WINDOW_TOKENS, normalizeUpstreamOrigin, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "../util.js";
 import { recordPckAblation } from "../pck-probe.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "../output-steering.js";
@@ -731,14 +731,29 @@ export async function forward(
     // that the dispatch catch renders into the 502 body.
     const circuitBlock = upstreamCircuitBlockReason(upstreamUrl);
     if (circuitBlock !== undefined) {
-        log("warn", `[${prepared?.session.id ?? "passthrough"}] [acp-proxy] upstream circuit open — failing fast without contacting ${upstreamUrl}: ${circuitBlock}`);
+        // #4254: throttle the per-request warn to one line/window/host while the
+        // circuit stays OPEN (the OPEN/CLOSED/probe state flips log at their own
+        // sites) so a single dead upstream stops re-amplifying every blocked round.
+        if (noteCircuitFailFastLog(upstreamUrl)) {
+            log("warn", `[${prepared?.session.id ?? "passthrough"}] [acp-proxy] upstream circuit open — failing fast without contacting ${upstreamUrl}: ${circuitBlock}`);
+        }
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "upstream circuit open", outboundPayloadBreakdown(prepared, opts, route, req.url ?? "").armEstimate);
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream circuit open");
         const lastKind = upstreamCircuitLastFailureKind(upstreamUrl);
-        throw withUpstreamFailure(new Error(`upstream circuit open: ${circuitBlock}`), {
+        const retryAfter = upstreamCircuitRetryAfterSeconds(upstreamUrl);
+        let displayHost: string | undefined;
+        try { displayHost = maskHostPortForDisplay(new URL(upstreamUrl).host); } catch { /* not a URL */ }
+        // #4254: carry host/circuitOpen/retryAfterSeconds so the egress can name the
+        // dead endpoint in the client-facing `error`, answer 503 + Retry-After, and
+        // skip its per-request [error] (markExpectedFailFast) since the throttled
+        // warn above is the canonical record.
+        throw markExpectedFailFast(withUpstreamFailure(new Error(`upstream circuit open: ${circuitBlock}`), {
             ...(lastKind !== undefined ? { kind: lastKind as UpstreamFailureKind } : {}),
+            ...(displayHost !== undefined ? { host: displayHost } : {}),
+            circuitOpen: true,
+            ...(retryAfter !== undefined ? { retryAfterSeconds: retryAfter } : {}),
             hint: "upstream circuit open — the endpoint is unreachable and bili is failing fast instead of resending full context until a probe succeeds",
-        });
+        }));
     }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     // #3701: the catch below replaces upstreamResult on a shrunken resend; capture the

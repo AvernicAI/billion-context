@@ -17,7 +17,7 @@ import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOut
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
 import { getUpstreamConnectionStatus, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
-import { upstreamFailureOf, type SkippedProxyInfo } from "./upstream-fail.js";
+import { buildProxyFailureResponse, isExpectedFailFast, type SkippedProxyInfo } from "./upstream-fail.js";
 import { getUpstreamAlerts } from "./upstream-alerts.js";
 import { hostIdForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs + the historical-image strip primitive live in the kernel now
@@ -643,23 +643,22 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // feeding the context-free [error] AbortError storm.
             const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
             if (clientAbort) log("info", `client aborted mid-stream: ${msg}`);
-            // #806: cap-include the stack on hard failures — the bare message
-            // gave no clue where the handler died (wedged-request forensics).
-            else if (err instanceof Error && err.stack) log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
-            else log("error", msg);
+            // #4254: a deliberate circuit-breaker fail-fast logs nothing here — the
+            // throttled [warn] at the throw site is the canonical record, so one dead
+            // upstream stops re-emitting a per-request [error]+stack on every round.
+            else if (!isExpectedFailFast(err)) {
+                // #806: cap-include the stack on hard failures — the bare message
+                // gave no clue where the handler died (wedged-request forensics).
+                if (err instanceof Error && err.stack) log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
+                else log("error", msg);
+            }
             if (!res.headersSent) {
-                const status = msg.includes("exceeds") ? 413 : 502;
-                // #3776 sub-defect 3: surface the machine-readable failure slice
-                // (kind/code/hint) alongside the free-text detail so clients can
-                // self-diagnose without reading bili's log. Additive — when no
-                // upstream failure is attached the body is byte-identical to before.
-                const uf = upstreamFailureOf(err);
-                const diag: Record<string, unknown> = {};
-                if (uf?.kind !== undefined) diag.kind = uf.kind;
-                if (uf?.code !== undefined) diag.code = uf.code;
-                if (uf?.hint !== undefined) diag.hint = uf.hint;
-                res.writeHead(status, { "content-type": "application/json" });
-                res.end(JSON.stringify({ error: "acp-proxy failure", detail: msg, ...(Object.keys(diag).length > 0 ? { upstreamFailure: diag } : {}) }));
+                // #4254: shared egress builder (startServer + inline engine render
+                // identically) — informative `error`, 503+Retry-After for a
+                // circuit-open fail-fast, additive structured diag.
+                const { status, headers, body } = buildProxyFailureResponse(msg, err);
+                res.writeHead(status, headers);
+                res.end(body);
             } else {
                 res.end();
             }

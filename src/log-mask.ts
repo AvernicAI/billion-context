@@ -228,6 +228,27 @@ function isLoopbackIp(ip: string): boolean {
     return ip === "::1" || ip === "0:0:0:0:0:0:0:1" || ip === "0.0.0.0" || ip.startsWith("127.");
 }
 
+/** #4254: is this a loopback host name/address? Loopback identifies a LOCAL
+ *  relay/endpoint, never an external party, so the diagnostic DISPLAY path
+ *  renders it verbatim (matching maskUrlForDiagnostics / maskIpsInText's
+ *  exemption) instead of masking it. Bracketed IPv6 and letter-case normalize. */
+export function isLoopbackHost(host: string): boolean {
+    const h = host.replace(/^\[|\]$/g, "").toLowerCase();
+    return h === "localhost" || isLoopbackIp(h);
+}
+
+/** #4254: display form of a `host[:port]` target under the LOOPBACK-EXEMPT rule —
+ *  the user-facing counterpart of maskHostPortForLog. Loopback renders verbatim
+ *  (so "127.0.0.1:7864" stays readable and actionable); any other non-public host
+ *  is masked with its port kept. Used by the upstream-failure egress path so one
+ *  message never mixes a raw loopback next to a masked <private-host>. */
+export function maskHostPortForDisplay(target: string): string {
+    const i = target.lastIndexOf(":");
+    if (i <= 0) return isLoopbackHost(target) ? target : maskHostForLog(target);
+    const host = target.slice(0, i);
+    return `${isLoopbackHost(host) ? host : maskHostForLog(host)}${target.slice(i)}`;
+}
+
 /**
  * Sink-level safety net (#1718): scrub non-loopback IP literals out of
  * arbitrary log text. undici/OS error messages embed the dialed endpoint
