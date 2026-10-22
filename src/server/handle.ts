@@ -1621,6 +1621,18 @@ async function handleRequest(
                     log("info", `[${sessionId}] [resume-inheritance] matched tracked chain ${resume.sessionId} but the parent session is not loadable — starting fresh (#1486)`);
                 }
             }
+        } else if (clientProvided && session.stats.requests === 0) {
+            // #4264: a SKIPPED gate must not be silent either — without this
+            // line, zero [resume-inheritance] output stays ambiguous between
+            // "gate skipped" and "pre-#4265 build / silent miss". First
+            // request only: stats.requests increments later in the prepare
+            // lanes, so this fires at most once per session. anonAffinity is
+            // structurally null here (only the anonymous lane sets it),
+            // leaving exactly three skip reasons.
+            const skipReason = session.metadata.derivedFromSessionId !== undefined ? "derivedFromSessionId"
+                : session.metadata.publicForkReceipt !== undefined ? "publicForkReceipt"
+                : "resumeInheritance=false";
+            log("debug", `[${sessionId}] [resume-inheritance] skipped: ${skipReason} (#4264)`);
         }
         // [#1333] explicitly derived conversations (pi RLM child, omp fork,
         // opencode subagent: the plugin reported its parent at register)
