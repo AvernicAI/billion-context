@@ -68,8 +68,14 @@ function bigConversation(pairs = 12): unknown[] {
     return messages;
 }
 
-async function postTurn(port: number, session: string, pairs = 12): Promise<{ status: number; body: string }> {
-    const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+// Route through the zero-config /bili/<upstream>/ prefix so the routes table
+// entry declared in startServer matches (window source=configured): a bare
+// /v1/messages request misses the table, falls back to the option-level
+// window, and reads as fallback-derived — where the #282 floor lifts any
+// reserved sub-100K window to 100K and dilutes the pressure bands these tests
+// exercise (#4205).
+async function postTurn(port: number, upstreamUrl: string, session: string, pairs = 12): Promise<{ status: number; body: string }> {
+    const res = await fetch(`http://127.0.0.1:${port}/bili/${upstreamUrl}/v1/messages`, {
         method: "POST",
         headers: {
             "content-type": "application/json",
@@ -132,13 +138,14 @@ test("auto-fold fires below the window via the external chain, and the model see
     const port = (server.address() as AddressInfo).port;
     process.env.E2E_SUM_KEY = "k";
 
-    // ~40K tokens = 80% of the 50K window. On a first turn the growth gate
+    // ~40K tokens ≈ 82% of the reserved 48_976 judging window (#4205:
+    // declared 50K − max_tokens 1024). On a first turn the growth gate
     // is idle by construction (growthSinceReference = 0), so the ONLY classic
     // nudge path at this size is the pressure band (usage >= 75%), which
     // bypasses the growth gate — the control arm in the "auto-fold off" test
     // proves a nudge WOULD fire here without auto-fold. The 8192 growth floor
     // owns the cadence instead.
-    const turn = await postTurn(port, "autofold-1", 36);
+    const turn = await postTurn(port, main.url, "autofold-1", 36);
     assert.equal(turn.status, 200);
 
     // The external chain did the folding (zero model involvement).
@@ -198,7 +205,7 @@ test("auto-fold off: no growth fold below the window (growthArmed only when enga
     const port = (server.address() as AddressInfo).port;
     process.env.E2E_SUM_KEY = "k";
 
-    const turn = await postTurn(port, "autofold-off");
+    const turn = await postTurn(port, main.url, "autofold-off");
     assert.equal(turn.status, 200);
     assert.equal(sum.bodies.length, 0, "external chain must not fold when autoFold is off and the payload fits the window");
     const forwarded = main.bodies.at(-1) as { messages?: unknown[] };
@@ -208,17 +215,18 @@ test("auto-fold off: no growth fold below the window (growthArmed only when enga
     // size with auto-fold off. The usage meter is cold on turn 1 (usage=0%,
     // growth ref = self — a first-turn nudge is structurally impossible), so
     // turn 1 only warms the baseline via the stub's honest 42K bill; turn 2
-    // sits at 84% usage = pressure band, where the classic cadence MUST
+    // sits at ≈86% usage (42_000 billed / 48_976 reserved) = pressure band,
+    // where the classic cadence MUST
     // inject "Context breakdown:". That proves the first test's absence
     // assertion targets a live, firing cadence — not an always-idle one.
-    const warm = await postTurn(port, "autofold-off-pressure", 36);
+    const warm = await postTurn(port, main.url, "autofold-off-pressure", 36);
     assert.equal(warm.status, 200);
     assert.equal(sum.bodies.length, 0, "external chain stays idle below the window even in the pressure band");
-    const pressure = await postTurn(port, "autofold-off-pressure", 36);
+    const pressure = await postTurn(port, main.url, "autofold-off-pressure", 36);
     assert.equal(pressure.status, 200);
     assert.equal(sum.bodies.length, 0, "classic nudges never call the external chain");
     const pressured = JSON.stringify(main.bodies.at(-1));
-    assert.ok(pressured.includes("Context breakdown:"), "control arm: classic cadence nudges at 84% usage without auto-fold");
+    assert.ok(pressured.includes("Context breakdown:"), "control arm: classic cadence nudges at ≈86% usage without auto-fold");
 });
 
 test("auto-fold fail-open: broken chain forwards the request instead of failing it", async () => {
@@ -257,7 +265,7 @@ test("auto-fold fail-open: broken chain forwards the request instead of failing 
     const port = (server.address() as AddressInfo).port;
     process.env.E2E_SUM_KEY = "k";
 
-    const turn = await postTurn(port, "autofold-fail");
+    const turn = await postTurn(port, main.url, "autofold-fail");
     assert.equal(turn.status, 200, "growth-fold failure must forward (fail-open), not fail the request");
     assert.ok(main.bodies.length >= 1, "payload reached the main upstream");
     const text = JSON.stringify(main.bodies.at(-1));
@@ -302,7 +310,7 @@ test("auto-fold backoff: a failed growth fold arms a cooldown — the next turn 
 
     // Turn 1: the chain is down — the growth fold fails, the request still
     // forwards (fail-open), and the failure arms the 10-minute backoff.
-    const turn1 = await postTurn(port, "autofold-backoff");
+    const turn1 = await postTurn(port, main.url, "autofold-backoff");
     assert.equal(turn1.status, 200, "turn 1 must forward despite the failing chain");
     assert.ok(sum.bodies.length >= 1, `turn 1 attempted external summaries, got ${sum.bodies.length}`);
 
@@ -310,7 +318,7 @@ test("auto-fold backoff: a failed growth fold arms a cooldown — the next turn 
     // gate disengages auto-fold BEFORE any attempt, so the external chain is
     // never called again and the payload forwards raw.
     const attemptsAfterTurn1 = sum.bodies.length;
-    const turn2 = await postTurn(port, "autofold-backoff");
+    const turn2 = await postTurn(port, main.url, "autofold-backoff");
     assert.equal(turn2.status, 200, "turn 2 must forward (backoff = skip, not fail)");
     assert.equal(sum.bodies.length, attemptsAfterTurn1, "backoff must skip external calls on the very next turn");
     const forwarded2 = main.bodies.at(-1) as { messages?: unknown[] };
@@ -379,7 +387,7 @@ test("auto-fold backoff: a pure queue-drop (zero dispatched attempts) does NOT a
         // Turn 1: every batch is dropped in the queue. The fold makes zero
         // progress, yet NOTHING was wrong with the chain — under the pre-#2662
         // policy this still armed the 10-minute cooldown.
-        const turn1 = await postTurn(port, "autofold-qdrop", 36);
+        const turn1 = await postTurn(port, main.url, "autofold-qdrop", 36);
         assert.equal(turn1.status, 200, "queue-dropped fold must still forward (fail-open)");
         assert.equal(sum.bodies.length, 0, "pure queue-drop: no summary call may reach the endpoint at all");
         const forwarded1 = main.bodies.at(-1) as { messages?: unknown[] };
@@ -389,7 +397,7 @@ test("auto-fold backoff: a pure queue-drop (zero dispatched attempts) does NOT a
         // retries the chain and the fold lands.
         releaseHolders();
         await Promise.all(holders);
-        const turn2 = await postTurn(port, "autofold-qdrop", 36);
+        const turn2 = await postTurn(port, main.url, "autofold-qdrop", 36);
         assert.equal(turn2.status, 200, "turn 2 must forward");
         assert.ok(sum.bodies.length >= 1, `backoff must NOT have armed on pure queue-drops; expected external calls on turn 2, got ${sum.bodies.length}`);
         const forwarded2 = main.bodies.at(-1) as { messages?: unknown[] };
@@ -499,9 +507,9 @@ test("degenerate sub-MIN growth window: classic nudges still fire (no silent sup
     const port = (server.address() as AddressInfo).port;
     process.env.E2E_SUM_KEY = "k";
 
-    const warm = await postTurn(port, "deg-win", 2);
+    const warm = await postTurn(port, main.url, "deg-win", 2);
     assert.equal(warm.status, 200, "warm-up turn forwards cleanly");
-    const turn = await postTurn(port, "deg-win", 2);
+    const turn = await postTurn(port, main.url, "deg-win", 2);
     assert.equal(turn.status, 200, "turn 2 must forward cleanly");
     assert.equal(sum.bodies.length, 0, "growth folding never engaged (degenerate window) — no external calls");
     const text = JSON.stringify(main.bodies.at(-1));
@@ -546,9 +554,9 @@ test("explicit autoFoldTargetTokens clamped to the window: classic nudges still 
     const port = (server.address() as AddressInfo).port;
     process.env.E2E_SUM_KEY = "k";
 
-    const warm = await postTurn(port, "deg-target", 36);
+    const warm = await postTurn(port, main.url, "deg-target", 36);
     assert.equal(warm.status, 200, "warm-up turn forwards cleanly");
-    const turn = await postTurn(port, "deg-target", 36);
+    const turn = await postTurn(port, main.url, "deg-target", 36);
     assert.equal(turn.status, 200, "turn 2 must forward cleanly");
     assert.equal(sum.bodies.length, 0, "clamped target is a no-op growth config — no external calls");
     const text = JSON.stringify(main.bodies.at(-1));
