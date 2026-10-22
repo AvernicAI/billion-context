@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { CompressibleRange, CoreMessage, NudgeDecision } from "acp-kernel";
-import { assignRefs, createCore, createInitialState, defaultConfig, emptyRefMap } from "acp-kernel";
+import { assignRefs, coveredMessageIds, createCore, createInitialState, defaultConfig, emptyRefMap } from "acp-kernel";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
 import { handleAcpStatus } from "../src/acp-status.ts";
@@ -172,6 +172,40 @@ test("#4331 P2: tier-distillation precedence — no stop signal AND no uncovered
     assert.ok(out.startsWith("[Compressed"), `expected success receipt, got: ${out.slice(0, 160)}`);
     assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "tier active: no stop signal:\n" + out);
     assert.ok(!out.includes(UNCOVERED_HEADER), "tier active: uncovered verdict suppressed too:\n" + out);
+});
+
+test("#4331 P4: tier-2 parents carry their children's coverage — the audit never reports child spans as uncovered", () => {
+    // Reviewer note on the #4331 thread: in their CED-T session a tier-2
+    // parent's STORED effective list looked empty on a DB-side walk while its
+    // children covered the spans. The state model must not have that hole:
+    // every block-creation path unions consumed children's effectiveMessageIds
+    // into the new parent (kernel/src/unit-projection.ts:178-183) and
+    // deactivates the children (kernel/src/compress.ts:1578-1581), so
+    // coveredMessageIds — the active-block union the audit relies on
+    // (kernel/src/state.ts:57-64) — sees the full distilled span. Pin it:
+    // fold three adjacent T1 blocks, distill them into one T2 parent, then
+    // the audit must not name any ref inside the distilled region.
+    const ctx = withRefs(makeCtx(buildSession(16, 4000, "bash"), { preserveRecentMessages: 3, preserveRecentTokens: 100 }));
+    const s1 = turnSpan(1, 5);
+    const s2 = turnSpan(6, 10);
+    const s3 = turnSpan(11, 15);
+    setOffer(ctx, [offerRange(s1.startRef, s1.endRef, 45), offerRange(s2.startRef, s2.endRef, 45), offerRange(s3.startRef, s3.endRef, 45)]);
+    const out = runApply(ctx, foldArgs([s1, s2, s3]));
+    assert.ok(out.startsWith("[Compressed"), `expected success receipt, got: ${out.slice(0, 160)}`);
+    const refNum = (ref: string) => Number(ref.replace(/\D/g, ""));
+    const t1s = ctx.session.state.blocks.filter((b) => b.tier === 1 && b.active).sort((a, b) => refNum(a.startRef ?? "") - refNum(b.startRef ?? ""));
+    assert.equal(t1s.length, 3, "three T1 blocks expected before distillation");
+    const distillOut = runApply(ctx, foldArgs([{ startRef: t1s[0].blockId, endRef: t1s[2].blockId }]));
+    assert.ok(distillOut.startsWith("[Compressed"), `expected distillation receipt, got: ${distillOut.slice(0, 160)}`);
+    const parent = ctx.session.state.blocks.find((b) => b.tier === 2 && b.active);
+    assert.ok(parent, "T2 parent expected after distillation");
+    assert.equal(ctx.session.state.blocks.filter((b) => b.tier === 1 && b.active).length, 0, "children must be deactivated");
+    const covered = coveredMessageIds(ctx.session.state);
+    for (const i of [9, 89, 134]) {
+        assert.ok(covered.has(ctx.messages[i].id), `message idx ${i} (inside the distilled span) must stay covered via the T2 parent`);
+    }
+    const runs = uncoveredHistoryRuns({ core: ctx.core, messages: ctx.messages, state: ctx.session.state, config: ctx.config, tokenCount: 100000 });
+    assert.ok(!runs.some((r) => refNum(r.startRef) <= 135 && refNum(r.endRef) >= 10), `distilled T2 span leaked into the audit: ${JSON.stringify(runs)}`);
 });
 
 test("#4331 P3: acp_status names uncovered runs that no offer covers (additive section)", () => {

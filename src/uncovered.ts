@@ -52,6 +52,12 @@ interface UncoveredAuditInput {
   /** Spans the model can act on right now (post-filter offer / remaining list).
    *  Runs overlapping these are NOT reported — they are surfaced elsewhere. */
   actionableSpans?: readonly { startRef: string; endRef: string }[];
+  /** A caller that already ran the normal-config offer pass may pass its
+   *  ranges here so the audit skips re-running it (acp_status reuses its live
+   *  Compressible-ranges pass, cutting the audit from two processTurn calls
+   *  to one on that surface). UNDEFINED means "no caller data" — the audit
+   *  runs its own normal pass; an array (even empty) means "trust this". */
+  normalRanges?: readonly { startRef: string; endRef: string }[];
 }
 
 interface RunEntry {
@@ -112,7 +118,7 @@ export function uncoveredHistoryRuns(input: UncoveredAuditInput): UncoveredRun[]
   }
 
   // 3) Empirical zone diff. Cloned state: see header note on cadence stamps.
-  let normalWindows: SpanWindow[] = [];
+  const normalWindows = input.normalRanges ? windowsOf(input.normalRanges) : [];
   let relaxedWindows: SpanWindow[] = [];
   try {
     const clone = structuredClone(state);
@@ -123,9 +129,11 @@ export function uncoveredHistoryRuns(input: UncoveredAuditInput): UncoveredRun[]
       contentStore: input.contentStore,
       applyView: input.applyView,
     };
-    normalWindows = windowsOf(
-      core.processTurn({ ...base, state: clone, config }).nudge?.compressibleRanges ?? [],
-    );
+    if (!input.normalRanges) {
+      normalWindows.push(...windowsOf(
+        core.processTurn({ ...base, state: clone, config }).nudge?.compressibleRanges ?? [],
+      ));
+    }
     relaxedWindows = windowsOf(
       core
         .processTurn({

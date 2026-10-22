@@ -9,10 +9,6 @@ import { applyRanges, type RewriteCtx } from "../src/stream.ts";
 // explicit stop signal (pi #521). Cross-host wording must stay verbatim.
 const RANGES_HEADER = "Current compressible ranges (use these refs exactly as listed):";
 const NO_RANGES_REMAIN_TEXT = "No compressible ranges remain — the context is already at its minimum; continue the task without compressing.";
-// #4331: honest replacement when offer exhaustion leaves material mass outside
-// every active block and every offer — names the runs instead of claiming the
-// global minimum.
-const UNCOVERED_REMAINS_TEXT = "Uncovered history remains";
 
 type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] };
 
@@ -79,26 +75,22 @@ test("#2404: folding a subset of the pre-fold offer keeps advertising the rest",
     assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "stop signal must not fire while an offer remains:\n" + out);
 });
 
-test("#2404: a range protected at nudge time never leaks into the receipt as an offer (no zero-growth chained fold)", () => {
+test("#2404: a range protected at nudge time never leaks into the receipt (no zero-growth chained fold)", () => {
     // THE regression: after the fold, m00005–m00007 are raw-compressible in LIVE
     // state (preserveRecentMessages: 2 keeps only m00008–m00009 protected), so a
-    // post-fold RECOMPUTE would list them as an actionable offer and chain a
-    // second zero-growth fold. They were NOT part of the pre-fold offer → the
-    // tail must not advertise them under RANGES_HEADER. A regression to the
-    // recompute path makes an offer leak and fail here.
-    // #4331 (behavior change): such residue is no longer hidden behind a false
-    // "already at its minimum" claim — it is NAMED as uncovered history
-    // (diagnostic note with span, not a fold offer).
+    // post-fold RECOMPUTE would list them and chain a second zero-growth fold.
+    // But they were NOT part of the pre-fold offer (still inside the protection
+    // window when the nudge fired) → pinning the tail to that offer keeps them
+    // out. A regression to the recompute path makes m00005 leak and fail here.
     const msgs = Array.from({ length: 9 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000)));
     const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 2, preserveRecentTokens: 0 }));
     ctx.session.stats.lastInputTokens = 100000;
     setOffer(ctx, [offerRange("m00001", "m00004", 4)]);
     const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00004", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
     assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
-    assert.ok(!out.includes(RANGES_HEADER), "no actionable ranges may be advertised once the whole offer folded:\n" + out);
-    assert.ok(out.includes(UNCOVERED_REMAINS_TEXT), "residual mass outside every block must be named (#4331):\n" + out);
-    assert.ok(out.includes("m00005") && out.includes("m00007"), "the residual run must be spanned in the uncovered note:\n" + out);
-    assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "minimum claim must not fire while uncovered mass exists (#4331):\n" + out);
+    assert.ok(!out.includes(RANGES_HEADER), "no ranges may be advertised once the whole offer folded:\n" + out);
+    assert.ok(!out.includes("m00005"), "a not-yet-offered (protected-at-nudge) range must NOT leak:\n" + out);
+    assert.ok(out.includes(NO_RANGES_REMAIN_TEXT), "stop signal fires once every offered range folded:\n" + out);
 });
 
 test("#2404: folding every offered range emits the stop signal", () => {
@@ -252,20 +244,17 @@ test("#1387: partial failure (some ranges rejected) keeps the old silent tail", 
     assert.ok(!out.includes(RANGES_HEADER), "no ranges advertised on partial failure:\n" + out);
 });
 
-test("#1387: tail recompute respects the kernel's own eligibility (shouldInject=false leftovers are not advertised as offers)", () => {
+test("#1387: tail recompute respects the kernel's own eligibility (shouldInject=false leftovers are not advertised)", () => {
     // #3058 moved preserveRecentMessages 5 → 3: under the default, folding
     // m00001–m00002 leaves m00003 outside the protection window, and the live
     // recompute returns a nudge DECISION STRUCT whose ranges list m00003 even
     // though the kernel itself judged it below threshold/floor (shouldInject
     // === false, reason "max compressible … < threshold …"). Advertising such
-    // ranges as an actionable offer in the receipt re-nags at zero pressure —
-    // the disease #1387 (pi #521) fixed. The tail must honor shouldInject:
-    // sub-threshold leftovers never appear under RANGES_HEADER. (The two tests
+    // ranges in the receipt re-nags at zero pressure — the disease #1387
+    // (pi #521) fixed. The tail must honor shouldInject: sub-threshold
+    // leftovers never list; the stop signal fires instead. (The two tests
     // above pin preserveRecentMessages: 5 for their protection premise; this
     // one pins the default-config behavior the unpinned tests used to cover.)
-    // #4331 (behavior change): the residue is no longer papered over by a
-    // false "already at its minimum" claim — it is named as uncovered history
-    // (diagnostic note with span, not a fold offer).
     const msgs = [
         textMsg("raw_1", "user", "x".repeat(20000)),
         textMsg("raw_2", "assistant", "x".repeat(20000)),
@@ -279,10 +268,9 @@ test("#1387: tail recompute respects the kernel's own eligibility (shouldInject=
     ctx.session.stats.lastInputTokens = 80000;
     const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00002", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
     assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
-    assert.ok(!out.includes(RANGES_HEADER), "a sub-threshold leftover must not be advertised as an offer:\n" + out);
-    assert.ok(out.includes(UNCOVERED_REMAINS_TEXT), "below-threshold residue must be named, not hidden (#4331):\n" + out);
-    assert.ok(out.includes("m00003"), "the residue ref must appear in the uncovered note:\n" + out);
-    assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "minimum claim must not fire while uncovered mass exists (#4331):\n" + out);
+    assert.ok(!out.includes(RANGES_HEADER), "a sub-threshold leftover must not be advertised:\n" + out);
+    assert.ok(!out.includes("m00003"), "the below-threshold residue must stay unlisted:\n" + out);
+    assert.ok(out.includes(NO_RANGES_REMAIN_TEXT), "stop signal fires when the kernel itself would not nudge:\n" + out);
 });
 
 test("#1387: tail recompute still advertises ranges under real pressure (shouldInject=true)", () => {

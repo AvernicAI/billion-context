@@ -516,6 +516,10 @@ function droppedEntriesNote(diagnostics: CompressParseDiagnostics): string {
 // past the session tail and burn a round on kernel rejection. Wording is
 // verbatim pi-side so both hosts speak the same contract.
 const NO_RANGES_REMAIN_TEXT = "No compressible ranges remain — the context is already at its minimum; continue the task without compressing.";
+// #4331 / pi #521 anti-nag rule: below this TOTAL uncovered mass the receipt
+// keeps the legacy wording — small leftovers outside the offer must not re-nag
+// on every fold. Material leaks (the #4331 class: tens of K tokens raw) override it.
+const UNCOVERED_RECEIPT_FLOOR_TOKENS = 10_000;
 
 // #2404: the tail's "remaining ranges" is the LAST NUDGE's offer (the pre-fold
 // set the model acted on) minus the just-folded spans — NOT a fresh post-fold
@@ -626,7 +630,9 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
         if (runs.length > 0) {
             const totalMsgs = runs.reduce((s, r) => s + r.count, 0);
             const totalTok = runs.reduce((s, r) => s + r.tokens, 0);
-            return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect with acp_status(scope:"uncompressed").`;
+            if (totalTok >= UNCOVERED_RECEIPT_FLOOR_TOKENS) {
+                return `\n\nUncovered history remains — all offered ranges are folded, but ${totalMsgs} msg(s) across ${runs.length} run(s), ${shortTokenCount(totalTok)} tok, sit outside every active block and are not in this call's offer: ${describeUncoveredRuns(runs)}. The context is not at its minimum (runs may sit below the fold-size gate — named for visibility, not as fold suggestions); inspect with acp_status(scope:"uncompressed").`;
+            }
         }
     } catch {
         // Fall through to the contract wording below.
