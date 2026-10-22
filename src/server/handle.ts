@@ -34,7 +34,7 @@ import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
 import { affinityToken, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity } from "../session-id.js";
 import { personaConversationOrder } from "../session-resolve.js";
-import { prefixAffinity, type AnonymousAffinity } from "../prefix-affinity.js";
+import { prefixAffinity, describeResumeMiss, type AnonymousAffinity } from "../prefix-affinity.js";
 import { buildAnonymousProvenance, type AnonymousProvenance } from "../anon-provenance.js";
 import { maybeAdoptForkBlocks, maybeAdoptResume, maybeAdoptDerivedFork } from "../fork-adoption.js";
 import { executeThreadsReforge } from "./threads-lane.js";
@@ -1578,10 +1578,22 @@ async function handleRequest(
                 }
             }
             if (!resume) {
+                const affinityList = affinityMessageList();
                 const matched = derivedParent !== undefined
-                    ? prefixAffinity.findResumeParentWithin(derivedParent, affinityMessageList(), sessionId)
-                    : prefixAffinity.findResumeParent(affinityMessageList(), sessionId);
-                if (matched) resume = { sessionId: matched.sessionId, sharedDepth: matched.sharedDepth, via: `${matched.sharedDepth} msg(s) byte-exact prefix` };
+                    ? prefixAffinity.findResumeParentWithin(derivedParent, affinityList, sessionId)
+                    : prefixAffinity.findResumeParent(affinityList, sessionId);
+                if (matched) {
+                    resume = { sessionId: matched.sessionId, sharedDepth: matched.sharedDepth, via: `${matched.sharedDepth} msg(s) byte-exact prefix` };
+                } else {
+                    // #4264: a miss must not be silent — equal-depth replay,
+                    // parent-chain absence and head break need completely
+                    // different fixes, so name the closest near-miss.
+                    // Diagnostics only: matching above is untouched.
+                    const miss = derivedParent !== undefined
+                        ? prefixAffinity.diagnoseResumeMiss(affinityList, sessionId, derivedParent)
+                        : prefixAffinity.diagnoseResumeMiss(affinityList, sessionId);
+                    log(miss.best !== undefined ? "info" : "debug", `[${sessionId}] [resume-inheritance] miss: ${describeResumeMiss(miss)} (#4264)`);
+                }
             }
             if (resume) {
                 const resumeParent = loadParent(resume.sessionId);

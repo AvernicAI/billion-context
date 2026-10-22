@@ -520,6 +520,85 @@ function containsRun(haystack: string[], needle: string[]): boolean {
     return false;
 }
 
+/** #4264: one judged candidate inside a ResumeMissReport. */
+export interface ResumeMissCandidate {
+    sessionId: string;
+    /** Stored chain depth (neutral turns for hv2, raw messages for hv1). */
+    chainDepth: number;
+    /** Incoming depth in the candidate's hash domain. */
+    incomingDepth: number;
+    /** 2 = wire-neutral domain, 1 = pre-upgrade raw-wire domain. */
+    hashDomain: 1 | 2;
+    /** Why this candidate was not accepted as a resume parent — the same
+     *  gates findResumeParent applies, reported: "equal-depth" is a
+     *  byte-exact replay at exactly the stored depth under another id (a
+     *  duplicate conversation, rejected by design #1486); "prefix-break" is
+     *  a deeper incoming history whose head-anchored progressive hash at
+     *  the stored depth differs (the shared prefix broke somewhere);
+     *  "truncated" is an incoming history SHORTER than the stored chain
+     *  (cannot be a resume — a resume adds at least one message). */
+    kind: "equal-depth" | "prefix-break" | "truncated";
+    /** First cell index whose per-item hash differs from the stored chain,
+     *  when verifiable from the stored trailing window. null: the whole
+     *  inspectable overlap matched (the break sits before windowStart) or
+     *  no overlap exists at all. */
+    firstDivergence: number | null;
+    /** First stored position inspectable via the trailing itemHashes window
+     *  (0 for chains ≤ MAX_STORED_ITEMS deep). */
+    windowStart: number;
+    /** true when the inspectable overlap is non-empty and every overlapped
+     *  cell matches byte-for-byte. */
+    tailWindowIntact: boolean;
+    /** 8-hex fragments of the diverging cells (log correlation only). */
+    incomingCell?: string;
+    storedCell?: string;
+}
+
+/** #4264: diagnostics-only report for a resume-inheritance miss. */
+export interface ResumeMissReport {
+    /** Tracked chains that passed the pre-screen (depth ≥
+     *  MIN_RESUME_PREFIX, id ≠ self, in-domain floor) and were actually
+     *  judged. 0 with no declaredParentState = nothing eligible to begin
+     *  with (parent chain absent — LRU eviction or never noted). */
+    eligible: number;
+    /** Scoped match only: state of the declared parent's own chain when it
+     *  could not even be judged. */
+    declaredParentState?: "untracked" | "too-shallow";
+    /** Best near-miss candidate (closest by kind rank, then deepest chain,
+     *  then most recently seen), when any eligible candidate existed. */
+    best?: ResumeMissCandidate;
+}
+
+/** #4264: render a ResumeMissReport as the bounded log-line body. Pure
+ *  formatting — the caller picks the level (info when report.best exists,
+ *  debug otherwise). */
+export function describeResumeMiss(report: ResumeMissReport): string {
+    const b = report.best;
+    if (!b) {
+        const scope = report.declaredParentState !== undefined ? `; declared parent chain ${report.declaredParentState}` : "";
+        return `no eligible tracked chain (floor ${MIN_RESUME_PREFIX}${scope})`;
+    }
+    switch (b.kind) {
+        case "equal-depth":
+            return `no byte-exact resume among ${report.eligible} eligible chain(s); closest ${b.sessionId} is a byte-exact EQUAL-DEPTH replay (${b.chainDepth} msgs == incoming ${b.incomingDepth}) — duplicate conversation, not a resume by design`;
+        case "truncated":
+            return `no byte-exact resume among ${report.eligible} eligible chain(s); closest ${b.sessionId} (chain ${b.chainDepth}) is LONGER than the incoming history (${b.incomingDepth} msgs)${b.tailWindowIntact ? `, visible cells ${b.windowStart}..${b.incomingDepth - 1} intact — truncated replay` : ""}`;
+        case "prefix-break": {
+            let detail: string;
+            if (b.firstDivergence !== null) {
+                detail = b.windowStart > 0
+                    ? `first divergence found at cell ${b.firstDivergence} (stored ${b.storedCell} vs incoming ${b.incomingCell}; cells 0..${b.windowStart - 1} uninspectable — chain deeper than the ${MAX_STORED_ITEMS}-cell window)`
+                    : `first divergence at cell ${b.firstDivergence} (stored ${b.storedCell} vs incoming ${b.incomingCell})`;
+            } else if (b.tailWindowIntact) {
+                detail = `tail window (cells ${b.windowStart}..${Math.min(b.chainDepth, b.incomingDepth) - 1}) byte-intact — break sits BEFORE cell ${b.windowStart}`;
+            } else {
+                detail = "head-anchored prefix broken (no inspectable overlap)";
+            }
+            return `no byte-exact resume among ${report.eligible} eligible chain(s); closest ${b.sessionId} (chain ${b.chainDepth}, incoming ${b.incomingDepth}): ${detail}`;
+        }
+    }
+}
+
 export class PrefixAffinityResolver {
     private trackedChains = new Map<string, ChainEntry>();
 
@@ -988,6 +1067,91 @@ export class PrefixAffinityResolver {
         if (len <= entry.depth) return null;
         if (hashes[entry.depth - 1] !== entry.tailHash) return null;
         return { sessionId: parentId, sharedDepth: entry.depth };
+    }
+
+    /** #4264: diagnostics-only explanation of a resume-inheritance MISS
+     *  (the gate passed but findResumeParent/findResumeParentWithin returned
+     *  null). It re-runs the SAME gates in reporting mode and names why the
+     *  closest near-miss was rejected; it never influences matching. The
+     *  three causes need completely different fixes, so they are reported
+     *  distinctly: equal-depth replay (a duplicate conversation by design),
+     *  parent-chain absence (LRU eviction / never noted), head break (host
+     *  rebuild drift desynchronizes the byte-exact prefix). Cost-bounded:
+     *  the candidate scan does only O(1) progressive-hash checks per entry;
+     *  the per-item divergence scan runs ONCE on the single best near-miss,
+     *  over its stored trailing window (≤ MAX_STORED_ITEMS compares). */
+    diagnoseResumeMiss(messages: unknown[], selfSessionId: string, declaredParent?: string): ResumeMissReport {
+        const msgs = normalizeAffinityMessages(messages);
+        if (!hasUserMessage(msgs)) return { eligible: 0 };
+        // #2791: judge each candidate in the hash domain it was noted in —
+        // same dual-domain discipline as findResumeParent. #2824: hashes-only
+        // consumers pay nothing for sketches; itemHashes come from the same
+        // fused pass at no extra cost.
+        const turns = neutralTurns(messages);
+        const fp2 = neutralFingerprints(turns, 0);
+        const hashesV2 = fp2.hashes;
+        const hashesV1 = chainHashes(msgs);
+        if (hashesV2.length === 0 && hashesV1.length === 0) return { eligible: 0 };
+        type Candidate = { id: string; entry: ChainEntry; kind: ResumeMissCandidate["kind"]; rank: number };
+        const cands: Candidate[] = [];
+        let declaredParentState: "untracked" | "too-shallow" | undefined;
+        const consider = (id: string, entry: ChainEntry): void => {
+            if (id === selfSessionId) return;
+            if (entry.depth < MIN_RESUME_PREFIX) return;
+            const hv2 = entry.hv === 2;
+            const hashes = hv2 ? hashesV2 : hashesV1;
+            const len = hv2 ? turns.length : msgs.length;
+            if (hashes.length < MIN_RESUME_PREFIX) return;
+            let kind: ResumeMissCandidate["kind"];
+            if (len < entry.depth) kind = "truncated";
+            else if (len === entry.depth && hashes[entry.depth - 1] === entry.tailHash) kind = "equal-depth";
+            else kind = "prefix-break";
+            cands.push({ id, entry, kind, rank: kind === "equal-depth" ? 0 : kind === "prefix-break" ? 1 : 2 });
+        };
+        if (declaredParent !== undefined && declaredParent !== selfSessionId) {
+            const entry = this.trackedChains.get(declaredParent);
+            if (entry === undefined) declaredParentState = "untracked";
+            else if (entry.depth < MIN_RESUME_PREFIX) declaredParentState = "too-shallow";
+            else consider(declaredParent, entry);
+        } else if (declaredParent === undefined) {
+            for (const [id, entry] of this.trackedChains) consider(id, entry);
+        }
+        if (cands.length === 0) return { eligible: 0, ...(declaredParentState !== undefined ? { declaredParentState } : {}) };
+        cands.sort((a, b) => a.rank - b.rank || b.entry.depth - a.entry.depth || b.entry.lastSeen - a.entry.lastSeen);
+        const top = cands[0]!;
+        const hv2 = top.entry.hv === 2;
+        const depth = top.entry.depth;
+        const len = hv2 ? turns.length : msgs.length;
+        // Lazy v1 per-item pass: only paid when the winner is a legacy raw-wire entry.
+        const itemIncoming = hv2 ? fp2.itemHashes : perItemHashes(msgs);
+        const windowStart = Math.max(0, depth - top.entry.itemHashes.length);
+        const end = Math.min(depth, len);
+        let firstDivergence: number | null = null;
+        let tailWindowIntact = false;
+        if (windowStart < end) {
+            tailWindowIntact = true;
+            for (let i = windowStart; i < end; i++) {
+                if (itemIncoming[i] !== top.entry.itemHashes[i - windowStart]) {
+                    firstDivergence = i;
+                    tailWindowIntact = false;
+                    break;
+                }
+            }
+        }
+        const best: ResumeMissCandidate = {
+            sessionId: top.id,
+            chainDepth: depth,
+            incomingDepth: len,
+            hashDomain: hv2 ? 2 : 1,
+            kind: top.kind,
+            firstDivergence,
+            windowStart,
+            tailWindowIntact,
+            ...(firstDivergence !== null
+                ? { incomingCell: itemIncoming[firstDivergence]?.slice(0, 8), storedCell: top.entry.itemHashes[firstDivergence - windowStart]?.slice(0, 8) }
+                : {}),
+        };
+        return { eligible: cands.length, ...(declaredParentState !== undefined ? { declaredParentState } : {}), best };
     }
 
     /** #2241: does `messages` continue the tracked chain of `sessionId`?
