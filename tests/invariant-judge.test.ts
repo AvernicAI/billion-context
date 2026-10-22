@@ -317,3 +317,84 @@ test("PR-D closure: a REAL mid-history rewrite still flags through the echo norm
   assert.equal(v.ok, false);
   assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"));
 });
+
+// #4241 — snapshot-render lane tail-fidelity. On a turn where prepare's snapshot
+// render served the outbound prefix, the raw inbound prefix was INTENTIONALLY
+// replaced by server rows + summary anchors; only the client tail (>= renderTailStart)
+// is promised byte-intact. The judge validates exactly that suffix; the rendered
+// prefix is exempt from the frozen-prefix rule while I2 stays armed on the tail.
+const renderCarrier = () => mk("system", "text", "[Compressed conversation section] b5", { summaryOfBlockId: "b5" });
+
+test("#4241 POS bug-repro: covered region replaced by server view + intact tail ⇒ green (was false-positive red)", () => {
+  const entry = [mk("user", "text", "old-a"), mk("assistant", "text", "old-b"), mk("user", "text", "old-c"), mk("user", "text", "new question")];
+  const exit = [mk("user", "text", "canon-x"), mk("assistant", "text", "canon-y"), renderCarrier(), mk("user", "text", "new question")];
+  // Without render-lane awareness this turn reads as a mid-history rewrite — the reported false positive:
+  const legacy = judgeInboundOutbound(entry, exit);
+  assert.equal(legacy.ok, false);
+  assert.ok(legacy.violations.some((x) => x.kind === "mid-history-rewrite"));
+  // With renderTailStart=3 (first client index of the live tail) only the tail is validated:
+  const v = judgeInboundOutbound(entry, exit, { renderTailStart: 3 });
+  assert.equal(v.ok, true);
+  assert.equal(v.renderLane, true);
+  assert.equal(v.matched, 1);
+  assert.equal(v.total, 1);
+  assert.equal(v.folded, true);
+});
+
+test("#4241 NEG control: a corrupted tail message still goes red on the render lane (teeth remain)", () => {
+  const entry = [mk("user", "text", "old"), mk("user", "text", "original words")];
+  const exit = [mk("user", "text", "canon"), renderCarrier(), mk("user", "text", "rewritten words")];
+  const v = judgeInboundOutbound(entry, exit, { renderTailStart: 1 });
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite"));
+});
+
+test("#4241 NEG control: a dropped tail message still goes red on the render lane", () => {
+  const entry = [mk("user", "text", "old"), mk("user", "text", "keep me"), mk("assistant", "text", "and me")];
+  const exit = [mk("user", "text", "canon"), renderCarrier(), mk("user", "text", "keep me")];
+  const v = judgeInboundOutbound(entry, exit, { renderTailStart: 1 });
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-drop"));
+});
+
+test("#4241 POS: multiple intact tail messages all match in order across the server prefix", () => {
+  const entry = [mk("user", "text", "c0"), mk("assistant", "text", "c1"), mk("user", "text", "q"), mk("assistant", "text", "a"), mk("user", "text", "q2")];
+  const exit = [mk("user", "text", "canon"), renderCarrier(), mk("user", "text", "q"), mk("assistant", "text", "a"), mk("user", "text", "q2")];
+  const v = judgeInboundOutbound(entry, exit, { renderTailStart: 2 });
+  assert.equal(v.ok, true);
+  assert.equal(v.matched, 3);
+  assert.equal(v.total, 3);
+  assert.equal(v.renderLane, true);
+});
+
+test("#4241 POS edge: fully-covered turn (empty tail) is green with nothing to validate", () => {
+  const entry = [mk("user", "text", "covered-0"), mk("assistant", "text", "covered-1")];
+  const exit = [mk("user", "text", "canon-0"), renderCarrier()];
+  const v = judgeInboundOutbound(entry, exit, { renderTailStart: 2 });
+  assert.equal(v.ok, true);
+  assert.equal(v.matched, 0);
+  assert.equal(v.total, 0);
+  assert.equal(v.renderLane, true);
+});
+
+test("#4241 wiring: maybeRunInvariantJudge honors renderTailStart (green on rendered shape, red without)", () => {
+  const seen: JudgeVerdict[] = [];
+  _setInvariantJudgeForTest(true, (v) => seen.push(v));
+  try {
+    const body = JSON.stringify({ model: "m", messages: [
+      { role: "user", content: "canon" },
+      { role: "user", content: "new question" },
+    ] });
+    const entry = [mk("user", "text", "old"), mk("user", "text", "new question")];
+    maybeRunInvariantJudge({ originalMessages: entry, body, protocol: "openai", sessionId: "s-r" });
+    assert.equal(seen.at(-1)?.ok, false);
+    assert.equal(seen.at(-1)?.renderLane, undefined);
+    assert.ok(seen.at(-1)!.violations.some((x) => x.kind === "mid-history-rewrite"));
+    seen.length = 0;
+    maybeRunInvariantJudge({ originalMessages: entry, body, protocol: "openai", sessionId: "s-r", renderTailStart: 1 });
+    assert.equal(seen.at(-1)?.ok, true);
+    assert.equal(seen.at(-1)?.renderLane, true);
+  } finally {
+    _setInvariantJudgeForTest(false);
+  }
+});

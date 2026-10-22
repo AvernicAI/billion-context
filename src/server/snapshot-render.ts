@@ -121,7 +121,11 @@ function parseRow(content: string, seq: number): BiliMessage | null {
  * are two observability fields on `session.metadata` (the render latch and the
  * last post-arm degrade reason) — neither touches outbound bytes.
  */
-type ViewResult = { ok: true; view: BiliMessage[] } | { ok: false; reason: string };
+// tailStart (#4241): the first CLIENT index of the live tail (clientJoin) —
+// everything in clientMsgs at indices >= tailStart rides the outbound verbatim,
+// everything below is server-rendered territory. Exposed so the egress judge can
+// exempt the rendered prefix and validate only the tail it promises byte-intact.
+type ViewResult = { ok: true; view: BiliMessage[]; tailStart: number } | { ok: false; reason: string };
 
 function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
     const activeBlocks = session.state.blocks.filter((b) => b.active);
@@ -300,10 +304,15 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
     while (ai < anchors.length) merged.push(anchors[ai++].msg);
     for (let k = clientJoin; k < clientMsgs.length; k++) merged.push(clientMsgs[k]);
 
-    return { ok: true, view: merged };
+    return { ok: true, view: merged, tailStart: clientJoin };
 }
 
 export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], deps: SnapshotRenderDeps): BiliMessage[] {
+    // #4241: the judge reads this to know whether THIS turn's outbound prefix is
+    // server-rendered. Clear unconditionally so presence ⟺ this call rendered a
+    // live view — every early-return / degrade / shadow path leaves it unset,
+    // which is exactly when the outbound is raw client bytes (legacy I1/I2 applies).
+    delete session.metadata["snapshotRenderTailStart"];
     if (deps.pluginMode) return clientMsgs; // plugin lane: client-authoritative by design, not a degradation
     const live = featureEnabled("snapshotRender");
     const shadow = !live && shadowLaneEnabled();
@@ -314,6 +323,7 @@ export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], d
     if (live) {
         if (!r.ok) return legacyFor(session, deps, clientMsgs, r.reason);
         delete session.metadata["snapshotRenderDegradeReason"];
+        session.metadata["snapshotRenderTailStart"] = r.tailStart;
         noteRender(session, deps);
         return r.view;
     }

@@ -717,11 +717,19 @@ export async function forward(
         // steering / chain-stamp / shed rewrites, so I1/I2 see the wire truth.
         // Advisory; never blocks. Replaces the pre-send hook (handle.ts) which
         // judged a pre-rewrite snapshot.
+        // #4241: on a snapshot-render turn the outbound prefix is server-rendered
+        // (transcript rows + summary carriers), not the raw inbound bytes — the
+        // judge must exempt that region and validate only the client tail. The
+        // boundary was recorded by prepare's maybeSnapshotView on the same session.
+        const renderTailStart = typeof prepared.session.metadata["snapshotRenderTailStart"] === "number"
+            ? (prepared.session.metadata["snapshotRenderTailStart"] as number)
+            : undefined;
         maybeRunInvariantJudge({
             originalMessages: prepared.originalMessages,
             body: sentBody,
             protocol: prepared.protocol,
             sessionId: prepared.session.id,
+            ...(renderTailStart !== undefined ? { renderTailStart } : {}),
         });
     }
     // #3148: round-level breaker — while the endpoint is provably dead, fail

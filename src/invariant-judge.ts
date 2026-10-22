@@ -75,6 +75,8 @@ export interface JudgeVerdict {
   exempt?: { carrier: number; reasoning: number; crush: number };
   /** Egress lane the verdict came from — main first-send vs loop round-2+. */
   lane?: "main" | "loop";
+  /** #4241: true when judged in render-lane tail-fidelity mode (outbound prefix was server-rendered). */
+  renderLane?: boolean;
 }
 
 interface JudgeOptions {
@@ -87,6 +89,13 @@ interface JudgeOptions {
   // steady folded session stays far under it (≈ one carrier per live block +
   // one reasoning item per reasoning turn).
   maxExempt?: number;
+  // #4241: when set (a finite number >= 0), THIS turn's outbound prefix was
+  // server-rendered (snapshot-render lane) — the raw inbound prefix is NOT a
+  // valid baseline (the engine intentionally replaced the covered region with
+  // transcript rows + summary carriers). Validate only the client tail
+  // entry[renderTailStart..] against the outbound; the rendered prefix is exempt
+  // from the frozen-prefix requirement. Absent ⇒ legacy full inbound-vs-outbound.
+  renderTailStart?: number;
 }
 
 function normText(m: CoreMessage): string {
@@ -167,60 +176,117 @@ export function judgeInboundOutbound(
   const freezeEnd = folded ? sumIdx : exit.length;
   let foldStart = -1;
 
+  // #4241 render-lane tail-fidelity: when THIS turn's outbound prefix was
+  // server-rendered (snapshot render active), the raw inbound prefix is NOT a
+  // valid baseline — the engine intentionally replaced the covered region with
+  // transcript rows + summary carriers (defined behavior, not a rewrite). Only
+  // the client tail (entry[rts..]) is promised byte-intact, so validate exactly
+  // that, in order; the rendered prefix is exempt from the frozen-prefix rule.
+  // A real tail corruption/drop/reorder still goes red — I2 stays armed on the
+  // part the render owns verbatim. Cross-turn prefix stability is seamLcp's /
+  // shadow's job (outbound-vs-previous-outbound), not this inbound-vs-outbound.
+  const rts = opts.renderTailStart;
+  const renderLane = typeof rts === "number" && Number.isFinite(rts) && rts >= 0;
+
   let j = 0;
-  for (let i = 0; i < entry.length; i++) {
-    const e = entry[i];
-    if (isReasoning(e)) continue;
-    if (folded && j >= freezeEnd) { foldStart = i; break; } // remainder is the folded region
-    total++;
-
-    // Stateful hosts re-send previously-injected carriers in their inbound
-    // history; such an entry must match its own twin by identity — skipping
-    // exit carriers for it would false-positive every steady-state post-fold
-    // turn. The gap budget counts NON-carrier elements only: a stack of
-    // injected carriers between stable messages is exempt volume, not drift.
-    const eCarrier = isCarrier(e);
-    let found = -1;
-    let nearTwin = false;
-    let scanned = 0;
-    for (let k = j; k < freezeEnd; k++) {
-      const x = exit[k];
-      if (isReasoning(x)) continue;
-      if (!eCarrier && isCarrier(x)) continue;
-      scanned++;
-      if (scanned > maxGap) break;
-      if (stableEqual(e, x)) { found = k; break; }
-      if (x.role === e.role && x.contentType === e.contentType && (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
-    }
-
-    if (found < 0) {
-      violations.push({
-        kind: nearTwin ? "mid-history-rewrite" : "mid-history-drop",
-        index: i,
-        detail: `inbound[${i}] ${fp(e)} absent from outbound frozen prefix`,
-      });
-      j++; // soft resync: one bad cell must not cascade into a total unfold (#2821)
-      continue;
-    }
-
-    for (let k = j; k < found; k++) {
-      const x = exit[k];
-      if (!isCarrier(x) && !isReasoning(x)) {
-        violations.push({ kind: "mid-insertion", index: i, detail: `unexplained outbound element before inbound[${i}]: ${fp(x)}` });
+  if (renderLane) {
+    let located = false; // have we matched at least one tail message yet?
+    for (let i = rts!; i < entry.length; i++) {
+      const e = entry[i];
+      if (isReasoning(e)) continue;
+      total++;
+      const eCarrier = isCarrier(e);
+      let found = -1;
+      let nearTwin = false;
+      let scanned = 0;
+      // Until the tail is located, the scan spans the whole outbound (it must
+      // cross the entire server-rendered prefix); once located, tail messages
+      // are contiguous and the normal carrier-gap budget applies again.
+      const cap = located ? maxGap : Number.POSITIVE_INFINITY;
+      for (let k = j; k < exit.length; k++) {
+        const x = exit[k];
+        if (isReasoning(x)) continue;
+        if (!eCarrier && isCarrier(x)) continue;
+        scanned++;
+        if (scanned > cap) break;
+        if (stableEqual(e, x)) { found = k; break; }
+        if (x.role === e.role && x.contentType === e.contentType && (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
       }
+      if (found < 0) {
+        violations.push({ kind: nearTwin ? "mid-history-rewrite" : "mid-history-drop", index: i, detail: `tail inbound[${i}] ${fp(e)} absent from outbound` });
+        j++; // soft resync: one bad cell must not cascade into a total unfold (#2821)
+        continue;
+      }
+      // Insertions count only AFTER the tail is located — the server prefix
+      // before the first match is legitimately present, never an insertion.
+      if (located) {
+        for (let k = j; k < found; k++) {
+          const x = exit[k];
+          if (!isCarrier(x) && !isReasoning(x)) {
+            violations.push({ kind: "mid-insertion", index: i, detail: `unexplained outbound element before tail inbound[${i}]: ${fp(x)}` });
+          }
+        }
+      }
+      matched++;
+      j = found + 1;
+      located = true;
     }
-    matched++;
-    j = found + 1;
-  }
+    foldStart = rts! > 0 ? 0 : -1;
+  } else {
+    for (let i = 0; i < entry.length; i++) {
+      const e = entry[i];
+      if (isReasoning(e)) continue;
+      if (folded && j >= freezeEnd) { foldStart = i; break; } // remainder is the folded region
+      total++;
 
-  // Carrier pinning (I2): a non-carrier element sitting before the fold carrier
-  // that exceeds the matched frozen prefix means the anchor drifted.
-  if (folded && sumIdx > matched) {
-    for (let k = matched; k < sumIdx; k++) {
-      const x = exit[k];
-      if (!isCarrier(x) && !isReasoning(x)) {
-        violations.push({ kind: "carrier-drift", index: -1, detail: `element before fold carrier at outbound[${k}]: ${fp(x)}` });
-        break;
+      // Stateful hosts re-send previously-injected carriers in their inbound
+      // history; such an entry must match its own twin by identity — skipping
+      // exit carriers for it would false-positive every steady-state post-fold
+      // turn. The gap budget counts NON-carrier elements only: a stack of
+      // injected carriers between stable messages is exempt volume, not drift.
+      const eCarrier = isCarrier(e);
+      let found = -1;
+      let nearTwin = false;
+      let scanned = 0;
+      for (let k = j; k < freezeEnd; k++) {
+        const x = exit[k];
+        if (isReasoning(x)) continue;
+        if (!eCarrier && isCarrier(x)) continue;
+        scanned++;
+        if (scanned > maxGap) break;
+        if (stableEqual(e, x)) { found = k; break; }
+        if (x.role === e.role && x.contentType === e.contentType && (!e.toolCallId || !x.toolCallId || x.toolCallId === e.toolCallId)) nearTwin = true;
+      }
+
+      if (found < 0) {
+        violations.push({
+          kind: nearTwin ? "mid-history-rewrite" : "mid-history-drop",
+          index: i,
+          detail: `inbound[${i}] ${fp(e)} absent from outbound frozen prefix`,
+        });
+        j++; // soft resync: one bad cell must not cascade into a total unfold (#2821)
+        continue;
+      }
+
+      for (let k = j; k < found; k++) {
+        const x = exit[k];
+        if (!isCarrier(x) && !isReasoning(x)) {
+          violations.push({ kind: "mid-insertion", index: i, detail: `unexplained outbound element before inbound[${i}]: ${fp(x)}` });
+        }
+      }
+      matched++;
+      j = found + 1;
+    }
+
+    // Carrier pinning (I2): a non-carrier element sitting before the fold carrier
+    // that exceeds the matched frozen prefix means the anchor drifted.
+    if (folded && sumIdx > matched) {
+      for (let k = matched; k < sumIdx; k++) {
+        const x = exit[k];
+        if (!isCarrier(x) && !isReasoning(x)) {
+          violations.push({ kind: "carrier-drift", index: -1, detail: `element before fold carrier at outbound[${k}]: ${fp(x)}` });
+          break;
+        }
       }
     }
   }
@@ -249,6 +315,7 @@ export function judgeInboundOutbound(
     total,
     violations,
     exempt: { carrier: carrierExempt, reasoning: reasoningExempt, crush: crushExempt },
+    ...(renderLane ? { renderLane: true } : {}),
   };
 }
 
@@ -266,6 +333,10 @@ interface InvariantJudgeInput {
   body?: string | Buffer;
   protocol?: string;
   sessionId?: string;
+  /** #4241: set when prepare's snapshot render served this turn's outbound prefix —
+   *  the first client index of the live tail; the judge then validates only that
+   *  suffix against the outbound (the rendered prefix is exempt). Absent ⇒ legacy. */
+  renderTailStart?: number;
 }
 
 // Re-parse the ACTUAL outbound body through its own wire codec so the exit side
@@ -332,7 +403,7 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
     const exitCores0 = parseExitCores(input.body, input.protocol);
     if (!exitCores0) return; // unparseable/unknown wire → skip, never false-positive
     const exitCores = fault ? fault([...exitCores0]) : exitCores0;
-    const v = judgeInboundOutbound(entry, exitCores);
+    const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart });
     // Every judged request reports its verdict (ok or not): consumers must be
     // able to see folded-but-clean traffic too, not just violations — that is
     // how the live I2 path proves a real fold stayed green (#3842).
