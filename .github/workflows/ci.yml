@@ -272,6 +272,12 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm install --ignore-scripts --no-fund --no-audit
+      # #4326-B: kernel/dist is not committed, so on every fresh checkout the
+      # file:-linked acp-kernel is unresolvable — since #4177 the suite reaches
+      # it via backend.ts -> store.ts -> runtime-status.ts -> knobs.ts ->
+      # config.ts, so this lane must build it like scripts/run-ci-tests.mjs
+      # does in its pretest (pi-subagents is not in these files' import graph).
+      - run: npm --prefix kernel run build
       - run: node --import tsx --test tests/storage-backend-contract.test.ts tests/storage-backend-knob.test.ts
         env:
           BILI_MYSQL_TEST_DSN: mysql://root:bili-test-root@127.0.0.1:3306/bili
