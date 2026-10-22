@@ -1857,11 +1857,11 @@ export async function forward(
             // only THEN pushes the absorb section (sysParts order). Nesting it
             // inside flipped the two sections on round-2 and broke the
             // system-element prefix at every fold (cache-seam-probes P1+P2/P3).
-             // #4305 cache-seam parity: the standing generation-boundary note sits
-             // between the compress prompt and the absorb section on every steady
-             // prepare* path — the round-2 rebuild must keep that exact order or
-             // the system-element prefix forks at every fold of an affected session.
-             const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? `\n\n${GENERATION_BOUNDARY_NOTE}` : "";
+            // #4305 cache-seam parity: the standing generation-boundary note sits
+            // between the compress prompt and the absorb section on every steady
+            // prepare* path — the round-2 rebuild must keep that exact order or
+            // the system-element prefix forks at every fold of an affected session.
+            const genBoundaryNote = detectGenerationBoundary(prepared.session, prepared.originalMessages, log) ? `\n\n${GENERATION_BOUNDARY_NOTE}` : "";
              const systemPrompt = withProjectAttribution(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers)) + genBoundaryNote + absorbSection;
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks, prepared.anthropicClientCacheControls, absorbActive);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
