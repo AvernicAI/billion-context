@@ -1,10 +1,11 @@
 // #4289: a compress exchange that applied ZERO ranges (its result starts with
-// "[Compression FAILED") is refuse, not metadata — no block carries its
-// arguments and decompress never consults it. Both halves of such an exchange
-// lose ALWAYS_PROTECTED_TOOLS protection and fold like ordinary messages, so a
-// failing compress loop cannot permanently bloat context. Successful and
-// partial receipts start with "[Compressed" and STAY protected — those
-// arguments are the on-record summaries decompress restores from.
+// "[Compression FAILED" or, #4307, "[Compression refused") is refuse, not
+// metadata — no block carries its arguments and decompress never consults it.
+// Both halves of such an exchange lose ALWAYS_PROTECTED_TOOLS protection and
+// fold like ordinary messages, so a failing compress loop cannot permanently
+// bloat context. Successful and partial receipts start with "[Compressed" and
+// STAY protected — those arguments are the on-record summaries decompress
+// restores from.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createCore } from "../src/compress.js";
@@ -210,4 +211,98 @@ test("#4289 unit shapes: isFailedCompressResult / collectFailedCompressCallIds /
   const protectedIds = collectProtectedToolCallIds(messages, cfg());
   assert.ok(!protectedIds.has("call-1"), "failed compress call is not in the protected set (its result can never be re-protected via pairing)");
   assert.ok(protectedIds.has("call-2"), "successful compress call stays in the protected set");
+});
+
+// #4307: the two refuse gates whose draft parses but commits nothing emit
+// "[Compression refused: …" receipts (src/stream.ts gate:coverage-regression /
+// gate:no-net-shrink). Zero ranges applied — same dead-draft semantics as
+// FAILED, so the exchange must un-protect and fold identically.
+const refusedSession = (): CoreMessage[] => [
+  user("u1"),
+  call("rc1", "call-refused", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: validSummary }] })),
+  result("rr1", "call-refused", `[Compression refused: no net shrink — the summary you supplied is not smaller than the range it replaces (committing it would grow the context by 42 token(s)). Nothing was folded: no block was created and the context prefix/cache were left untouched. Do not re-issue this same range and summary; supply a much shorter summary for the range, target a larger span so the summary shrinks it, or continue your task without compressing.]`),
+  user("u2"),
+  call("rc2", "call-refused-cov", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: validSummary }] })),
+  result("rr2", "call-refused-cov", `[Compression refused: coverage regression — folding these ranges would leave 3 already-folded message(s) without any covering block, so the live context view would GROW instead of shrink (and the size estimate can blow past the model window, bricking the session behind permanent preflight rejections). Nothing was folded: no block was created and the context prefix/cache were left untouched. Retry with ranges aligned to whole turns (do not cut through a reasoning/tool-call/result group), target fewer blocks, or continue your task without compressing.]`),
+  user("u3"),
+  // Successful exchange amid refusals: load-bearing metadata, stays protected.
+  call("sc1", "call-ok", JSON.stringify({ content: [{ startId: "m00001", endId: "m00001", summary: validSummary }] })),
+  result("sr1", "call-ok", `[Compressed m00001–m00001 → 1 block(s), ~1234 tokens saved.]`),
+  user("u4"),
+];
+
+test("#4307 refused compress exchanges get foldable refs; successful stays BLOCKED", () => {
+  const core = createCore();
+  const turn = core.processTurn({
+    messages: refusedSession(),
+    state: createInitialState(),
+    config: cfg(),
+    tokenCount: 1000,
+  });
+
+  const byRaw = turn.state.messageRefs.byRaw;
+  assert.notEqual(byRaw["rc1"], BLOCKED_REF, "refused compress CALL must get a numeric ref");
+  assert.notEqual(byRaw["rr1"], BLOCKED_REF, "refused compress RESULT must get a numeric ref");
+  assert.notEqual(byRaw["rc2"], BLOCKED_REF, "coverage-regression refused CALL must get a numeric ref");
+  assert.notEqual(byRaw["rr2"], BLOCKED_REF, "coverage-regression refused RESULT must get a numeric ref");
+  assert.equal(byRaw["sc1"], BLOCKED_REF, "successful compress CALL stays BLOCKED");
+  assert.equal(byRaw["sr1"], BLOCKED_REF, "successful compress RESULT stays BLOCKED");
+});
+
+test("#4307 refused compress exchanges fold; successful exchange stays visible in the same range", () => {
+  const core = createCore();
+  const messages = refusedSession();
+  const turn = core.processTurn({
+    messages,
+    state: createInitialState(),
+    config: cfg(),
+    tokenCount: 1000,
+  });
+  const byRaw = turn.state.messageRefs.byRaw;
+  const startRef = byRaw["u1"];
+  const endRef = byRaw["u4"];
+  assert.ok(typeof startRef === "string" && startRef.startsWith("m"));
+  assert.ok(typeof endRef === "string" && endRef.startsWith("m"));
+
+  const applied = core.applyCompression({
+    ranges: [{ startRef, endRef, summary: validSummary }],
+    messages,
+    state: turn.state,
+    config: cfg(),
+  });
+
+  assert.equal(applied.result.blocksCreated, 1, "the range must fold");
+  const block = applied.state.blocks[0]!;
+  for (const id of ["rc1", "rr1", "rc2", "rr2"]) {
+    assert.ok(block.directMessageIds.includes(id), `refused exchange half ${id} folds into the block`);
+  }
+  assert.ok(!block.effectiveMessageIds.includes("sc1"), "successful compress call stays visible");
+  assert.ok(!block.effectiveMessageIds.includes("sr1"), "successful compress result stays visible");
+});
+
+test("#4307 unit shapes: refused receipts recognized as failed by both prefixes", () => {
+  const noNetShrink = result("r", "c1", `[Compression refused: no net shrink — the summary you supplied is not smaller than the range it replaces (committing it leaves the context size unchanged). Nothing was folded.]`);
+  const coverage = result("r", "c2", `[Compression refused: coverage regression — folding these ranges would leave 1 already-folded message(s) without any covering block.]`);
+  assert.ok(isFailedCompressResult(noNetShrink), "gate:no-net-shrink receipt is failure");
+  assert.ok(isFailedCompressResult(coverage), "gate:coverage-regression receipt is failure");
+  assert.ok(!isFailedCompressResult({ ...noNetShrink, toolName: "acp_rule" }), "refused prefix on a non-compress tool is not the signal");
+
+  const messages = [
+    call("c1", "call-refused", "{}"),
+    result("r1", "call-refused", noNetShrink.text!),
+    call("c2", "call-failed", "{}"),
+    result("r2", "call-failed", "[Compression FAILED: nope]"),
+    call("c3", "call-ok", "{}"),
+    result("r3", "call-ok", "[Compressed m00001–m00001 → 1 block(s), ~10 tokens saved.]"),
+  ];
+  assert.deepEqual(
+    [...collectFailedCompressCallIds(messages)].sort(),
+    ["call-failed", "call-refused"],
+    "both FAILED and refused call ids are collected",
+  );
+
+  const protectedIds = collectProtectedToolCallIds(messages, cfg());
+  assert.ok(!protectedIds.has("call-refused"), "refused compress call is not re-protected via pairing");
+  assert.ok(!protectedIds.has("call-failed"), "failed compress call is not re-protected via pairing");
+  assert.ok(protectedIds.has("call-ok"), "successful compress call stays in the protected set");
 });
