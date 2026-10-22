@@ -104,7 +104,7 @@ Notes:
 
 ### 4. `GET /__bili/plugin/status?conversationId=<id>`
 
-Context-level visibility for plugin UIs (status bars / slash commands):
+Context-level visibility for plugin UIs (status bars / slash commands). Third-party UI readers that are not cooperative plugins get the same route — its access gate and evolution contract live in README → **Host plugin integration** (#4319):
 
 ```json
 {

@@ -73,6 +73,7 @@ export function renderPage(origin: string, version: string, embed = false, theme
 </section>
 <section id="page-config" class="page" hidden>
 <div class="page-head"><div><h1 data-i18n="cfg.title">${zh("cfg.title")}</h1><div class="sub" data-i18n="cfg.sub">${zh("cfg.sub")}</div></div></div>
+<p class="dim small" style="margin:0 0 12px" data-i18n="cfg.hostview_note">${zh("cfg.hostview_note")}</p>
 <div id="cfg-parse-error" class="banner err" hidden></div>
 <div class="card" id="card-quick"><div class="card-h"><span data-i18n="cfg.quick">${zh("cfg.quick")}</span></div><div class="card-b">
 <p class="dim small" style="margin:0 0 12px" data-i18n="cfg.quick_desc">${zh("cfg.quick_desc")}</p>

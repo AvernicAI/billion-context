@@ -358,7 +358,8 @@ const zh: Dict = {
     "tab_sessions": "会话",
     "tab_config": "配置",
     "tab_logs": "日志",
-    "tab_ctx": "上下文",
+    // #4319: own name (not 上下文) so the tab is distinguishable from dsh-context's same-purpose tab.
+    "tab_ctx": "压缩代理",
     "ctx_waiting": "等待首个模型请求…",
     "ctx_nodata": "暂无上下文数据——完成一次模型请求后自动刷新。",
     "ctx_refresh": "刷新",
@@ -378,7 +379,7 @@ const en: Dict = {
     "tab_sessions": "Sessions",
     "tab_config": "Config",
     "tab_logs": "Logs",
-    "tab_ctx": "Context",
+    "tab_ctx": "Compression",
     "ctx_waiting": "Waiting for the first model request…",
     "ctx_nodata": "No context data yet — refreshes automatically after the first model request.",
     "ctx_refresh": "Refresh",

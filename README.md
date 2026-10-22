@@ -319,6 +319,27 @@ should see a `processTurn` line per request, and once the conversation grows,
 
 Everything that doesn't fit in one Quickstart line — how each client's lanes attach, what gets written where, and known limitations — lives in **[CLIENTS.md](CLIENTS.md)**: dsh · Kimi Code · Hermes · ZCode · Gemini family (Gemini CLI / iFlow CLI / Qwen Code / Antigravity) · cert-MITM clients that never compress (CONNECT blind tunnels, #897) · unrecognized endpoints going direct (#1290) · OpenCode (launcher / native / pure proxy, `/acp` status & rules, legacy opencode-acp sessions #920).
 
+### Host plugin integration
+
+Stable read-only surface for third-party host-side UI plugins that want to show bili's wire-caliber numbers next to their own local views (e.g. [dsh-context](https://github.com/bowenliang123/dsh-context): where the tokens come from vs. what actually reaches the model). Two routes:
+
+**`GET /bili/origin`** — served by the host web server (registered by the dsh lane's native entry), answers where the bound bili proxy listens:
+
+- `{"origin":"http://127.0.0.1:<port>"}` — use this as the base for all `/__bili/*` calls below;
+- `{"origin":null,"relay":true}` — admin relay mode (#3373): derive your base from the probe response URL itself instead;
+- `{"origin":null}` — no proxy bound yet (attach/spawn still booting); keep polling;
+- route absent (404) — older host build without the route.
+
+Poll while unresolved: the origin can land late (spawn mode binds after bootstrap) or move (runtime re-bind).
+
+**`GET /__bili/plugin/status?conversationId=<id>`** — wire-caliber session stats. Full field semantics (observation lifecycle, fork behavior, revision guards): [PLUGIN.md](PLUGIN.md) §4. The stable contract surface is the documented field set there — `ok`, `conversationId`, `sessionId`, `sessionRevision`, `pluginAgent`, `model`, `contextLimit`, `contextTokens`, `contextTokensSource`, `contextTokensAt`, `contextGeneration`, `inputTokens`, `outputTokens`, `cachedTokens`, `requests`, `blocks`, `compressibleRanges`, `lastSeen`; fields not listed are internal and carry no guarantee.
+
+Errors: `400 {"ok":false,"error":"conversationId query parameter is required"}`; `404 {"ok":false,"error":"unknown plugin conversation"}` (with `fallback=latest`: `"no session with activity since boot …"`). Before any request lands, responses report `"phase":"pre-first-request"` or `"phase":"chain-advisory"` with null context fields instead of 404.
+
+Access: loopback-only management gate — the connection must come from loopback, the `Host` header must be a loopback name (`localhost` / `127.0.0.1` / `::1`, port ignored so SSH forwards work), and a browser `Origin` must be a loopback http(s) origin or the dsh desktop scheme (`dsh-app://app`). Non-browser clients without an `Origin` are admitted on a trusted Host. An admitted browser `Origin` is echoed back via `access-control-allow-origin`, so cross-origin `fetch` from the host web app works.
+
+Evolution: additive. Documented fields are never removed or re-semantized silently; new fields may appear at any time. Do not depend on undocumented fields.
+
 ## From source (development)
 
 > **Risk:** `master` is the development branch and can be broken at any moment — unreleased changes, failing builds, unverified fixes. Unless you are patching the code or testing an unreleased fix, install a release with npm as above.

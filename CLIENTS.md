@@ -193,8 +193,8 @@ is expected, not a stuck compressor. The effective size is the proxy's: read
 `/acp` (or `GET /__bili/plugin/status` → `contextTokens`, provenance in
 `contextTokensSource`) instead of re-deriving it locally.
 
-**The dsh client ships a Context tab for this (#3862):** the native plugin
-registers a session-scoped `Context` tab in dsh's conversation view (right of
+**The dsh client ships a Compression tab for this (#3862, renamed from `Context` in #4319 so it stays distinguishable from third-party context tabs such as dsh-context's):** the native plugin
+registers a session-scoped `Compression` tab (zh: 压缩代理) in dsh's conversation view (right of
 Chat/Trajectory). It reads `GET /__bili/plugin/status` cross-origin from the
 dsh web app and renders the same breakdown the `/acp` panel computes live:
 the post-compression sent total against the window limit, category segments
@@ -203,7 +203,9 @@ anchor on its own labeled scale, and recent fold/switch events with reclaimed
 tokens. It refreshes every 10 s; when the running proxy predates this build
 the tab degrades to a restart notice plus an open-Web-UI button instead of
 guessing. Plain React from dsh's own runtime — no iframe, no added
-dependencies.
+dependencies. Third-party UI plugins can read the same status route
+cross-origin — the stable contract (fields, errors, access gate, evolution
+promise) is documented in README → **Host plugin integration** (#4319).
 
 ## Kimi Code (Moonshot)
 

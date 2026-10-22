@@ -519,7 +519,9 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     assert.equal(viewSlot.order, 30);
     assert.equal(viewSlot.locale, "bili");
     assert.equal(typeof viewSlot.label, "function");
-    assert.equal((viewSlot.label as () => string)(), "上下文");
+    // #4319: the tab carries bili's own name, not 上下文 — it must stay distinguishable from
+    // dsh-context's same-purpose tab when both are installed.
+    assert.equal((viewSlot.label as () => string)(), "压缩代理");
     assert.ok(m.dicts["bili"] !== undefined);
     const settings = m.optionsBySlot.get("settings.section")!;
     assert.equal(settings.name, "settings.section");

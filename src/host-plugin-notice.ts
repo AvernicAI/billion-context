@@ -36,6 +36,8 @@ interface HostPluginNotice {
     client: string;
     /** Profile name that triggered detection (first hit wins). */
     profile: string;
+    /** #4319: upstream project URL — the banner renders it as a link. */
+    repoUrl?: string;
 }
 
 interface HostPluginEntry {
@@ -44,6 +46,7 @@ interface HostPluginEntry {
     depName: string;
     loaderId: string;
     requiresBiliLane: boolean;
+    repoUrl?: string;
 }
 
 // One row per known host-side metering plugin — adding the next one adds one
@@ -53,7 +56,7 @@ const KNOWN_HOST_PLUGINS: readonly HostPluginEntry[] = [
     // dsh's durable (lossless) session log, so under active compression they are
     // the pre-compression distribution; its headline size is provider-usage-
     // anchored and tracks the effective volume.
-    { client: "dsh", id: "dsh-context", depName: "dsh-context", loaderId: "dsh-context", requiresBiliLane: true },
+    { client: "dsh", id: "dsh-context", depName: "dsh-context", loaderId: "dsh-context", requiresBiliLane: true, repoUrl: "https://github.com/bowenliang123/dsh-context" },
 ];
 
 /** bili's own dsh lane package name — present in the same profile's deps, or no compression happens there. */
@@ -127,7 +130,7 @@ export function detectHostPluginNotices(env: NodeJS.ProcessEnv = process.env): H
             if (!selectedBundlesOf(doc).has(p.depName)) continue;
             if (p.requiresBiliLane && !deps.has(BILI_DSH_PACKAGE)) continue;
             if (patchDisabled(path.join(dir, "cordis.patch.yml"), p.loaderId)) continue;
-            found.push({ id: p.id, name: p.depName, client: p.client, profile: path.basename(dir) });
+            found.push({ id: p.id, name: p.depName, client: p.client, profile: path.basename(dir), repoUrl: p.repoUrl });
             break;
         }
     }

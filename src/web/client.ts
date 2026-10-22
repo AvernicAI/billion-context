@@ -372,11 +372,13 @@ export const WEB_CLIENT = `(function () {
     }
     window.bili_pluginAdvisoryBanner = bili_pluginAdvisoryBanner;
     // #2861: host-side metering plugin notice (pre-compression local caliber).
-    // Pure builder taking pre-translated strings; name/id are data -> escaped.
+    // Pure builder taking pre-translated strings; name/id/repoUrl are data -> escaped.
     function bili_hostPluginBanner(notices, s) {
         let html = '<div class="banner-title">' + escapeHtml(s.on) + "</div>";
         for (const n of notices) {
-            html += '<div class="alert-row"><span><strong>' + escapeHtml(n.name || n.id) + "</strong> " + escapeHtml(s.desc) + '</span><button class="btn sm host-plugin-dismiss" data-hpid="' + escapeHtml(n.id) + '">' + escapeHtml(s.dismiss) + "</button></div>";
+            // #4319: upstream project link next to the name (when the notice carries one).
+            const repo = typeof n.repoUrl === "string" && typeof s.repo === "string" ? ' <a class="mono" href="' + escapeHtml(n.repoUrl) + '" target="_blank" rel="noopener">' + escapeHtml(s.repo) + "</a>" : "";
+            html += '<div class="alert-row"><span><strong>' + escapeHtml(n.name || n.id) + "</strong>" + repo + " " + escapeHtml(s.desc) + '</span><button class="btn sm host-plugin-dismiss" data-hpid="' + escapeHtml(n.id) + '">' + escapeHtml(s.dismiss) + "</button></div>";
         }
         html += '<div class="dim small" style="margin-top:6px">' + escapeHtml(s.hint) + "</div>";
         return html;
@@ -962,7 +964,7 @@ export const WEB_CLIENT = `(function () {
             if (hns.length > 0) {
                 hb.hidden = false;
                 hb.classList.add("show");
-                hb.innerHTML = bili_hostPluginBanner(hns, { on: t("hostplug.on"), desc: t("hostplug.desc"), hint: t("hostplug.hint"), dismiss: t("hostplug.dismiss_btn") });
+                hb.innerHTML = bili_hostPluginBanner(hns, { on: t("hostplug.on"), desc: t("hostplug.desc"), hint: t("hostplug.hint"), dismiss: t("hostplug.dismiss_btn"), repo: t("hostplug.repo") });
                 for (const btn of Array.from(hb.querySelectorAll(".host-plugin-dismiss"))) {
                     btn.addEventListener("click", async () => {
                         busy(btn, true);

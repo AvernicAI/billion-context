@@ -177,8 +177,8 @@ test("#2861: corrupt dismissal state degrades to empty set (never throws)", () =
     assert.deepEqual(dismissedHostPlugins(hermeticEnv(root)), new Set());
 });
 
-type Notice = { id?: string; name?: string; client?: string; profile?: string };
-type Strs = { on: string; desc: string; hint: string; dismiss: string };
+type Notice = { id?: string; name?: string; client?: string; profile?: string; repoUrl?: string };
+type Strs = { on: string; desc: string; hint: string; dismiss: string; repo?: string };
 function bannerHtml(): (notices: Notice[], s: Strs) => string {
     const src = WEB_CLIENT;
     const s = src.indexOf("function escapeHtml");
@@ -211,7 +211,7 @@ test("#2861: banner escapes HTML in plugin data", () => {
 test("#2861: wiring drift guards (seam export, banner slot, i18n refs, payload field, endpoint)", () => {
     assert.ok(WEB_CLIENT.includes("window.bili_hostPluginBanner = bili_hostPluginBanner;"), "seam export present");
     assert.ok(WEB_CLIENT.includes('$("host-plugin-banner")'), "loadOverview reads the banner slot");
-    for (const k of ['t("hostplug.on")', 't("hostplug.desc")', 't("hostplug.hint")', 't("hostplug.dismiss_btn")', 't("hostplug.dismissed")']) {
+    for (const k of ['t("hostplug.on")', 't("hostplug.desc")', 't("hostplug.hint")', 't("hostplug.dismiss_btn")', 't("hostplug.dismissed")', 't("hostplug.repo")']) {
         assert.ok(WEB_CLIENT.includes(k), `i18n key ${k} referenced literally (dead-key lint)`);
     }
     assert.ok(WEB_CLIENT.includes('API_ROOT + "/host-plugins/dismiss"'), "dismiss POST target present");
@@ -240,4 +240,38 @@ test("#3303: notice scopes the pre-compression claim to segment composition/time
     assert.ok(zh.includes("分段") || zh.includes("构成"), "zh desc must scope the pre-compression claim to segment composition");
     assert.ok(!/not\s+accurate|inaccurate/i.test(en), "en desc must not re-assert the headline figures are inaccurate (the #3303 false alarm)");
     assert.ok(/composition|segment|timeline/i.test(en), "en desc must scope the pre-compression claim to segment composition / timeline");
+});
+
+test("#4319: detection carries the upstream repo URL for the banner link", () => {
+    _clearHostPluginNoticeCache();
+    const root = tmp("bili-4319-repo-");
+    writeProfilePkg(root, "main", fullGatePkg());
+    const found = detectHostPluginNotices(hermeticEnv(root));
+    assert.equal(found.length, 1);
+    assert.equal(found[0].repoUrl, "https://github.com/bowenliang123/dsh-context");
+});
+
+test("#4319: banner renders the repository link when the notice carries one, escaped", () => {
+    const f = bannerHtml();
+    const out = f([{ name: DEP, id: DEP, repoUrl: "https://github.com/x/y" }], { on: "T", desc: "D", hint: "H", dismiss: "D2", repo: "repository" });
+    assert.ok(out.includes('<a class="mono" href="https://github.com/x/y" target="_blank" rel="noopener">repository</a>'), "repo anchor rendered next to the name");
+    const esc = f([{ name: DEP, id: DEP, repoUrl: 'https://x/"onload="alert(1)' }], { on: "T", desc: "D", hint: "H", dismiss: "D2", repo: "<r>" });
+    assert.ok(esc.includes("&quot;onload=&quot;"), "quotes in repoUrl neutralized in attribute");
+    assert.ok(esc.includes("&lt;r&gt;"), "repo label escaped");
+});
+
+test("#4319: banner omits the repository link without repoUrl or without a label", () => {
+    const f = bannerHtml();
+    const out = f([{ name: DEP, id: DEP }], { on: "T", desc: "D", hint: "H", dismiss: "D2", repo: "repository" });
+    assert.ok(!out.includes("<a "), "no anchor when the notice has no repoUrl");
+    const out2 = f([{ name: DEP, id: DEP, repoUrl: "https://x/y" }], { on: "T", desc: "D", hint: "H", dismiss: "D2" });
+    assert.ok(!out2.includes("<a "), "no anchor when the label string is missing");
+});
+
+test("#4319: softened wording — coexistence framing, no blame in either locale", () => {
+    const zh = MESSAGES["zh-CN"]["hostplug.desc"] ?? "";
+    const en = MESSAGES["en"]["hostplug.desc"] ?? "";
+    assert.ok(zh.includes("互补"), "zh frames the two calibers as complementary");
+    assert.ok(zh.includes("各看各的"), "zh states both views coexist");
+    assert.ok(/complement/i.test(en), "en frames the two calibers as complementary");
 });
