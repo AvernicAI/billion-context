@@ -143,6 +143,10 @@ const ctxStatusPathFor = (hostSessionId: string | undefined): string =>
         ? CTX_STATUS_PATH
         : `/__bili/plugin/status?conversationId=${encodeURIComponent(hostSessionId)}&fallback=latest`;
 const CTX_POLL_MS = 10000;
+// #4254: frame-level upstream-unavailable pill (shell.overlay) — same slow cadence
+// as the per-session Context tab. A dead circuit retries on its own ~60s probe, so
+// 10s keeps the "retry in ~Ns" hint fresh and clears the banner within one tick.
+const UPSTREAM_POLL_MS = 10000;
 
 type CtxStatus = {
     ok: boolean;
@@ -362,6 +366,10 @@ const zh: Dict = {
     "ctx_waiting": "等待首个模型请求…",
     "ctx_nodata": "暂无上下文数据——完成一次模型请求后自动刷新。",
     "ctx_refresh": "刷新",
+    "upstreams_label": "bili 上游状态",
+    "upstreams_down_one": "1 个上游不可用",
+    "upstreams_down_many": "{n} 个上游不可用",
+    "upstream_retry_hint": "约 {s}s 后重试",
 };
 
 const en: Dict = {
@@ -382,6 +390,10 @@ const en: Dict = {
     "ctx_waiting": "Waiting for the first model request…",
     "ctx_nodata": "No context data yet — refreshes automatically after the first model request.",
     "ctx_refresh": "Refresh",
+    "upstreams_label": "bili upstream status",
+    "upstreams_down_one": "1 upstream unavailable",
+    "upstreams_down_many": "{n} upstreams unavailable",
+    "upstream_retry_hint": "~{s}s until retry",
 };
 
 function readOrigin(): string | undefined {
@@ -440,6 +452,37 @@ function remoteMismatch(origin: string | undefined): boolean {
     const g = globalThis as { location?: { hostname?: unknown } };
     const pageHost = typeof g.location?.hostname === "string" ? g.location.hostname : "";
     return pageHost.length > 0 && !isLoopbackHost(pageHost);
+}
+
+// #4254: one row of GET /__bili/upstreams as consumed by the shell.overlay pill.
+// host already carries the port ("127.0.0.1:7864"); code is the errno token
+// (ECONNREFUSED/...), count the consecutive-failure tally, nextProbeInMs only
+// exists while that host's circuit is OPEN (it is the "retry in ~Ns" ETA).
+type UpstreamRow = { host: string; kind: string; code?: string; count: number; nextProbeInMs?: number };
+
+/** #4254: defensively parse the /__bili/upstreams report into render rows —
+ *  a malformed or partial payload yields fewer rows, never a throw, so a broken
+ *  health report can never break the DSH client. */
+function parseUpstreamHealth(raw: unknown): UpstreamRow[] {
+    if (typeof raw !== "object" || raw === null) return [];
+    const list = (raw as { upstreams?: unknown }).upstreams;
+    if (!Array.isArray(list)) return [];
+    const rows: UpstreamRow[] = [];
+    for (const item of list) {
+        if (typeof item !== "object" || item === null) continue;
+        const o = item as Record<string, unknown>;
+        const host = typeof o.host === "string" && o.host.length > 0 ? o.host : undefined;
+        if (host === undefined) continue;
+        const kind = typeof o.kind === "string" && o.kind.length > 0 ? o.kind : "unknown";
+        const code = typeof o.code === "string" && o.code.length > 0 ? o.code : undefined;
+        const count = typeof o.count === "number" && Number.isFinite(o.count) ? Math.max(0, Math.round(o.count)) : 0;
+        const circuit = (typeof o.circuit === "object" && o.circuit !== null ? o.circuit : undefined) as { state?: unknown; nextProbeInMs?: unknown } | undefined;
+        const probe = circuit !== undefined && circuit.state === "open" && typeof circuit.nextProbeInMs === "number" && Number.isFinite(circuit.nextProbeInMs)
+            ? Math.max(0, circuit.nextProbeInMs)
+            : undefined;
+        rows.push({ host, kind, code, count, ...(probe !== undefined ? { nextProbeInMs: probe } : {}) });
+    }
+    return rows;
 }
 
 // #3373: gateways that mount dsh web under a path prefix re-map every URL
@@ -801,6 +844,44 @@ export function apply(ctx: ClientContext): void {
             ),
         );
     };
+    // #4254 defect ②: frame-level upstream-unavailable pill (shell.overlay slot).
+    // Polls the loopback-gated GET /__bili/upstreams read surface (#4257) and
+    // renders one row per unreachable upstream; returns null while every upstream
+    // is reachable, so the banner auto-dismisses when circuits close + alerts clear.
+    // Purely additive UI — no request path changes. Display identity is the
+    // forwarded host:port (bili is a transparent pipe); provider/model reverse
+    // lookup stays host-side.
+    const upstreamBanner = (): ((props?: Record<string, unknown>) => unknown) => () => {
+        const [origin, setOrigin] = useState<string | undefined>(readOrigin());
+        const [rows, setRows] = useState<UpstreamRow[]>([]);
+        useEffect(() => probeOrigin((o) => setOrigin(o)), []);
+        useEffect(() => {
+            if (origin === undefined) return;
+            let cancelled = false;
+            const load = (): void => {
+                void fetch(`${origin}/__bili/upstreams`)
+                    .then((res) => res.json() as Promise<unknown>)
+                    .then((raw) => { if (!cancelled) setRows(parseUpstreamHealth(raw)); })
+                    .catch(() => { if (!cancelled) setRows([]); });
+            };
+            load();
+            const timer: ReturnType<typeof setInterval> = setInterval(load, UPSTREAM_POLL_MS);
+            return () => { cancelled = true; clearInterval(timer); };
+        }, [origin]);
+        if (rows.length === 0) return null;
+        const header = rows.length === 1 ? t("upstreams_down_one") : t("upstreams_down_many").replace("{n}", String(rows.length));
+        return createElement(
+            "div",
+            { role: "status", style: { display: "flex", flexDirection: "column", gap: 4, maxWidth: 520, padding: "8px 12px", borderRadius: 8, border: "1px solid rgba(217,63,11,0.5)", background: "rgba(217,63,11,0.1)" } },
+            createElement("div", { style: { fontSize: 13, fontWeight: 600 } }, header),
+            ...rows.map((r) => {
+                const code = r.code !== undefined ? ` ${r.code}` : "";
+                const s = r.nextProbeInMs !== undefined ? Math.max(1, Math.ceil(r.nextProbeInMs / 1000)) : undefined;
+                const eta = s !== undefined ? ` · ${t("upstream_retry_hint").replace("{s}", String(s))}` : "";
+                return createElement("div", { key: r.host, style: { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontSize: 12, lineHeight: 1.5 } }, `${r.host} · ${r.kind}${code} ×${r.count}${eta}`);
+            }),
+        );
+    };
     ctx.slots.inject(
         "settings.section",
         () => ctx.slots.register({ name: "settings.section", id: "bili", order: 100, label: () => t("nav"), locale: NS }, panel(true)),
@@ -816,5 +897,12 @@ export function apply(ctx: ClientContext): void {
     ctx.slots.inject(
         "conversation.view",
         () => ctx.slots.register({ name: "conversation.view", id: "bili-context", order: 30, label: () => t("tab_ctx"), locale: NS }, contextPanel()),
+    );
+    // #4254 defect ②: frame-level upstream-unavailable pill. Deferred injection
+    // is fail-open on hosts whose build lacks the shell.overlay slot (same
+    // discipline as the session Context tab above).
+    ctx.slots.inject(
+        "shell.overlay",
+        () => ctx.slots.register({ name: "shell.overlay", id: "bili-upstreams", order: 100, label: () => t("upstreams_label"), locale: NS }, upstreamBanner()),
     );
 }

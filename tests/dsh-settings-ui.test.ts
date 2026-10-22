@@ -509,8 +509,8 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
 
     const m = await mountClient(extra);
     assert.deepEqual(Array.from(m.inject), ["slots", "locale"]);
-    assert.deepEqual(m.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view"]);
-    assert.equal(m.optionsBySlot.size, 3);
+    assert.deepEqual(m.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view", "shell.overlay"]);
+    assert.equal(m.optionsBySlot.size, 4);
     // #3862: the per-session Context tab sits right of the built-in chat (0) /
     // trajectory (10) faces and any third-party context tab (dsh-context: 20).
     const viewSlot = m.optionsBySlot.get("conversation.view")!;
@@ -1663,4 +1663,81 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
         assert.equal(collectButtons(dtree).length, 0, "no actions before the origin resolves");
         dm.runCleanups();
     }
+});
+
+test("#4254: shell.overlay upstream-unavailable pill polls /__bili/upstreams, renders per-host rows, auto-dismisses when healthy", async () => {
+    const ORIGIN = "http://127.0.0.1:8787";
+    const intervals: Array<{ id: number; delay: number; fn: () => void }> = [];
+    let nextId = 1;
+    const fakeSetInterval = ((fn: () => void, delay?: number): unknown => {
+        const id = nextId++;
+        intervals.push({ id, delay: delay ?? 0, fn });
+        return id;
+    }) as unknown as typeof setInterval;
+    const fakeClearInterval = ((id: unknown): void => {
+        const i = intervals.findIndex((p) => p.id === id);
+        if (i >= 0) intervals.splice(i, 1);
+    }) as unknown as typeof clearInterval;
+    const textOf = (node: unknown): string => {
+        const out: string[] = [];
+        collectText(node, out);
+        return out.join(" ");
+    };
+    const mountOverlay = async (upstreams: unknown): Promise<Awaited<ReturnType<typeof mountClient>>> =>
+        mountClient({
+            __BILI__: { origin: ORIGIN },
+            fetch: async (url: string) => {
+                const u = String(url);
+                if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
+                if (u.endsWith("/__bili/upstreams")) return { ok: true, json: async () => ({ upstreams }) };
+                throw new Error(`unexpected fetch: ${u}`);
+            },
+            setTimeout,
+            clearTimeout,
+            setInterval: fakeSetInterval,
+            clearInterval: fakeClearInterval,
+        }, "shell.overlay");
+
+    // Populated: one unreachable upstream with an OPEN circuit (retry ETA present).
+    const m = await mountOverlay([{ host: "127.0.0.1:7864", kind: "connect-refused", code: "ECONNREFUSED", count: 9, firstSeen: 0, lastSeen: 0, circuit: { state: "open", nextProbeInMs: 60000 } }]);
+    m.resetHooks();
+    m.component();
+    assert.equal(m.component(), null, "first paint is empty until the health report resolves");
+    await tick();
+    const txt = textOf(m.component());
+    assert.ok(txt.includes("127.0.0.1:7864"), "row shows the forwarded host:port");
+    assert.ok(txt.includes("connect-refused"), "row shows the failure kind");
+    assert.ok(txt.includes("ECONNREFUSED"), "row shows the errno code");
+    assert.ok(txt.includes("×9"), "row shows the consecutive-failure tally");
+    assert.ok(txt.includes("约 60s 后重试"), "open circuit surfaces the retry ETA (zh)");
+    assert.ok(txt.includes("1 个上游不可用"), "singular header for one upstream");
+    assert.equal(intervals.length, 1, "one poll loop while mounted");
+    assert.equal(intervals[0].delay, 10000, "poll cadence is 10s");
+    m.runCleanups();
+    assert.deepEqual(intervals, [], "unmount cancels the poll loop");
+
+    // Healthy: empty report ⇒ the banner dismisses (renders null).
+    const h = await mountOverlay([]);
+    h.resetHooks();
+    h.component();
+    await tick();
+    assert.equal(h.component(), null, "no unreachable upstreams ⇒ no banner");
+    h.runCleanups();
+
+    // Multiple: header pluralizes, one row per host, and only the OPEN-circuit
+    // host carries a retry ETA (an alert-only host has circuit:null).
+    const mm = await mountOverlay([
+        { host: "127.0.0.1:7864", kind: "connect-refused", code: "ECONNREFUSED", count: 3, circuit: { state: "open", nextProbeInMs: 30000 } },
+        { host: "10.0.0.5:9000", kind: "connect-timeout", count: 2, circuit: null },
+    ]);
+    mm.resetHooks();
+    mm.component();
+    await tick();
+    const mt = textOf(mm.component());
+    assert.ok(mt.includes("2 个上游不可用"), "plural header for two upstreams");
+    assert.ok(mt.includes("127.0.0.1:7864") && mt.includes("10.0.0.5:9000"), "one row per unreachable host");
+    assert.ok(mt.includes("connect-timeout") && mt.includes("×2"), "alert-only host still lists kind + tally");
+    assert.ok(mt.includes("约 30s 后重试"), "open-circuit host surfaces its own retry ETA");
+    assert.ok(!mt.includes("×2 · 约"), "alert-only (circuit-null) host carries no retry ETA");
+    mm.runCleanups();
 });
