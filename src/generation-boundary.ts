@@ -44,7 +44,7 @@ const REF_CITATION_RE = /\bm(\d{4,})\b/g;
 /** byRef key shape guard (mirrors stream.ts M_REF_NUM_RE usage). */
 const BYREF_KEY_RE = /^m(\d+)$/;
 
-export interface GenerationBoundaryRecord {
+interface GenerationBoundaryRecord {
     /** First-detection time (ms epoch). */
     at: number;
     /** This session's highest mapped ref at detection ("mNNNNN" or "" when none) — evidence anchor, log surface only. */
