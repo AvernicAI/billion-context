@@ -95,7 +95,7 @@ export const COMPRESS_PARAMETERS = {
     },
     content: {
       description:
-        "One or more ranges to compress into separate summary blocks. PREFERRED (multi-range batch): ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Array form: one entry per range — a line-form string or an object {startId,endId,summary,topic?}. Batch multiple ranges into ONE call — do not split into one call per range. REQUIRED unless the flat single-range form is used.",
+         "One or more ranges to compress into separate summary blocks. PREFERRED (multi-range batch): ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string: internal quotes \\\" and newlines \\n; a JSON-encoded array as that string is also accepted). Array form: one entry per range — a line-form string or an object {startId,endId,summary,topic?}. Single-range forms: {startId,endId,summary,topic?} without content, OR the summary text in this string with the bounds in top-level startId/endId (plain prose, or a JSON object with summary and topic fields; a top-level summary field wins over the text). Batch multiple ranges into ONE call — do not split into one call per range. REQUIRED unless the flat single-range form is used.",
       anyOf: [
         {
           type: "array",
@@ -123,12 +123,12 @@ export const COMPRESS_PARAMETERS = {
     startId: {
       type: "string",
       description:
-        "Flat single-range form (no content): mNNNNN ref at the start of the range",
+        "Flat single-range form: mNNNNN ref at the start of the range. Without content the summary comes from the summary field; with a string content holding the summary text, startId/endId give that text its bounds.",
     },
     endId: {
       type: "string",
       description:
-        "Flat single-range form (no content): mNNNNN ref at the end of the range",
+        "Flat single-range form: mNNNNN ref at the end of the range. Pairs with startId for the bounds of a flat single range (see startId for how the summary is supplied).",
     },
     startRef: {
       type: "string",
@@ -141,7 +141,7 @@ export const COMPRESS_PARAMETERS = {
     summary: {
       type: "string",
       description:
-        "Flat single-range form (no content): self-contained summary replacing the range",
+        "Flat single-range form: self-contained summary replacing the range. Wins over summary text riding in content when both are present.",
     },
   },
 };
@@ -149,7 +149,7 @@ export const COMPRESS_PARAMETERS = {
 export const COMPRESS_TOOL = {
   name: COMPRESS_TOOL_NAME,
   description:
-    "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. PREFERRED form: content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Also accepted: object entries {startId,endId,summary,topic?} in the content array, and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+    "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. PREFERRED form: content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (a valid JSON string — internal quotes \\\", newlines \\n; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Also accepted: object entries {startId,endId,summary,topic?} in the content array, and a flat single-range call {startId,endId,summary,topic?} without content (or with content holding the summary text and startId/endId giving that text its bounds). Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
   input_schema: COMPRESS_PARAMETERS,
 };
 

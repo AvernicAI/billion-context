@@ -1236,3 +1236,206 @@ test("line-form split still breaks on headers after blank lines and element resi
     ],
   );
 });
+
+// ---------------------------------------------------------------------------
+// #4252: merged flat single-range form (summary text in content beside
+// top-level refs), U+2212/U+FF0D separators, unrecognized-separator
+// rejection instead of silent narrowing, header-only string visibility
+// ---------------------------------------------------------------------------
+
+test("merged flat form: summary text in content + top-level refs parses as one range (#4252)", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: "## Session\nWorked on auth; chose X because Y.",
+    startId: "m00150",
+    endId: "m00168",
+    topic: "Auth exploration",
+  });
+  assert.equal(diagnostics.kind, "ok");
+  assert.equal(diagnostics.flatSummarySalvage, true);
+  assert.equal(ranges.length, 1);
+  assert.equal(ranges[0]!.startRef, "m00150");
+  assert.equal(ranges[0]!.endRef, "m00168");
+  assert.equal(
+    ranges[0]!.summary,
+    "## Session\nWorked on auth; chose X because Y.",
+  );
+  assert.equal(ranges[0]!.topic, "Auth exploration");
+});
+
+test("merged flat form: startRef/endRef and messageId spellings accepted (#4252)", () => {
+  const a = parseCompressArgs({
+    content: "sum a",
+    startRef: "b114",
+    endRef: "b121",
+  });
+  assert.equal(a.ranges.length, 1);
+  assert.equal(a.ranges[0]!.startRef, "b114");
+  assert.equal(a.ranges[0]!.endRef, "b121");
+  const b = parseCompressArgs({
+    content: "sum b",
+    messageId: "m00007",
+  });
+  assert.equal(b.ranges.length, 1);
+  assert.equal(b.ranges[0]!.startRef, "m00007");
+  assert.equal(b.ranges[0]!.endRef, "m00007");
+});
+
+test("merged flat form: JSON-encoded object with summary/topic inside the content string (#4252)", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: JSON.stringify({ summary: "sum from json", topic: "t-json" }),
+    startId: "b114",
+    endId: "b121",
+  });
+  assert.equal(diagnostics.kind, "ok");
+  assert.equal(diagnostics.flatSummarySalvage, true);
+  assert.equal(ranges.length, 1);
+  assert.equal(ranges[0]!.startRef, "b114");
+  assert.equal(ranges[0]!.endRef, "b121");
+  assert.equal(ranges[0]!.summary, "sum from json");
+  assert.equal(ranges[0]!.topic, "t-json");
+});
+
+test("merged flat form: top-level summary field wins over content text (#4252)", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: "prose summary text",
+    startId: "m00001",
+    endId: "m00005",
+    summary: "top-level wins",
+  });
+  assert.equal(diagnostics.kind, "ok");
+  assert.equal(diagnostics.flatSummarySalvage, true);
+  assert.equal(ranges[0]!.summary, "top-level wins");
+});
+
+test("merged flat form: line-form content with refs headers is never hijacked (#4252)", () => {
+  const pair = parseCompressArgs({
+    content: "m00150–m00168 real topic\nline-form summary",
+    startId: "m00001",
+    endId: "m00002",
+  });
+  assert.equal(pair.diagnostics.kind, "ok");
+  assert.equal(pair.diagnostics.flatSummarySalvage, undefined);
+  assert.equal(pair.ranges.length, 1);
+  assert.equal(pair.ranges[0]!.startRef, "m00150");
+  assert.equal(pair.ranges[0]!.endRef, "m00168");
+  assert.equal(pair.ranges[0]!.topic, "real topic");
+  const single = parseCompressArgs({
+    content: "m00042 lone ref line\nsummary",
+    startId: "m00001",
+    endId: "m00002",
+  });
+  assert.equal(single.diagnostics.flatSummarySalvage, undefined);
+  assert.equal(single.ranges[0]!.startRef, "m00042");
+  assert.equal(single.ranges[0]!.endRef, "m00042");
+});
+
+test("merged flat form: prose without top-level refs stays content-not-array (#4252)", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: "just some prose with no refs anywhere",
+  });
+  assert.equal(diagnostics.kind, "content-not-array");
+  assert.equal(diagnostics.flatSummarySalvage, undefined);
+  assert.equal(ranges.length, 0);
+});
+
+test("merged flat form: broken JSON shell or non-object structure beside refs stays rejected (#4252)", () => {
+  const broken = parseCompressArgs({
+    content: '{"summary": "cut off mid-string',
+    startId: "m00001",
+    endId: "m00005",
+  });
+  assert.equal(broken.ranges.length, 0);
+  const scalar = parseCompressArgs({
+    content: "123",
+    startId: "m00001",
+    endId: "m00005",
+  });
+  assert.equal(scalar.ranges.length, 0);
+  const emptyObj = parseCompressArgs({
+    content: "{}",
+    startId: "m00001",
+    endId: "m00005",
+  });
+  assert.equal(emptyObj.ranges.length, 0);
+});
+
+test("U+2212 minus and U+FF0D fullwidth dash are recognized range separators (#4252)", () => {
+  for (const header of [
+    "m00150\u2212m00168",
+    "m00150\uFF0Dm00168",
+    "m00150 − m00168",
+    "m00150－m00168",
+  ]) {
+    const { ranges, diagnostics } = parseCompressArgs({
+      content: [`${header} topic\nsum`],
+    });
+    assert.equal(diagnostics.kind, "ok", `separator in ${JSON.stringify(header)}`);
+    assert.equal(ranges[0]!.startRef, "m00150", `separator in ${JSON.stringify(header)}`);
+    assert.equal(ranges[0]!.endRef, "m00168", `separator in ${JSON.stringify(header)}`);
+    assert.equal(ranges[0]!.topic, "topic", `separator in ${JSON.stringify(header)}`);
+  }
+});
+
+test("unrecognized separator with a second ref is rejected, not narrowed (#4252)", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: ["m00150 => m00168 topic\nsum"],
+  });
+  assert.equal(ranges.length, 0);
+  assert.equal(diagnostics.invalidItems, 1);
+  const reason = diagnostics.invalidReasons?.[0] ?? "";
+  assert.ok(reason.includes('"=>"'), reason);
+  assert.ok(reason.includes("m00150"), reason);
+  assert.ok(reason.includes("m00168"), reason);
+});
+
+test("two adjacent refs with no separator are rejected, not narrowed (#4252)", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: ["m00150 m00168 topic\nsum"],
+  });
+  assert.equal(ranges.length, 0);
+  assert.ok(
+    (diagnostics.invalidReasons?.[0] ?? "").includes(
+      "no recognized separator",
+    ),
+    JSON.stringify(diagnostics.invalidReasons),
+  );
+});
+
+test("wordy gap between refs stays a single-message read (topic citation) (#4252)", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: ["m00150 see also m00168 for context\nsum"],
+  });
+  assert.equal(diagnostics.kind, "ok");
+  assert.equal(ranges.length, 1);
+  assert.equal(ranges[0]!.startRef, "m00150");
+  assert.equal(ranges[0]!.endRef, "m00150");
+  assert.equal(ranges[0]!.topic, "see also m00168 for context");
+});
+
+test("header-only string entries report no-valid-ranges with per-entry reasons (#4252)", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: "m00010–m00020 topic\nm00030–m00040 other",
+  });
+  assert.equal(ranges.length, 0);
+  assert.equal(diagnostics.kind, "no-valid-ranges");
+  assert.equal(diagnostics.invalidItems, 2);
+  assert.ok(
+    (diagnostics.invalidReasons ?? []).every((r) =>
+      r.includes("missing summary"),
+    ),
+    JSON.stringify(diagnostics.invalidReasons),
+  );
+});
+
+test("header-only plus valid entry in one string keeps ok kind with the invalid count (#4252)", () => {
+  const { ranges, diagnostics } = parseCompressArgs({
+    content: "m00010–m00020 topic\nm00030–m00040 other\nbody under other",
+  });
+  assert.equal(diagnostics.kind, "ok");
+  assert.equal(ranges.length, 1);
+  assert.equal(ranges[0]!.startRef, "m00030");
+  assert.equal(diagnostics.invalidItems, 1);
+  assert.ok(
+    (diagnostics.invalidReasons?.[0] ?? "").includes("missing summary"),
+  );
+});

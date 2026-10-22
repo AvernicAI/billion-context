@@ -47,6 +47,9 @@ export interface CompressParseDiagnostics {
   /** True when a non-array `content` value (single entry object or nested
    *  `ranges` array) was recovered into the canonical array form (#470). */
   contentSalvage?: boolean;
+  /** True when a string `content` holding the summary text beside top-level
+   *  refs (startId/endId) was recovered as one flat range (#4252). */
+  flatSummarySalvage?: boolean;
   /** First 800 chars of the raw string input (string inputs only). */
   rawPrefix?: string;
   /** Raw string input length (string inputs only). */
@@ -198,25 +201,57 @@ function parseObjectValue(
       parsed === null ||
       (parsed.entries.length === 0 && content.trim().length > 0)
     ) {
-      // Not a JSON array (or nothing salvageable): bare line-form text.
-      // Strip JSON-wrapper residue (stringified ["…"] with broken
-      // escaping) — the line form needs structure only in the refs
-      // header line, so the summary body never has to parse.
+      // Not a JSON array (or nothing salvageable): either the merged flat
+      // single-range form (#4252) or bare line-form text. Strip
+      // JSON-wrapper residue (stringified ["…"] with broken escaping) —
+      // the line form needs structure only in the refs header line, so
+      // the summary body never has to parse.
       const bare = stripJsonWrapperResidue(content);
-      const entries = splitLineEntries(bare);
-      const { ranges, invalid, reasons } = validateEntries(entries, callId);
-      if (ranges.length > 0) {
-        diag.invalidItems = invalid;
-        if (reasons.length > 0) diag.invalidReasons = reasons;
-        diag.kind = "ok";
-        return finish(ranges, diag);
+      const flat = flatSummaryEntry(value, content);
+      if (flat !== undefined) {
+        entries = [flat];
+        diag.flatSummarySalvage = true;
+        // fall through to the shared validation tail below
+      } else {
+        const lineEntries = splitLineEntries(bare);
+        const { ranges, invalid, reasons } = validateEntries(
+          lineEntries,
+          callId,
+        );
+        if (ranges.length > 0) {
+          diag.invalidItems = invalid;
+          if (reasons.length > 0) diag.invalidReasons = reasons;
+          diag.kind = "ok";
+          return finish(ranges, diag);
+        }
+        // #4252 RC3: entries whose first line IS a refs header are line-
+        // form drift (usually a missing summary under the header), not
+        // "not an array" — report no-valid-ranges with the per-entry
+        // reasons so the model can fix the call instead of retrying blind
+        // (#362 visibility). Prose without any refs header stays
+        // content-not-array.
+        const looksLikeLineForm = lineEntries.some((e) => {
+          if (typeof e !== "string") return false;
+          const nl = e.indexOf("\n");
+          const head = (nl === -1 ? e : e.slice(0, nl)).trim();
+          return (
+            REF_PAIR_IN_LINE.test(head) || SINGLE_REF_IN_LINE.test(head)
+          );
+        });
+        if (looksLikeLineForm) {
+          diag.invalidItems = invalid;
+          if (reasons.length > 0) diag.invalidReasons = reasons;
+          diag.kind = "no-valid-ranges";
+        } else {
+          diag.kind = "content-not-array";
+        }
+        return finish([], diag);
       }
-      diag.kind = "content-not-array";
-      return finish([], diag);
+    } else {
+      entries = parsed.entries;
+      salvaged = parsed.salvaged;
+      if (parsed.quoteRepaired) diag.quoteSalvage = true;
     }
-    entries = parsed.entries;
-    salvaged = parsed.salvaged;
-    if (parsed.quoteRepaired) diag.quoteSalvage = true;
   } else if (content !== null && typeof content === "object") {
     // #470: a single entry OBJECT in the content slot instead of a
     // one-element array — the SAME drift the top level already recovers
@@ -374,9 +409,16 @@ type EntryOutcome = { range: CompressRangeSpec } | { reason: string };
 // hard requirement is refs at the START of the first line. Both patterns are
 // anchored (^): summaries cite mNNNNN/bN refs routinely, so an unanchored
 // scan would let a citation inside a headerless entry supply fake bounds.
+// #4252 RC2: the separator class includes U+2212 (minus sign) and U+FF0D
+// (fullwidth hyphen-minus) — models copy the dash from rendered summaries,
+// where it is usually the Unicode minus, not ASCII '-'.
 const REF_PAIR_IN_LINE =
-  /^([mb]\d{1,7})\s*(?:[-\u2013\u2014\u2026~]|\.\.\.|to)\s*([mb]\d{1,7})\b/i;
+  /^([mb]\d{1,7})\s*(?:[-\u2212\uFF0D\u2013\u2014\u2026~]|\.\.\.|to)\s*([mb]\d{1,7})\b/i;
 const SINGLE_REF_IN_LINE = /^([mb]\d{1,7})\b/i;
+// #4252 RC2: second-ref scan for the single-ref fallback — catches pairs
+// whose separator the class above missed. The lookbehind keeps refs glued
+// to a preceding alphanumeric run ("idm00168") from matching.
+const SECOND_REF_IN_HEADER = /(?<![A-Za-z0-9])([mb]\d{1,7})\b/i;
 
 function normalizeLineRef(raw: string): string {
   const lower = raw.toLowerCase();
@@ -403,6 +445,25 @@ function parseLineEntry(
     const single = SINGLE_REF_IN_LINE.exec(head);
     if (single === null)
       return { reason: "line entry: no mNNNNN/bN refs in header" };
+    // #4252 RC2: a second ref later in the header means the writer meant a
+    // PAIR whose separator the class above missed ("=>", adjacent refs…).
+    // Silently narrowing to ONE message is the expensive failure — reject
+    // with the offending separator named so the retry can fix it. A wordy
+    // gap ("see also m00168") is a topic citing another ref, not a pair:
+    // keep the honest single-message reading.
+    const rest = head.slice(single.index + single[0].length);
+    const second = SECOND_REF_IN_HEADER.exec(rest);
+    if (second !== null) {
+      const sep = rest.slice(0, second.index).trim();
+      if (!/\p{L}{2,}/u.test(sep)) {
+        return {
+          reason:
+            sep.length === 0
+              ? `line entry: two refs (${single[1]} ${second[1]}) with no recognized separator between them — use one of - – — … ~ .. − － or "to"`
+              : `line entry: unrecognized range separator "${sep}" between ${single[1]} and ${second[1]} — use one of - – — … ~ .. − － or "to"`,
+        };
+      }
+    }
     startRef = normalizeLineRef(single[1]!);
     endRef = startRef;
     afterRefs = single.index + single[0].length;
@@ -438,8 +499,9 @@ export function deriveTopicFromSummary(summary: string): string | undefined {
   return text.length > 60 ? clampPrefix(text, 60).trimEnd() : text;
 }
 
+// Separator class mirrors REF_PAIR_IN_LINE (keep the two in step, #4252).
 const LINE_ENTRY_REFS_RE =
-  /[mb]\d{1,7}\s*(?:[-\u2013\u2014\u2026~]|\.\.\.|to)\s*[mb]\d{1,7}\b/iy;
+  /[mb]\d{1,7}\s*(?:[-\u2212\uFF0D\u2013\u2014\u2026~]|\.\.\.|to)\s*[mb]\d{1,7}\b/iy;
 const WHITESPACE_RE = /\s/;
 
 function skipWhitespace(s: string, i: number): number {
@@ -559,6 +621,97 @@ function validateEntry(
 
 function stringOr(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+// #4252 RC1: the merged flat single-range form. The schema documents the
+// multi-range `content` string and the flat {startId,endId,summary} form
+// separately, so models combine them: the summary TEXT rides in `content`
+// beside top-level refs (plain prose, or a JSON-encoded object with
+// summary/topic fields). Recover it as ONE object entry so the shared
+// validation tail applies unchanged. Never hijacks line form: a first line
+// that already carries refs headers keeps its line-form reading, so every
+// input that parses today is untouched. Top-level `summary` wins over the
+// content text; a content payload that parses to a non-object structure
+// (array, scalar) or a summary-less JSON object is not the documented
+// shape and stays rejected.
+function flatSummaryEntry(
+  value: Record<string, unknown>,
+  raw: string,
+): Record<string, unknown> | undefined {
+  // Same field-name variants as validateEntry (startRef/startId/messageId).
+  const start =
+    stringOr(value["startRef"]) ??
+    stringOr(value["startId"]) ??
+    stringOr(value["messageId"]);
+  const end =
+    stringOr(value["endRef"]) ??
+    stringOr(value["endId"]) ??
+    stringOr(value["messageId"]);
+  if (start === undefined || end === undefined) return undefined;
+  const text = stripJsonWrapperResidue(raw).trim();
+  if (text.length === 0) return undefined;
+  const firstLine = (text.split("\n")[0] ?? "").trim();
+  if (REF_PAIR_IN_LINE.test(firstLine) || SINGLE_REF_IN_LINE.test(firstLine))
+    return undefined;
+  const fenced = stripFence(raw.trim());
+  // Structural reading of the content text, most specific first: a strict
+  // or lenient JSON OBJECT supplies summary/topic fields; a quoted string
+  // is prose (its text, carried by `text` below); anything else coherent
+  // (number, boolean, null, array) is not the documented shape — reject
+  // rather than fold its text. Strict JSON.parse only on the first rung:
+  // prose fails it instantly, so the lenient repair ladder stays reserved
+  // for JSON-shaped payloads; a JSON-shaped payload that still does not
+  // parse is a broken shell, also rejected.
+  let inner: Record<string, unknown> | undefined;
+  {
+    let strict: unknown;
+    let strictOk = false;
+    try {
+      strict = JSON.parse(fenced);
+      strictOk = true;
+    } catch {
+      // not strict JSON — shape-specific paths below
+    }
+    if (strictOk) {
+      if (
+        strict !== null &&
+        typeof strict === "object" &&
+        !Array.isArray(strict)
+      ) {
+        inner = strict as Record<string, unknown>;
+      } else if (typeof strict !== "string") {
+        return undefined;
+      }
+    } else if (/^[\[{]/.test(fenced)) {
+      const lenient = tryParseLenient(fenced);
+      if (lenient === undefined) return undefined;
+      if (
+        lenient !== null &&
+        typeof lenient === "object" &&
+        !Array.isArray(lenient)
+      ) {
+        inner = lenient as Record<string, unknown>;
+      } else if (typeof lenient !== "string") {
+        return undefined;
+      }
+    }
+  }
+  let summary = stringOr(value["summary"]);
+  let topic = stringOr(value["topic"]);
+  if (inner !== undefined) {
+    if (summary === undefined) summary = stringOr(inner["summary"]);
+    if (topic === undefined) topic = stringOr(inner["topic"]);
+    if (summary === undefined) return undefined;
+  }
+  if (summary === undefined) summary = text;
+  if (summary.length === 0) return undefined;
+  const entry: Record<string, unknown> = {
+    startRef: start,
+    endRef: end,
+    summary,
+  };
+  if (topic !== undefined) entry["topic"] = topic;
+  return entry;
 }
 
 // --- tolerant JSON parsing -------------------------------------------------
