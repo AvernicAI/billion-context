@@ -32,14 +32,14 @@ import {
   type MessageContentStore,
 } from "acp-kernel";
 
-export interface UncoveredRun {
+interface UncoveredRun {
   startRef: string;
   endRef: string;
   count: number;
   tokens: number;
 }
 
-export interface UncoveredAuditInput {
+interface UncoveredAuditInput {
   core: CompressionCore;
   /** Full resent log (apply class) — same array class prepare runs on. */
   messages: CoreMessage[];
