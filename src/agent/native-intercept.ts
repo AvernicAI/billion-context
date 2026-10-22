@@ -172,6 +172,12 @@ export interface NativeInterceptState {
      *  bili produces is re-signed); undefined falls back to the #1886 direct
      *  send — bytes untouched, inbound signature intact, no compression. */
     resignCredentialFor?: (url: string, scheme: string, inboundAk?: string) => Promise<{ ak: string; sk: string; token?: string } | undefined>;
+    /** #4276: client-side exemption prefixes (`providers.<url>.direct`) — a
+     *  model-API request whose URL matches one of these origins sends DIRECT
+     *  (uncompressed, byte-untouched, no plugin headers stamped): the
+     *  documented per-route exemption completed for the fetch-intercept lanes.
+     *  Same boundary rule as the zcode store lane (exact key or key + "/"). */
+    directPrefixes?: readonly string[];
 }
 
 // #1410: same-process installs share one identity — Symbol.for keeps the
@@ -213,6 +219,16 @@ function noteSignedDirect(url: string, scheme: string, why: string): void {
     logHostEvent("warn", "[native-client]", `bili-native: ${scheme}-signed model request forwarded DIRECT (${why}): ${key}`);
 }
 
+// #4276: the documented client-side exemption (providers.<url>.direct) sends
+// model traffic uncompressed — loud exactly like the signed passthrough
+// (#2090): once per exempted upstream, never per request.
+const directExemptSeen = new Set<string>();
+function noteDirectExempt(prefix: string, url: string): void {
+    if (directExemptSeen.has(prefix) || directExemptSeen.size >= 128) return;
+    directExemptSeen.add(prefix);
+    logHostEvent("warn", "[native-client]", `bili-native: providers.direct exemption active — model traffic for ${prefix} sends direct (uncompressed): ${url}`);
+}
+
 // Model-API endpoint suffixes across the wires bili proxies: Anthropic
 // `/v1/messages`, OpenAI chat `/v1/chat/completions` (and legacy
 // `/v1/completions`), Responses `/v1/responses`, Mistral
@@ -248,6 +264,14 @@ export function isModelApiUrl(url: string): boolean {
     } catch {
         return false;
     }
+}
+
+/** #4276: `providers.<url>.direct` exemption match — returns the matching
+ *  prefix (for once-per-prefix logging) or undefined. Same boundary rule as
+ *  the zcode store lane (src/zcode/json-edit.ts directExemptionHit): exact key
+ *  or key + "/", so "https://x.com" never exempts "https://x.com.evil". */
+export function directExemptMatch(url: string, directPrefixes: readonly string[]): string | undefined {
+    return directPrefixes.find((prefix) => url === prefix || url.startsWith(prefix + "/"));
 }
 
 /** Normalize either init.headers or a Request-object input — the two forms a
@@ -1117,6 +1141,16 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             if (!isBiliControlUrl(url) && fetchMethodOf(input, init) === "POST") state.onUnroutedModelUrl?.(url);
             return send(input, init);
         }
+        // #4276: documented client-side exemption (providers.<url>.direct) —
+        // this upstream is NEVER pointed at bili: byte-untouched direct send.
+        // The http.request hook marks such requests before stamping, so no
+        // x-bili-plugin-* header rides them either.
+        const exemptPrefix = state.directPrefixes !== undefined ? directExemptMatch(url, state.directPrefixes) : undefined;
+        if (exemptPrefix !== undefined) {
+            noteDirectExempt(exemptPrefix, url);
+            state.onDispatch?.(url, "direct");
+            return send(input, init);
+        }
         // #1884/#2090 plan A + owner binary-contract ruling ("要么一定压缩，
         // 或者一定拒绝"): a body-covering signature cannot survive a rewrite —
         // routing these through the proxy un-armed makes the upstream reject
@@ -1322,5 +1356,6 @@ export function _resetForTest(opts: { anchor?: typeof globalThis.fetch } = {}): 
     delete g[ACTIVE_STATE];
     delete g[ACTIVE_STATE_SEQ];
     signedDirectSeen.clear();
+    directExemptSeen.clear();
     resetFetchChainForTest(opts);
 }
