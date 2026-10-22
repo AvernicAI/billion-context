@@ -155,19 +155,34 @@ export async function prepareGoogle(
         // checkpoint framing in resent history AND decimated fold coverage;
         // detection runs BEFORE reconcileFoldCoverage/processTurn. No known
         // dsh+google traffic yet — this closes the same hole on the fourth wire.
-        if (!isTitleGen && laneDecisions.profile.compactsClientSide && session.state.blocks.some((b) => b.active)) {
-            const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
-            const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
-            if (dshGap && (carriesDshLocalCompactionSummary(msgs) || carriesBiliSnapshotCheckpoint(msgs))) {
-                const missing = dshGap.expected - dshGap.matched;
-                if (missing >= DSH_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= dshGap.expected) {
+        // #3874: attribution is an EXISTENCE test on the checkpoint framing, not a fold
+        // predicate. The `blocks.some(active)` + `dshGap &&` gate used to wrap the FRAME
+        // READ, so a session dsh compacted before bili ever folded never entered this
+        // branch. Fold coverage now only decides whether a rebase is worthwhile.
+        let dshAttributed = false;
+        if (!isTitleGen && laneDecisions.profile.compactsClientSide) {
+            const authored = carriesBiliSnapshotCheckpoint(msgs);
+            const framed = carriesDshLocalCompactionSummary(msgs);
+            if (authored || framed) {
+                const coveredBeforeDshCompact = coveredRealHistoryIds(session.state.blocks); // #2627: same real-history caliber
+                const noFoldState = coveredBeforeDshCompact.size === 0;
+                const dshGap = noFoldState ? null : foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
+                const missing = dshGap === null ? 0 : dshGap.expected - dshGap.matched;
+                const rebaseNeeded = dshGap !== null && missing >= DSH_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= dshGap.expected;
+                const firstSighting = noFoldState && session.metadata.dshNativeCompactionLanded !== true;
+                if (rebaseNeeded || firstSighting) {
+                    dshAttributed = true;
+                    session.metadata.dshNativeCompactionLanded = true;
                     // #3733: our own <bili-snapshot v1 …/> tag = authored checkpoint.
-                    const authored = carriesBiliSnapshotCheckpoint(msgs);
                     if (authored) session.metadata.dshAuthoredCheckpointLanded = true;
-                    recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
-                    log(authored ? "info" : "warn", `[${sessionId}] dsh ${authored ? "AUTHORED checkpoint landed" : "native compaction detected"} (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — ${authored ? "rebasing ACP state onto the authored bili-snapshot checkpoint (#3733)" : "rebasing ACP state onto the compacted history (#2432)"}`);
-                    markNativeCompactionBoundary(session);
-                    reconcileNativeCompactionBoundary(session);
+                    const coverage = dshGap === null ? "no fold state yet (nothing to rebase)" : `${missing}/${dshGap.expected} covered id(s) replaced by the compacted history`;
+                    const retained = dshGap === null ? "no fold state yet" : `${dshGap.matched}/${dshGap.expected} covered id(s) retained`;
+                    recordConflict(session, "native-compaction", `dsh native compaction: ${coverage}; ${rebaseNeeded ? "ACP state rebased (#2432)" : "landing attributed, no ACP state to rebase (#3874)"}`);
+                    log(authored ? "info" : "warn", `[${sessionId}] dsh ${authored ? "AUTHORED checkpoint landed" : "native compaction detected"} (${retained}, checkpoint framing in resent history) — ${rebaseNeeded ? (authored ? "rebasing ACP state onto the authored bili-snapshot checkpoint (#3733)" : "rebasing ACP state onto the compacted history (#2432)") : "attributed to dsh, nothing to rebase (#3874)"}`);
+                    if (rebaseNeeded) {
+                        markNativeCompactionBoundary(session);
+                        reconcileNativeCompactionBoundary(session);
+                    }
                 }
             }
         }
@@ -248,7 +263,7 @@ export async function prepareGoogle(
         // deactivated the blocks whose sources left the context.
         {
             const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id));
-            if (rewrite.detected) {
+            if (rewrite.detected && !dshAttributed) {
                 log("warn", `[${sessionId}] unannounced client history rewrite detected (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known) — marking compaction boundary (#1001)`);
                 recordConflict(session, "unannounced-rewrite", `${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known`);
                 markCompactionBoundary(session);

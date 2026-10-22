@@ -247,30 +247,49 @@ export async function prepareResponses(
         // #3686: host policy — a declared plugin host with a codex-shaped UA is not codex.
         const codexLane = !isCompactionTrigger && isCodexHost(req.headers);
         const dshLane = !isCompactionTrigger && laneDecisions.profile.compactsClientSide; // #3417 registry property (dsh native compaction, #2432)
-        if ((codexLane || dshLane) && session.state.blocks.some((b) => b.active)) {
-            const coveredBeforeLocalCompact = coveredRealHistoryIds(session.state.blocks);
-            const localGap = foldCoverage(coveredBeforeLocalCompact, msgs.map((m) => m.id));
+        // #3874: read the FRAME before consulting fold state. `blocks.some(active)` used to
+        // wrap this whole block, so a dsh session that compacted before bili ever folded
+        // never reached the frame read and fell through to the rewrite detector.
+        const hasActiveBlocks = session.state.blocks.some((b) => b.active);
+        if (codexLane || dshLane) {
             // #2621: pre-turn ref map for the dsh novelty gate — a freshly-landed
             // checkpoint is a NEW id; historical quotes/replays hit old ids.
             const knownIdsBeforeLocalCompact = new Set(Object.keys(session.state.messageRefs.byRaw));
             const codexHit = codexLane && carriesCodexLocalCompactionSummary(msgs);
-            const dshHit = dshLane && (carriesDshLocalCompactionSummary(msgs, knownIdsBeforeLocalCompact) || carriesBiliSnapshotCheckpoint(msgs, knownIdsBeforeLocalCompact));
             const dshAuthored = dshLane && carriesBiliSnapshotCheckpoint(msgs, knownIdsBeforeLocalCompact);
-            if (localGap && (codexHit || dshHit)) {
-                const missing = localGap.expected - localGap.matched;
-                const minMissing = dshHit ? DSH_LOCAL_COMPACTION_MIN_MISSING : CODEX_LOCAL_COMPACTION_MIN_MISSING;
-                if (missing >= minMissing && missing * 2 >= localGap.expected) {
-                    if (dshHit) {
-                        // #3733: our own <bili-snapshot v1 …/> tag = authored checkpoint.
-                        if (dshAuthored) session.metadata.dshAuthoredCheckpointLanded = true;
-                        recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
-                        log(dshAuthored ? "info" : "warn", `[${sessionId}] dsh ${dshAuthored ? "AUTHORED checkpoint landed" : "native compaction detected"} (${localGap.matched}/${localGap.expected} covered id(s) retained, checkpoint framing in resent history) — ${dshAuthored ? "rebasing ACP state onto the authored bili-snapshot checkpoint (#3733)" : "rebasing ACP state onto the compacted history (#2432)"}`);
-                    } else {
-                        recordConflict(session, "native-compaction", `codex local auto-compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; rebasing ACP state (#2372)`);
-                        log("warn", `[${sessionId}] codex local auto-compaction detected (${localGap.matched}/${localGap.expected} covered ids retained) — rebasing ACP state onto the compacted history (#2372)`);
+            const dshFramed = dshLane && dshAuthored !== true && carriesDshLocalCompactionSummary(msgs, knownIdsBeforeLocalCompact);
+            const dshHit = dshAuthored || dshFramed;
+            // #3874: with NO fold state there is nothing of ours to rebase, but a dsh frame
+            // still attributes the landing to dsh — record it once (flag = dedupe) and let
+            // the rewrite detector stand down. Codex is untouched: its branch keeps the
+            // pre-existing "needs a gap to be recognised" behavior.
+            const noFoldState = !hasActiveBlocks || coveredRealHistoryIds(session.state.blocks).size === 0;
+            const firstSighting = dshHit && noFoldState && session.metadata.dshNativeCompactionLanded !== true;
+            if (firstSighting) {
+                session.metadata.dshNativeCompactionLanded = true;
+                if (dshAuthored) session.metadata.dshAuthoredCheckpointLanded = true;
+                recordConflict(session, "native-compaction", "dsh native compaction: no fold state yet (nothing to rebase); landing attributed (#3874)");
+                log(dshAuthored ? "info" : "warn", `[${sessionId}] dsh ${dshAuthored ? "AUTHORED checkpoint landed" : "native compaction detected"} (no fold state yet, checkpoint framing in resent history) — attributed to dsh, nothing to rebase (#3874)`);
+            } else if (hasActiveBlocks) {
+                const coveredBeforeLocalCompact = coveredRealHistoryIds(session.state.blocks);
+                const localGap = foldCoverage(coveredBeforeLocalCompact, msgs.map((m) => m.id));
+                if (localGap && (codexHit || dshHit)) {
+                    const missing = localGap.expected - localGap.matched;
+                    const minMissing = dshHit ? DSH_LOCAL_COMPACTION_MIN_MISSING : CODEX_LOCAL_COMPACTION_MIN_MISSING;
+                    if (missing >= minMissing && missing * 2 >= localGap.expected) {
+                        if (dshHit) {
+                            session.metadata.dshNativeCompactionLanded = true;
+                            // #3733: our own <bili-snapshot v1 …/> tag = authored checkpoint.
+                            if (dshAuthored) session.metadata.dshAuthoredCheckpointLanded = true;
+                            recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
+                            log(dshAuthored ? "info" : "warn", `[${sessionId}] dsh ${dshAuthored ? "AUTHORED checkpoint landed" : "native compaction detected"} (${localGap.matched}/${localGap.expected} covered id(s) retained, checkpoint framing in resent history) — ${dshAuthored ? "rebasing ACP state onto the authored bili-snapshot checkpoint (#3733)" : "rebasing ACP state onto the compacted history (#2432)"}`);
+                        } else {
+                            recordConflict(session, "native-compaction", `codex local auto-compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; rebasing ACP state (#2372)`);
+                            log("warn", `[${sessionId}] codex local auto-compaction detected (${localGap.matched}/${localGap.expected} covered ids retained) — rebasing ACP state onto the compacted history (#2372)`);
+                        }
+                        markNativeCompactionBoundary(session);
+                        reconcileNativeCompactionBoundary(session);
                     }
-                    markNativeCompactionBoundary(session);
-                    reconcileNativeCompactionBoundary(session);
                 }
             }
         }
