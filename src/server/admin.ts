@@ -492,6 +492,29 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             return;
         }
     }
+    if (req.method === "POST" && (req.url === "/__bili/storage/backup" || req.url?.startsWith("/__bili/storage/backup?"))) {
+        // #4175: online consistent snapshot of the unified store (VACUUM
+        // INTO — sqlite only, never blocks WAL writers).
+        try {
+            const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { dst?: unknown };
+            const store = getStore();
+            if (!store.replicasAvailable()) {
+                res.writeHead(501, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: false, error: "storage backup requires the unified store — start this instance with BILI_STORAGE_UNIFIED=shadow|full (or storage.unified in the config file)" }));
+                return;
+            }
+            const dst = typeof parsed.dst === "string" && parsed.dst.length > 0 ? parsed.dst : undefined;
+            const result = store.unifiedBackup(dst);
+            log("info", `[admin] POST /__bili/storage/backup — ok=${result.ok} path=${result.path ?? "-"} bytes=${result.bytes ?? 0}`);
+            res.writeHead(result.ok ? 200 : 409, { "content-type": "application/json" });
+            res.end(JSON.stringify(result));
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
     if (req.method === "POST" && req.url === "/__bili/storage/restore") {
         try {
             const parsed = JSON.parse((await readBody(req)).toString("utf8")) as { sessionId?: unknown; archiveDir?: unknown };

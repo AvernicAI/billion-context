@@ -195,15 +195,13 @@ test("plugin: effectiveContextLimit honors anthropic-beta context-1m, per-reques
         };
         // With the beta header → the window reported to the plugin is 1M.
         await (await fetch(url(rig), { method: "POST", headers: { ...base, "anthropic-beta": BETA }, body: JSON.stringify({ model: MODEL, max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hi" }] }) })).text();
-        // #3900: Anthropic now reserves like every other wire, so the reported
-        // limit is the negotiated 1M minus the 1024-token output reservation.
-        assert.equal(listSessions()[0]?.metadata.effectiveContextLimit, 1_000_000 - 1_024, "beta → 1M minus output reservation reported to plugin");
+        assert.equal(listSessions()[0]?.metadata.effectiveContextLimit, 1_000_000, "beta → 1M reported to plugin");
 
         // Same session, header disappears → the window drops back to the model
         // default 200K. This is the per-request resolution the issue requires:
         // the beta may appear/disappear between requests of one session.
         await (await fetch(url(rig), { method: "POST", headers: base, body: JSON.stringify({ model: MODEL, max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hi again" }] }) })).text();
-        assert.equal(listSessions()[0]?.metadata.effectiveContextLimit, 200_000 - 1_024, "no beta → 200K minus output reservation (per-request resolution)");
+        assert.equal(listSessions()[0]?.metadata.effectiveContextLimit, 200_000, "no beta → 200K (per-request resolution)");
     } finally {
         await closeRig(rig);
     }

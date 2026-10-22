@@ -1,4 +1,8 @@
 import { test } from "node:test";
+// #4004/#4242: this file pins the LEGACY envelope layer (guard semantics,
+// directory shape). Full mode adds index.db to the dir and serves
+// unified-first — both would make these assertions nondeterministic.
+process.env.BILI_STORAGE_UNIFIED = "legacy";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";

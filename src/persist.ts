@@ -28,10 +28,11 @@ import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
-import { markDirty, scrubTurnSeparatorIds } from "./session.js";
+import { markDirty } from "./session.js";
+import { mergeState } from "./state-hydration.js";
 import { LazyBlockContents, isDroppedMetadata, lazyMetadata } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
-import { orphanContents, resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
+import { resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
 import { resolveBackendName } from "./storage/backend.js";
 import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import { sha256Hex, type CheckpointRow } from "./storage/store.js";
@@ -214,55 +215,6 @@ interface PersistedSession {
 }
 
 type Logger = (level: "info" | "warn" | "error", msg: string) => void;
-
-/** Forward-compat: merge a parsed state with a fresh one so missing fields
- * (added in later versions) get sane defaults instead of `undefined`. */
-function mergeState(parsed: CompressionState): CompressionState {
-    const fresh = createInitialState();
-    return {
-        // #2627: heal persisted state written before the turn-separator fix —
-        // those blocks' coverage carries outbound-only acp_turn_sep_* ids that
-        // no resent history can ever contain; scrubbing at hydration is what
-        // stops live long sessions from alarming forever after an upgrade.
-        blocks: (() => { const blocks = parsed.blocks ?? fresh.blocks; scrubTurnSeparatorIds(blocks); return blocks; })(),
-        messageRefs: parsed.messageRefs ?? fresh.messageRefs,
-        nudge: { ...fresh.nudge, ...(parsed.nudge ?? {}) },
-        stats: { ...fresh.stats, ...(parsed.stats ?? {}) },
-        nextBlockId: parsed.nextBlockId ?? fresh.nextBlockId,
-        nextRunId: parsed.nextRunId ?? fresh.nextRunId,
-        tokenSnapshot: parsed.tokenSnapshot ?? fresh.tokenSnapshot,
-        lastPassIds: parsed.lastPassIds ?? fresh.lastPassIds,
-        hiddenOrphanRefs: parsed.hiddenOrphanRefs ?? fresh.hiddenOrphanRefs,
-        // #2362: without this a restart forgets which refs are dead and the
-        // model re-learns each one by failing a compress call again.
-        deadRefs: parsed.deadRefs ?? fresh.deadRefs,
-        terminalStreak: parsed.terminalStreak ?? fresh.terminalStreak,
-        nextRuleId: parsed.nextRuleId ?? fresh.nextRuleId,
-        // Without this, a restart re-exposes absorbed tool outputs: state
-        // resurrects with absorbed=[] and hideAbsorbedMessages has nothing to hide.
-        absorbed: parsed.absorbed ?? fresh.absorbed,
-        rules: parsed.rules ?? fresh.rules,
-        // #3769: fold-gated orphan-sweep bookkeeping must survive hydration —
-        // dropping sweptOrphanCallIds resurrects already-cleaned pairs after a
-        // restart (mid-history rewrite = cache break); the pending marker is
-        // transient, losing it only defers the sweep to the next fold.
-        sweptOrphanCallIds: parsed.sweptOrphanCallIds ?? fresh.sweptOrphanCallIds,
-        pendingOrphanSweepMinRef: parsed.pendingOrphanSweepMinRef ?? fresh.pendingOrphanSweepMinRef,
-        // #3939 ③/#3691: the emergency-truncate latch must survive hydration —
-        // dropping it re-exposes clipped bytes mid-history after a restart,
-        // rewriting the still-cached prefix on the first post-restart turn.
-        emergencyTruncateLatch: parsed.emergencyTruncateLatch ?? fresh.emergencyTruncateLatch,
-        // #3939 ②/#3805: the render deferral must survive hydration — losing
-        // it stamps migration tags onto still-cached carriers right after a
-        // restart (a silent mid-history rewrite with no fold in sight).
-        renderDeferredRefs: parsed.renderDeferredRefs ?? fresh.renderDeferredRefs,
-        // #3939 ⑤: the view latch must survive hydration — losing it
-        // re-derives transform output on still-cached carriers right after a
-        // restart (silent mid-history rewrite, no fold in sight).
-        viewLatches: parsed.viewLatches ?? fresh.viewLatches,
-        viewLatchConfigDigest: parsed.viewLatchConfigDigest ?? fresh.viewLatchConfigDigest,
-    };
-}
 
 /** Extract a short host label from an upstream origin URL, safe for a
  *  filename. Uses the full hostname (sanitized) rather than guessing the
@@ -1621,6 +1573,23 @@ export class SessionStore {
         }
     }
 
+    /** #4175: online consistent snapshot of the unified store (VACUUM INTO,
+     *  sqlite only). Default destination lives beside the archive dir so a
+     *  backups/ tree grows in one place: sessionsDir/backups/index-<ts>.db. */
+    unifiedBackup(dst?: string): { ok: boolean; path?: string; bytes?: number; error?: string } {
+        if (!this.shadow || this.shadow.stats.disabled) return { ok: false, error: "unavailable" };
+        try {
+            const target = dst ?? join(this.sessionsDir, "backups", `index-${new Date().toISOString().replace(/[:.]/g, "-")}.db`);
+            const bytes = this.shadow.backupInto(target);
+            this.log("info", `[persist] unified backup written: ${target} (${bytes} bytes)`);
+            return { ok: true, path: target, bytes };
+        } catch (err) {
+            const error = String(err);
+            this.log("warn", `[persist] unified backup failed: ${error}`);
+            return { ok: false, error };
+        }
+    }
+
     /** #3928: read-only prediction of unifiedGc for `bili storage gc --dry-run`.
      *  Same mode gate as unifiedGc (null on legacy-only); DB-driven by design —
      *  the plan must predict what the real run does, and the real run sees only
@@ -2323,21 +2292,12 @@ export class SessionStore {
                             // Errors surface through the kernel write chain's own logging.
                         });
                     }
-                    // #3818 writerOff safety valve: writerOff's contract is
-                    // "the index can represent everything I write". An
-                    // orphan-contents record (the #2695 reap shape — block
-                    // gone from state.blocks, text kept in blockContents)
-                    // is SKIPPED by the mirror guard, so this tick would
-                    // otherwise persist NOTHING at all (no rows, no file).
-                    // Land the JSON envelope as the durable copy; the record
-                    // stays envelope-served on every later read.
-                    if (this.shadow && !this.shadow.stats.disabled && orphanContents(toLegacyLike(session))) {
-                        this.log("warn", `[persist] unrepresentable record for ${session.id} under writerOff — landing a JSON envelope copy (index cannot carry its blockContents)`);
-                        const build = this.guardedBuild(session);
-                        void this.store.writeNow(session.id, build).then(() => this.stampOwnWrite(session.id)).catch(() => {
-                            // Errors surface through the kernel write chain's own logging.
-                        });
-                    }
+                    // #3818 writerOff safety valve REMOVED (#4216/#4242):
+                    // the orphan/reap shape is now representable — its
+                    // contents ride sessions.orphans_json in the same
+                    // transaction as everything else, so writerOff's contract
+                    // ("the index can represent everything I write") holds
+                    // without a JSON-envelope escape hatch.
                 } catch (err) {
                     // Kernel-store never-throw save discipline: an uncaughtException
                     // escaping this microtask is fatal in embedded/plugin hosts

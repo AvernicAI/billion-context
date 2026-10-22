@@ -14,6 +14,7 @@ import { type CompressSettings, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { METADATA_FOLD_COVERAGE } from "../src/fold-reconcile.ts";
 import { getSession } from "../src/session.ts";
+import { normalizeUpstreamOrigin } from "../src/util.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
 // #301: when preflight (overflow) compression cannot proceed — the summary
@@ -88,6 +89,19 @@ function makeUpstreamOk(calls?: Call[]): http.Server {
             }
         });
     });
+}
+
+// #4185: zero-evidence identified sessions with a DETERMINISTIC exhaustion
+// (nothing compressible left after maximum folding) now forward once for
+// upstream arbitration instead of failing fast locally. The seeded pins below
+// are exactly that shape, so each carries a settled usage baseline to keep
+// exercising the evidence-driven verdict; relay-dependent failures (429'd or
+// empty summaries) stay on the classic path and need no seeding.
+function seedEvidence(sessionId: string, upstreamPort: number): void {
+    const s = getSession(sessionId);
+    s.stats.lastInputTokens = 100;
+    s.stats.lastInputTokensSource = "usage";
+    s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(`http://127.0.0.1:${upstreamPort}`);
 }
 
 function startProxy(upstreamPort: number, models: Record<string, { context: number }>, kernelOverrides?: Partial<Config>, compressOverrides?: Partial<CompressSettings>): Promise<http.Server> {
@@ -184,6 +198,8 @@ test("e2e #301: overflow + summary upstream 429 → structured 503, over-window 
         // Fresh session: a ~13k-token history against a 10k window — the
         // payload itself overflows, preflight fires, its summarization call
         // 429s. The proxy must fail fast, NOT forward the over-window body.
+        // (#4185) the 429 is relay-dependent, so the identified-fresh escape
+        // stays closed and this pin needs no evidence seeding.
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "preflight-429-sess" },
@@ -294,6 +310,7 @@ test("e2e #301: over-window payload with nothing compressible → structured 413
 
     try {
         const filler = "FILLER_".repeat(7000);
+        seedEvidence("preflight-exhausted-sess", upstreamPort);
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "preflight-exhausted-sess" },
@@ -442,6 +459,7 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
 
     try {
         const filler = "FILLER_".repeat(7000);
+        seedEvidence("preflight-shrink-sess", upstreamPort);
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "preflight-shrink-sess" },
@@ -471,6 +489,7 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
         const proxyPlain = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } }, { protectedTools: ["bash"] });
         await once(proxyPlain, "listening");
         const plainPort = (proxyPlain.address() as { port: number }).port;
+        seedEvidence("preflight-shrink-plain-sess", upstreamPort);
         const r2 = await fetch(`http://127.0.0.1:${plainPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "preflight-shrink-plain-sess" },
@@ -525,6 +544,7 @@ test("e2e #737: output-headroom-shrunk window (non-Anthropic, no operator overri
 
     try {
         const filler = "FILLER_".repeat(7000);
+        seedEvidence("preflight-headroom-sess", upstreamPort);
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "preflight-headroom-sess" },

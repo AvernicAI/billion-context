@@ -152,7 +152,7 @@ import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, resolveSideLane, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass, readOutputBudget } from "./server/budget.js";
 import { pipeThrough } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
@@ -3710,7 +3710,42 @@ export async function preflightCompressIfNeeded(
     // payload) fails fast with 413 instead of burning a multi-MB guaranteed-400
     // forward. This replaces the old char-count reject-forward gate, which
     // fail-fasted a successfully-folded payload that actually fit (#3146).
-    if (unknownBaseline && !growthArmed) {
+    // #4185: the gate above keyed on unknownBaseline, whose `anonymous &&`
+    // (#553 trigger-side concern) excluded IDENTIFIED fresh sessions — the
+    // dsh/codex/claude-code lanes stamp their own session ids, so their first
+    // over-headroom request skipped this gate and hit the final fail-fast;
+    // #3846 pinned every retry and the session was dead from message one
+    // (2026-10-21 raccoon incident: ~227K est vs the 192001 headroom target
+    // while payload + clamped output budget fit the 256000 native window).
+    // Two more arms, same internals: noUpstreamEvidence extends "zero
+    // evidence → arbitrate" to identified fresh sessions — but only for a
+    // DETERMINISTIC exhaustion (zero compressible ranges after maximum
+    // folding, #4185's shape): a relay-dependent failure (transient summary
+    // 503/429/524, empty or truncated summaries) keeps the classic 502
+    // fail-fast, because the walk may succeed once the relay recovers and
+    // forwarding an over-window payload then would only hammer the upstream
+    // (#301/#726). nativeFitAfterClamp forwards whenever the OUTBOUND body
+    // (already #453/#2096-clamped in prepare) plus its declared output budget
+    // fits the NATIVE window — the headroom reservation is a policy
+    // preference, not a physical limit, and with nothing left to fold the
+    // choice is a smaller output budget vs a dead session. statedWall > 0
+    // (the upstream already stated its overflow wall on record) keeps the
+    // native-fit arm closed; doom bytes (#2490) and #3846 guard every arm.
+    const deterministicExhaustion = f?.kind === "exhausted" && f.deterministic;
+    const noUpstreamEvidence = session.stats.lastInputTokens <= 0 && statedWall <= 0 && deterministicExhaustion;
+    let outboundBudgetTokens: number | undefined;
+    try {
+        const outBody: unknown = JSON.parse(typeof outbound.body === "string" ? outbound.body : outbound.body.toString("utf8"));
+        const outField = outputBudgetField(outBody);
+        const rawBudget = outField !== null ? readOutputBudget(outBody as Record<string, unknown>, outField) : undefined;
+        if (typeof rawBudget === "number" && rawBudget > 0) outboundBudgetTokens = rawBudget;
+    } catch {
+        outboundBudgetTokens = undefined;
+    }
+    const outboundCalibrated = foldedCalibratedSize ?? calibratedPayload;
+    const nativeFitAfterClamp = statedWall <= 0 && outboundBudgetTokens !== undefined && typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0
+        && outboundCalibrated + outboundBudgetTokens <= resolvedNativeWindow;
+    if ((unknownBaseline || noUpstreamEvidence || nativeFitAfterClamp) && !growthArmed) {
         const outMsgs = outbound.processedMessages.length > 0 ? outbound.processedMessages : outbound.originalMessages;
         const doomBytes = estimateCoreMessagesUpperBytes(outMsgs);
         if (doomBytes > Math.max(DOOMED_PROBE_ABSOLUTE_BYTES, limit * DOOMED_PROBE_BYTES_PER_TOKEN)) {
@@ -3723,9 +3758,10 @@ export async function preflightCompressIfNeeded(
         if (localRefusalHere) {
             // #3846: bili already refused this scope locally — do not re-bet on
             // the estimator; fall through to the fail-fast below.
-            log("warn", `[${session.id}] fresh-session payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for size arbitration (#3846)`);
+            log("warn", `[${session.id}] payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) but this origin/model was locally refused (413) at an equal or wider window — NOT re-forwarding for size arbitration (#3846/#4185)`);
         } else {
-            log("info", `[${session.id}] fresh-session payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) with no upstream evidence — forwarding once for the upstream to arbitrate size before failing fast (#3146)`);
+            const viaNativeFit = nativeFitAfterClamp && !noUpstreamEvidence && !unknownBaseline;
+            log("info", `[${session.id}] payload still over window ${limit} by local estimate (~${Math.round(result.payloadEstimate)} tok, ${result.compressedRanges} range(s) folded) ${viaNativeFit ? `but the outbound view (~${Math.round(outboundCalibrated)} tok) + clamped output budget ${outboundBudgetTokens ?? 0} fits the native window ${resolvedNativeWindow}` : "with no upstream evidence"} — forwarding once for the upstream to arbitrate size before failing fast (#3146/#4185)`);
             return outbound;
         }
     }

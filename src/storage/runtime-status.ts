@@ -38,10 +38,16 @@ interface RuntimeState {
     sidecar: UnifiedShadow | null;
     sidecarOpenError: string | null;
     bootstrap: BootstrapOutcome | null;
+    /** #4175 durability trio facts. integrity/backup are null until the first
+     *  store open / backup call; secondProcess is set only while a live
+     *  foreign pid holds the db lockfile. */
+    integrity: { ok: boolean; checkedAt: number; durationMs: number; detail?: string } | null;
+    secondProcess: { pid: number; at: number } | null;
+    backup: { lastPath: string; lastAt: number; lastBytes: number } | null;
 }
 
 function freshState(): RuntimeState {
-    return { requested: null, encryptionBlocked: false, persistDisabled: false, sidecar: null, sidecarOpenError: null, bootstrap: null };
+    return { requested: null, encryptionBlocked: false, persistDisabled: false, sidecar: null, sidecarOpenError: null, bootstrap: null, integrity: null, secondProcess: null, backup: null };
 }
 
 let state: RuntimeState = freshState();
@@ -64,6 +70,21 @@ export function recordRequestedMode(mode: StorageMode, encryptionBlocked: boolea
     state.requested = mode;
     state.encryptionBlocked = encryptionBlocked;
     state.persistDisabled = persistDisabled;
+}
+
+/** #4175: quick_check outcome of the latest store open (pass or fail). */
+export function recordIntegrityOutcome(dbPath: string, ok: boolean, durationMs: number, detail?: string): void {
+    state.integrity = { ok, checkedAt: Date.now(), durationMs, ...(detail === undefined ? {} : { detail: `${dbPath}: ${detail}` }) };
+}
+
+/** #4175: a live foreign pid holds <db>.lock — two processes on one db corrupt it. */
+export function recordSecondProcessOwner(pid: number): void {
+    state.secondProcess = { pid, at: Date.now() };
+}
+
+/** #4175: the last successful VACUUM INTO backup. */
+export function recordBackupOutcome(lastPath: string, lastBytes: number): void {
+    state.backup = { lastPath, lastAt: Date.now(), lastBytes };
 }
 
 export function _resetStorageRuntimeStatusForTest(): void {
@@ -150,6 +171,10 @@ interface StorageRuntimeStatus {
     verifyDrift: number;
     /** #3135 ④/#3818: sessions currently served from the JSON envelope because the index view drifted. */
     driftedSessions: number;
+    /** #4175 durability trio. */
+    integrity: { ok: boolean; checkedAt: number; durationMs: number; detail?: string } | null;
+    secondProcess: { pid: number; at: number } | null;
+    backup: { lastPath: string; lastAt: number; lastBytes: number } | null;
 }
 
 function getStorageRuntimeStatus(): StorageRuntimeStatus {
@@ -187,6 +212,9 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
         // (persist.ts loadSync) while the envelope still exists.
         verifyDrift: sidecar?.stats.verifyDrift ?? 0,
         driftedSessions: sidecar?.driftedSessions.size ?? 0,
+        integrity: state.integrity,
+        secondProcess: state.secondProcess,
+        backup: state.backup,
     };
 }
 
@@ -206,6 +234,10 @@ interface StorageStatusWire {
     /** #3135 ④/#3818: drift observability on the wire. */
     verifyDrift: number;
     driftedSessions: number;
+    /** #4175 durability trio. */
+    integrity: { ok: boolean; checkedAt: number; durationMs: number; detail?: string } | null;
+    secondProcess: { pid: number; at: number } | null;
+    backup: { lastPath: string; lastAt: number; lastBytes: number } | null;
 }
 
 export function storageStatusWire(): StorageStatusWire {
@@ -223,6 +255,9 @@ export function storageStatusWire(): StorageStatusWire {
         sidecarDisabled: st.sidecarDisabled,
         verifyDrift: st.verifyDrift,
         driftedSessions: st.driftedSessions,
+        integrity: st.integrity,
+        secondProcess: st.secondProcess,
+        backup: st.backup,
     };
 }
 

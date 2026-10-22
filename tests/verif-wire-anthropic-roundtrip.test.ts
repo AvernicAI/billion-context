@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert";
 import { translateFunction } from "../verif/symbolic.ts";
@@ -25,7 +26,7 @@ import type { Term } from "../verif/terms.ts";
  * negative controls via UNSAT.
  */
 
-const KP = new URL("../kernel/src/wire/anthropic.ts", import.meta.url).pathname;
+const KP = fileURLToPath(new URL("../kernel/src/wire/anthropic.ts", import.meta.url));
 
 const haveSolver = (() => {
   try { void solveSmt2("(check-sat)", []); return true; } catch { return false; }

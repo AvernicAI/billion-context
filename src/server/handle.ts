@@ -2061,11 +2061,11 @@ async function handleRequest(
         // kernel's nudge/truncate bands sit below (window - reserved) and a
         // context+output overflow can't happen on a small window (e.g. 100k with a
         // large max_tokens — the most common "context blew up" cause; none of the
-        // three layers reserved room for the output before this). #3900: the
-        // reservation now applies to EVERY wire including Anthropic — an over-full
-        // context costs attention everywhere, and wrapper providers on the
-        // Anthropic wire (DeepSeek /anthropic) count completion against the window.
-        // Per-provider opt-out for genuinely separate walls arrives with #3973. The request's own budget field is the exact
+        // three layers reserved room for the output before this). Anthropic is
+        // exempt: its input limit is enforced independently of max_tokens
+        // (separate output budget), so reserving would shift every band down by
+        // maxOutput on every session for no safety gain — see
+        // shouldReserveOutputHeadroom. The request's own budget field is the exact
         // output budget requested for THIS turn, so it is precise and per-request;
         // when the harness omits every budget field (#924 fallback below) the
         // model's declared max output stands in for it.

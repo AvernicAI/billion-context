@@ -6,6 +6,8 @@ import type { Session } from "../session.js";
 import { applyEstimateCalibration } from "../util.js";
 import { readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./side-request.js";
 
+export { readOutputBudget };
+
 // #453 hard backstop: cap the forwarded output budget so input+output can never
 // exceed the window on request-rebuilding upstreams (vLLM rejects an oversized
 // total instead of clamping). Non-Anthropic only — Anthropic enforces its input

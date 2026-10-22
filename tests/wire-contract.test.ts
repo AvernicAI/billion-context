@@ -151,7 +151,10 @@ function toolNameOf(wire: Wire, t: ToolShape): string | undefined {
     return typeof t.name === "string" ? t.name : undefined;
 }
 
-const COMPRESS_FORM_PROPS = ["topic", "content", "startId", "endId", "startRef", "endRef", "summary"];
+// #4252: only the string form is advertised (topic + content). The legacy
+// flat-form fields (startId/endId/startRef/endRef/summary) and array content
+// remain functional in parseCompressInput but are deliberately NOT taught.
+const COMPRESS_FORM_PROPS = ["topic", "content"];
 
 function assertCompressFormsKept(tool: ToolShape | undefined, source: string): void {
     assert.ok(tool, `${source}: compress tool present`);

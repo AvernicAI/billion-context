@@ -533,10 +533,7 @@ test("e2e #663 (anthropic): header strip is a no-op — summary keeps auth, fold
     await once(upstream, "listening");
     const upstreamPort = (upstream.address() as { port: number }).port;
 
-    // #3900: Anthropic now reserves min(max_tokens, cap×window) like every other
-    // wire; +2_000 restores the margin longAnthropicMessages() had against the
-    // old no-reservation wall (12_000 − 1_024 reserved ≈ the old 10_000).
-    const proxy = await startProxy(upstreamPort, { "claude-test": { context: 12_000 } });
+    const proxy = await startProxy(upstreamPort, { "claude-test": { context: 10_000 } });
     await once(proxy, "listening");
     const proxyPort = (proxy.address() as { port: number }).port;
 

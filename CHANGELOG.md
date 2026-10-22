@@ -5,6 +5,21 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Changed (storage correctness wave 3, #4242)
+
+- **State hydration can no longer drift from `mergeState`** (#4192): `COMPRESSION_STATE_FIELDS` in the new `src/state-hydration.ts` is derived mechanically from `Object.keys(mergeState(createInitialState()))` — the ingest/restore field list is generated from the same source as hydration, so a future field can never be restored-but-never-ingested (the `sweptOrphanCallIds`/`pendingOrphanSweepMinRef` loss class). Pinned by a parity test that fails the moment `createInitialState()` grows a key the list does not know.
+- **CAS orphans are deleted the moment their refcount hits zero** (#3987): `releaseContent` now deletes the row on the same statement (`UPDATE … RETURNING` + delete on 0) on both the sqlite and mysql backends. Follows the FK discipline strictly — referencing rows are now always deleted *before* their content is released (five call sites reordered), so a zero-ref row can never be dropped while a surviving row still points at it.
+- **Reap-shape sessions keep advancing instead of freezing** (#4216): blockContents that outlive their blocks (the #2695 reap shape) now ride the ingest plan as `sessions.orphans_json` — merged (`∪`, because LazyBlockContents may trim entries from memory) in the same transaction as everything else. The mirror skip, the async-twin skip, the importRecord skip and the #3818 writerOff JSON safety valve are all gone: the shape is representable, so `writerOff`'s "the index can represent everything I write" contract holds without an escape hatch. Cold loads after a reap now serve fresh state (the freeze-at-`requests=390` repro is pinned).
+- **Raw wire sidecars join the media CAS** (#4069): `splitMediaContent` now also swaps every `data:<mime>;base64,<payload>` occurrence ≥2 KiB inside `rawOpenaiContent` / `rawOpenaiContentParts` / `rawResponsesItem` / `rawGoogleParts` for `{$media:<hash>}` markers; hydration restores the bytes byte-identically on both backends. A picture used to be stored twice (top-level `imageBase64` + the raw sidecar data URL), capping dedup at ~1.89× — the raw sidecar now references the same CAS row (33.8× on the issue's corpus shape). Pinned: no payload bytes in the stored JSON, byte-identical round-trip, shared-row refcount=2.
+- **Full-mode authority over a tampered envelope is now pinned** (#4004): the four legacy-envelope integrity tests (`proxy-persist` ×3, `issue2129` ×1) pin `storage.unified=legacy` — they assert the envelope guard layer, which full mode legitimately supersedes; a new test pins the decided semantics instead (index serves while it holds the record; only when both carriers are gone/tampered does the load reject). These were flaky-by-construction under the #3818 full default.
+- test: storage-render goldens regenerated once — the drift is inherited from master (#4198 headroom revert changed the stats/metadata shape inside fold-turn bodies), not from this PR; full==legacy==goldens still holds on every wire.
+### 存储可靠性三件套:开库自检 + 在线备份 + 第二进程探测(#4175)
+
+- **开库自检**:每次 index.db 打开在迁移之前跑 `PRAGMA quick_check`;失败抛类型化错误,影子层捕获后自动隔离文件组(index.db/-wal/-shm → `.corrupt-<ts>`,与信封 corrupt 处理同款纪律)并重开新库——JSON 信封仍是恢复源,full 模式有机重导入。逃生口 `BILI_STORAGE_QUICK_CHECK=0`(超大库启动时间敏感)。结果与耗时进 runtime-status(`integrity` 字段)。
+- **在线备份**:`UnifiedStore.backupInto(dst)`(SQLite 原生 `VACUUM INTO`,WAL 活跃时安全、不阻塞写者;目标已存在拒绝覆盖)→ `SessionStore.unifiedBackup()` → `POST /__bili/storage/backup {dst?}`(缺省落 `sessionsDir/backups/index-<时间戳>.db`);`backup` 字段进 wire。自动调度不在本版——先给手动能力。
+- **同库第二进程探测**:`<db>.lock` 锁文件(存活外来 pid → 错误日志一次 + wire `secondProcess` 字段 + web 横幅,不硬拦——硬拦会把第二条 lane 砖掉,文档纪律是一会话目录一实例 #3633);死 pid 陈锁自动接管;close() 尽力删锁。堵 #3923/#3959 的检测盲区。
+
+
 ### dsh 归因正面修:llm/stream 会话身份随请求对象(#4082)
 
 - dsh 的 LlmRuntime 在每次派发上盖章 `options.sessionId`(主循环/压缩/标题生成,重试重发也重新盖章),且把 llm/stream waterfall 文档化为官方拦截点。插件现在把每条流的迭代包进以该 sid 为键的 AsyncLocalStorage:适配器的 fetch 读到的会话身份**跟随请求对象,不再依赖异步链形状**——429 重试链、无 initiator 的 agentless 侧调用(compaction/标题)、已销毁的 initiator 作用域、宿主运行时缺口(#2975/#3918/#4082)全部免疫。

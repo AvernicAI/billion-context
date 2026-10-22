@@ -329,12 +329,12 @@ test("reserveOutputHeadroom: degenerate maxOutput >= window stays a no-op even w
     assert.equal(reserveOutputHeadroom(100_000, 150_000, 0.25), 100_000);
 });
 
-// #3900: reservation applies to every wire (including Anthropic) — an over-full
-// context degrades attention everywhere, and wrapper providers on the Anthropic
-// wire count completion against the window. Per-provider opt-out for genuinely
-// separate walls arrives with #3973.
-test("shouldReserveOutputHeadroom: every protocol reserves (#3900)", () => {
-    assert.equal(shouldReserveOutputHeadroom("anthropic"), true, "#3900: over-full context costs more than the reserved band");
+// Protocol gate: Anthropic's Messages API enforces the input limit
+// independently of max_tokens (separate output budget), so reserving there
+// would shift every nudge/truncate band down by maxOutput for no safety gain.
+// OpenAI-family APIs count output against the window — reserve there.
+test("shouldReserveOutputHeadroom: anthropic exempt, other protocols reserve", () => {
+    assert.equal(shouldReserveOutputHeadroom("anthropic"), false, "Anthropic: output budget is separate from the context window");
     assert.equal(shouldReserveOutputHeadroom("openai"), true);
     assert.equal(shouldReserveOutputHeadroom("responses"), true);
     assert.equal(shouldReserveOutputHeadroom(undefined), true, "unknown protocol → conservative (reserve)");

@@ -831,6 +831,20 @@ export const WEB_CLIENT = `(function () {
                 sh.innerHTML = "";
             }
         }
+        const spb = $("storage-second-process-banner");
+        if (spb) {
+            const sg2 = d.storage;
+            const sp = sg2 && typeof sg2 === "object" ? sg2.secondProcess : null;
+            if (sp && typeof sp.pid === "number") {
+                spb.hidden = false;
+                spb.classList.add("show");
+                spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process", { pid: String(sp.pid) }));
+            } else {
+                spb.hidden = true;
+                spb.classList.remove("show");
+                spb.innerHTML = "";
+            }
+        }
         const pt = $("passthrough-banner");
         if (d.passthrough && d.passthrough.enabled) {
             pt.hidden = false;

@@ -539,6 +539,11 @@ export function parseCompressInput(input: unknown, callId?: string) {
     if (parsed.diagnostics.quoteSalvage === true) {
         loggerLog("warn", `[acp-compress-input] quote-salvage: recovered ${parsed.ranges.length} range(s) after single->double quote normalization (kind=${parsed.diagnostics.kind})`);
     }
+    if (parsed.diagnostics.flatSummarySalvage === true) {
+        // Flat single-range call ({content: "<summary text>", startId, endId})
+        // — the two schema-advertised shapes merged — recovered by the kernel.
+        loggerLog("warn", `[acp-compress-input] flat-summary salvage: recovered ${parsed.ranges.length} range(s); summary text arrived in content alongside top-level refs`);
+    }
     if (!parsed.diagnostics.ok && parsed.diagnostics.kind !== "ok") {
         loggerLog("warn", `[acp-compress-input] rejected: kind=${parsed.diagnostics.kind} invalidItems=${parsed.diagnostics.invalidItems}${parsed.diagnostics.keys ? ` keys=[${parsed.diagnostics.keys.join(",")}]` : ""}${parsed.diagnostics.length !== undefined ? ` len=${parsed.diagnostics.length}` : ""}${parsed.diagnostics.invalidReasons && parsed.diagnostics.invalidReasons.length > 0 ? ` reasons=[${parsed.diagnostics.invalidReasons.join(" | ")}]` : ""}`);
     } else if (parsed.diagnostics.invalidItems > 0 || parsed.diagnostics.kind === "truncated") {

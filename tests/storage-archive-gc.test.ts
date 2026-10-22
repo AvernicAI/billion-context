@@ -158,7 +158,13 @@ test("gc(): age sweep archives only past-retention sessions; dormant shared rows
         assert.ok(store.getSessionRow("sess-old"));
         assert.equal((store.getSessionRow("sess-old") as unknown as { status?: string }).status, "archived");
         assert.equal((store.getSessionRow("sess-new") as unknown as { status?: string }).status, "active");
-        assert.equal(result.contentRowsDeleted >= 1, true, "released exclusive content collected");
+        // #4242 delete-on-zero: the released row is deleted INLINE by the
+        // release itself, so gc's sweep counter may legitimately be 0 — the
+        // observable contract is that the exclusive content is GONE.
+        const contentLeft = (
+            store as unknown as { db: { prepare: (q: string) => { all: () => { bytes?: unknown }[] } } }
+        ).db.prepare("SELECT bytes FROM content").all().length;
+        assert.ok(contentLeft === 1, `released exclusive content collected inline (left=${contentLeft})`);
         store.close();
     } finally {
         try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handles */ }

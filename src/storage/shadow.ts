@@ -25,7 +25,9 @@ import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
-import { UnifiedStore, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
+import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
+import { renameSync } from "node:fs";
+import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
@@ -171,7 +173,34 @@ export class UnifiedShadow {
         }
         let store: UnifiedStore;
         try {
-            store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+            try {
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+            } catch (err) {
+                // #4175: quick_check failed — the file set is provably corrupt.
+                // Quarantine it (db/-wal/-shm → .corrupt-<ts>, same suffix
+                // discipline as the session envelopes) and retry ONCE with a
+                // fresh file: the JSON envelopes remain the recovery source
+                // (full mode re-imports organically on load). No auto-delete —
+                // the corrupt original is kept for forensics.
+                if (!(err instanceof StorageIntegrityError)) throw err;
+                const stamp = Date.now();
+                const quarantined: string[] = [];
+                for (const suffix of ["", "-wal", "-shm"]) {
+                    const from = `${dir}/index.db${suffix}`;
+                    const to = `${dir}/index.db${suffix}.corrupt-${stamp}`;
+                    try {
+                        renameSync(from, to);
+                        quarantined.push(path.basename(to));
+                    } catch {
+                        /* absent sidecar files are fine */
+                    }
+                }
+                loggerLog(
+                    "error",
+                    `[storage] index.db failed its integrity quick_check (${err.detail}) — quarantined ${quarantined.join(", ")} and reopened fresh; JSON envelopes remain the recovery source (#4175)`,
+                );
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+            }
             // #3285: watermark trust does not cross process boundaries — a
             // restart-handoff overlap leaves the previous writer's rows AND
             // watermark behind; drop them all so this process's first save
@@ -269,40 +298,13 @@ export class UnifiedShadow {
         try {
             const loaded = this.legacyLoad(record);
             if (!loaded) return;
-            // #3818/#3135: a record carrying blockContents ids with no
-            // matching state.blocks entry (hand-built archives, web seeds)
-            // is a shape the unified ingest cannot represent — block rows
-            // land only for state.blocks entries, so a viewFor rebuild
-            // would silently drop those contents. Real kernel sessions
-            // never have orphans (state.blocks keeps consumed blocks), so
-            // skipping the mirror here is free; the JSON envelope stays
-            // the superset on disk.
-            if (orphanContents(loaded)) {
-                // #3841 reap journal: distinguish the REAL kernel reap shape
-                // (#2695: reaped block rows exist in the store but the
-                // incoming state no longer claims them) from never-ingested
-                // hand-built shapes. For reaps, drop exactly the reaped rows
-                // and journal the orphan contents — without this the rows
-                // resurrect into every viewFor rebuild after a restart and
-                // the next envelope save re-pollutes. Envelope stays the
-                // serving path either way (owner-pinned semantics).
-                const claimed = new Set(loaded.state.blocks.map((b) => b.blockId));
-                const reapedIds = new Set<string>();
-                const orphans = new Map<string, { one: BlockView | null; full: BlockView }>();
-                try {
-                    for (const row of this.sync.getBlocks(loaded.id)) {
-                        if (!claimed.has(row.blockId)) reapedIds.add(row.blockId);
-                    }
-                    for (const [blockId, view] of loaded.blockContents) {
-                        if (!claimed.has(blockId)) orphans.set(blockId, view);
-                    }
-                    if (reapedIds.size > 0 || orphans.size > 0) this.sync.reapBlocks(loaded.id, reapedIds, orphans);
-                } catch {
-                    // journal failure must not break the save path
-                }
-                this.stats.orphanSkips++;
-                return;
-            }
+            // #4216/#4242: the reap shape (blockContents without their
+            // state.blocks entries) is now REPRESENTABLE — planIngest
+            // journals the orphan contents into sessions.orphans_json and
+            // the store merges it in the same transaction, while the blocks
+            // stale-sweep drops the reaped rows. The old early-return here
+            // froze every subsequent save for such sessions (rows stuck at
+            // hours-old state, #4216). Normal ingest for everyone.
             let legacy = loaded;
             let hasRawTail = false;
             if (rawTail && rawTail.lastMessages.length > 0) {
@@ -483,10 +485,8 @@ export class UnifiedShadow {
             // #3818: same orphan-contents guard as record() — a record the
             // index cannot represent faithfully must not be served from a
             // viewFor rebuild; callers fall back to the envelope itself.
-            if (orphanContents(legacy)) {
-                this.stats.orphanSkips++;
-                return null;
-            }
+            // #4216/#4242: orphan shape is representable (journal rides the
+            // plan) — import normally instead of rejecting.
             this.sync.ingestSession(planIngest(legacy));
             this.stats.imports++;
             loggerLog("info", `[storage] unified import on first open: ${legacy.id}`);
@@ -599,6 +599,12 @@ export class UnifiedShadow {
     /** #3248: raw canonical rows for the incremental lane (core-form
      *  message JSON in seq order — exactly what planIngest interned). */
     /** #3901/#3463: pass-through GC + restore (see UnifiedStore.gc). */
+    /** #4175: online consistent snapshot (sqlite only — VACUUM INTO). */
+    backupInto(dstPath: string): number {
+        if (this.sync === null) throw new Error("backup is a sqlite-store operation (VACUUM INTO)");
+        return this.sync.backupInto(dstPath);
+    }
+
     gc(opts: { archiveAfterDays: number; archiveDir: string; vacuum?: "full" | "incremental" }): { archived: number; contentRowsDeleted: number } {
         if (this.sync === null) return { archived: 0, contentRowsDeleted: 0 };
         return this.sync.gc(opts);
@@ -766,20 +772,8 @@ export class UnifiedShadow {
                 }
                 if (liveCcr) legacy = { ...legacy, contentStore: liveCcr };
                 // #3818/#3841: same orphan-guard + reap-journal semantics.
-                if (orphanContents(legacy)) {
-                    const claimed = new Set<string>(legacy.state.blocks.map((b) => b.blockId));
-                    const reapedIds = new Set<string>();
-                    const orphans = new Map<string, { one: BlockView | null; full: BlockView }>();
-                    for (const row of await backend.getBlocks(legacy.id)) {
-                        if (!claimed.has(row.blockId)) reapedIds.add(row.blockId);
-                    }
-                    for (const [blockId, view] of legacy.blockContents) {
-                        if (!claimed.has(blockId)) orphans.set(blockId, view);
-                    }
-                    if (reapedIds.size > 0 || orphans.size > 0) await backend.reapBlocks(legacy.id, reapedIds, orphans);
-                    this.stats.orphanSkips++;
-                    return;
-                }
+                // #4216/#4242: orphan shape rides the plan journal — normal
+                // ingest (the async twin of the sync fix); no freeze.
                 // #3133 watermark delta.
                 let applied = false;
                 try {
@@ -869,10 +863,7 @@ export class UnifiedShadow {
             try {
                 const legacy = this.legacyLoad(record);
                 if (!legacy) return null;
-                if (orphanContents(legacy)) {
-                    this.stats.orphanSkips++;
-                    return null;
-                }
+                // #4216/#4242: orphan shape rides the plan journal — import normally.
                 await this.enqueue(() => this.backend!.ingestSession(planIngest(legacy)));
                 this.stats.imports++;
                 loggerLog("info", `[storage] unified import on first open: ${legacy.id}`);

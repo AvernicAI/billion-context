@@ -365,6 +365,16 @@ function compressFailureCause(errs: string, session: Session): string {
     return "";
 }
 
+/** Highest allocated mNNNNN number in the session's ref map (0 when empty). */
+function highestMappedRef(state: Pick<CompressionState, "messageRefs">): number {
+    let highest = 0;
+    for (const ref of Object.keys(state.messageRefs?.byRef ?? {})) {
+        const m = M_REF_NUM_RE.exec(ref);
+        if (m) highest = Math.max(highest, Number(m[1]));
+    }
+    return highest;
+}
+
 /** #2146: every requested endpoint sits strictly ABOVE the session's highest
  *  mapped m-ref. Such refs cannot exist in this session (refs are never
  *  pre-allocated); the kernel now classifies that case as above-frontier
@@ -372,11 +382,7 @@ function compressFailureCause(errs: string, session: Session): string {
  *  NO superset of such refs can ever compress — so the model stops re-anchoring
  *  on other stale artifacts instead. */
 export function beyondFrontierNote(state: Pick<CompressionState, "messageRefs">, ranges: Array<{ startRef: string; endRef: string }>): string {
-    let highest = 0;
-    for (const ref of Object.keys(state.messageRefs?.byRef ?? {})) {
-        const m = M_REF_NUM_RE.exec(ref);
-        if (m) highest = Math.max(highest, Number(m[1]));
-    }
+    const highest = highestMappedRef(state);
     if (highest <= 0 || ranges.length === 0) return "";
     const allAbove = ranges.every((r) => {
         const s = M_REF_NUM_RE.exec(r.startRef.trim());
@@ -386,6 +392,34 @@ export function beyondFrontierNote(state: Pick<CompressionState, "messageRefs">,
     if (!allAbove) return "";
     const hi = `m${String(highest).padStart(5, "0")}`;
     return ` All requested refs are above this session's highest ref (${hi}) — they cannot exist here (this session allocates no future refs). They are stale artifacts from an earlier session generation left in your visible history; NO superset of them can ever compress. Request only refs ≤ ${hi}, or call acp_status for the live ranges.`;
+}
+
+/** #4252 follow-up: PARTIALLY past the frontier — some endpoint above the
+ *  highest stored ref while another sits inside it. beyondFrontierNote
+ *  (#2146) only fires when EVERY endpoint is above, so a start-in/end-out
+ *  range fell through to generic guidance while allocation lagged rendering
+ *  (the model sees refs in its transcript that the store has not minted yet)
+ *  and it blind-retried against a moving ceiling (incident session 01a15993:
+ *  5× gate:none-resolved inside 8 minutes, breaker armed). Name the ceiling
+ *  and the clamp explicitly so one retry converges. Fires only when the
+ *  all-above note is absent (the two are mutually exclusive by design). */
+export function frontierClampNote(
+    state: Pick<CompressionState, "messageRefs">,
+    ranges: Array<{ startRef: string; endRef: string }>,
+    beyond: string,
+): string {
+    if (beyond !== "" || ranges.length === 0) return "";
+    const highest = highestMappedRef(state);
+    if (highest <= 0) return "";
+    const over = ranges.filter((rg) => {
+        const s = M_REF_NUM_RE.exec(rg.startRef.trim());
+        const e = M_REF_NUM_RE.exec(rg.endRef.trim());
+        return !!s && !!e && (Number(s[1]) > highest || Number(e[1]) > highest);
+    });
+    if (over.length === 0) return "";
+    const hi = `m${String(highest).padStart(5, "0")}`;
+    const list = over.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
+    return ` Range(s) ${list} extend past this session's highest stored ref (${hi}) — refs are minted as messages are stored, so numbers you can already see rendered may not be ingestible yet. Retry with endId ≤ ${hi}, or call acp_status for the live compressible span.`;
 }
 
 /** #2592/F3: after a host-native compaction rebase (resetSessionCompression)
@@ -1019,11 +1053,12 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             const repeatGuard = recordCompressFailure(ctx.session, specKey);
             const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, specKey, errs) : "";
             const beyond = beyondFrontierNote(ctx.session.state, ranges);
+            const clamp = frontierClampNote(ctx.session.state, ranges, beyond);
             // #2146: once the breaker arms, the diagnostic hint cluster it used
             // to lead with has proven unread by the looping model — swap it for
             // the hard-stop paragraph instead of stacking more ignored advice.
             const hints = loopGuard === ""
-                ? `${beyond}${rebaseNote(ctx.session, errs, beyond)}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
+                ? `${beyond}${clamp}${rebaseNote(ctx.session, errs, beyond)}${currentRefsSnapshot(ctx)}${repeatGuard}${spanHint}${noViableAnywhere}`
                 : `${beyond}${loopGuard}`;
             // #2360 §2: one instruction per receipt — while armed, the kernel's
             // "run acp_status and retry" guidance is scrubbed from the model-

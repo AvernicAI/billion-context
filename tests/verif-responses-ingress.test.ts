@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { translateFunction } from "../verif/symbolic.js";
@@ -42,7 +43,7 @@ import { pipeline } from "../verif/drivers/responses-ingress-driver.js";
  * Replay: 60 random real inputs, pipeline run twice, states must match.
  */
 
-const REPO = new URL("..", import.meta.url).pathname;
+const REPO = fileURLToPath(new URL("..", import.meta.url));
 const DRIVER = `${REPO}verif/drivers/responses-ingress-driver.ts`;
 
 type SymVal = Record<string, unknown>;

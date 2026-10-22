@@ -33,6 +33,7 @@
  * lone-duplicate degrade (seam-too-short → legacy fallback, reason recorded),
  * (c) block-unanchored degrade.
  */
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { translateFunction, type SymVal } from "../verif/symbolic.ts";
@@ -42,7 +43,7 @@ import { maybeSnapshotView } from "../src/server/snapshot-render.ts";
 import { _setStoreForTest, type SessionStore } from "../src/persist.ts";
 import type { BiliMessage } from "acp-kernel/wire";
 
-const SR_FILE = new URL("../src/server/snapshot-render.ts", import.meta.url).pathname;
+const SR_FILE = fileURLToPath(new URL("../src/server/snapshot-render.ts", import.meta.url));
 
 function haveSolver(): boolean {
   try {

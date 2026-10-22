@@ -567,17 +567,16 @@ export function appendSystemText(
 
 /**
  * Whether the OUTPUT budget should be reserved from the context window at all.
- * #3900: reserve on EVERY wire, including Anthropic. An over-full context degrades
- * attention everywhere, so paying up to headroomCap × window of reservation on
- * Claude routes is worth removing the "provider counts completion against the
- * window" class of 400s (DeepSeek /anthropic counted it: 1,070,269 + 128,000 vs
- * a 1,048,576 wall). Real-Claude routes — where the input limit IS enforced
- * independently of max_tokens — can recover the band once #3973 persists the
- * per-provider wall fact; until then every protocol gets the safe default. The
- * parameter stays for call-site stability across that follow-up.
+ * Anthropic's Messages API enforces the input limit INDEPENDENTLY of
+ * max_tokens (the output budget is separate — input up to the window works
+ * with any max_tokens), so reserving it would shift the nudge/truncate bands
+ * down by maxOutput on every session with no safety gain. The OpenAI-family
+ * APIs count output against the window, so the reservation is only needed
+ * there. Unknown/other protocols reserve (conservative — a missed reservation
+ * at worst overflows once and the self-heal corrects it).
  */
-export function shouldReserveOutputHeadroom(_protocol?: string): boolean {
-    return true;
+export function shouldReserveOutputHeadroom(protocol: string | undefined): boolean {
+    return protocol !== "anthropic";
 }
 
 /** System-carrier texts of a parsed request body, covering all four wire shapes:

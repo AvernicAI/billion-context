@@ -34,6 +34,14 @@ entries:
     group: envonly
     desc_en: "GC age sweep window in days (#3463): sessions idle longer than this are archived (one JSON line appended to the single archive log (archive/archive.jsonl) + tombstone row + content/media refs released). 0 disables the age sweep; the manual entry POST /__bili/storage/gc always runs. Config-file key storage.archiveAfterDays is the persistent form."
     desc_zh: "GC 年龄清扫窗口（天，#3463）：闲置超过该时长的会话被归档（单文件归档日志 archive/archive.jsonl 追加一行 + 墓碑行保留标签 + 释放内容/媒体引用）。0 关闭年龄清扫；手动入口 POST /__bili/storage/gc 始终可用。配置文件键 storage.archiveAfterDays 为持久形式。"
+  - key: BILI_STORAGE_QUICK_CHECK
+    type: string
+    default: "on"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Storage integrity self-check at open (#4175): every index.db open runs PRAGMA quick_check BEFORE migrations; on failure the shadow layer quarantines the file set (index.db/-wal/-shm renamed to .corrupt-<ts>) and reopens fresh (JSON envelopes remain the recovery source). Set 0 only for boot-time-sensitive huge deployments where the check's cost matters."
+    desc_zh: "存储开库自检（#4175）：每次 index.db 打开在迁移之前先跑 PRAGMA quick_check;失败时影子层把文件组（index.db/-wal/-shm 改名为 .corrupt-<ts>）隔离并重建新库（JSON 信封仍是恢复源）。仅当超大库的启动时间敏感时才设 0 跳过。"
   - key: BILI_SNAPSHOT_SHADOW
     type: boolean
     default: "true (on)"

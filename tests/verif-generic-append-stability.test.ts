@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { translateFunction } from "../verif/symbolic.js";
@@ -32,7 +33,7 @@ import type { CoreMessage } from "../kernel/src/types.js";
  *     message is protected.
  */
 
-const REPO = new URL("..", import.meta.url).pathname;
+const REPO = fileURLToPath(new URL("..", import.meta.url));
 const REFS = `${REPO}kernel/src/refs.ts`;
 const RENDER_REFS = `${REPO}kernel/src/render-refs.ts`;
 

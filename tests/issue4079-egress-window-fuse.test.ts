@@ -98,7 +98,7 @@ function proxyOptions(routes: Record<string, object>): ProxyOptions {
 
 type Ctx = { url: string; headers: Record<string, string> };
 
-async function setup(): Promise<{ ctx: Ctx; calls: Call[]; close: () => Promise<void> }> {
+async function setup(): Promise<{ ctx: Ctx; calls: Call[]; close: () => void }> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const { server: upstream, calls } = makeUpstream();
@@ -114,12 +114,23 @@ async function setup(): Promise<{ ctx: Ctx; calls: Call[]; close: () => Promise<
             headers: { "content-type": "application/json", "x-acp-session": "" },
         },
         calls,
-        close: async () => {
+        // #4245 deterministic teardown. The fuse answers 413 WITHOUT consuming
+        // the doomed upload (relay egress fuse: writeHead+end+return, req is
+        // never aborted), so after a doomed request the proxy still owns a
+        // BUSY socket that closeIdleConnections never touches — the servers'
+        // 'close' events only land once the client-side destroy propagates
+        // back over the wire. Awaiting them made test completion depend on
+        // cross-socket timing: on loaded GitHub windows runners the final
+        // event delivery loses the race against node:test's empty-loop exit
+        // check ("Promise resolution is still pending but the event loop has
+        // already resolved" → cancelledByParent, 4/4 attempts in #4245).
+        // Assertions are long done here and ports are ephemeral, so force-
+        // destroy every connection and stop gating the test on 'close'.
+        close: () => {
             proxy.close();
-            proxy.closeIdleConnections?.();
+            proxy.closeAllConnections?.();
             upstream.close();
-            upstream.closeIdleConnections?.();
-            await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
+            upstream.closeAllConnections?.();
         },
     };
 }

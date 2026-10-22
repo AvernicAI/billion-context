@@ -10,6 +10,7 @@ import { durableMessageToolPaths, withDurableProtection } from "./durable-messag
 import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
 import type { InboundSlot, SeamSlot } from "./cache-ledger.js";
+import { isResponsesTurnSeparatorId } from "./turn-separator.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -1621,42 +1622,11 @@ export function foldCoverage(
     return matched < coveredBefore.size ? { expected: coveredBefore.size, matched } : null;
 }
 
-/** #2627: bili-synthesized Responses turn separators (repairResponsesAssistantOrdering,
- *  src/server.ts) are OUTBOUND-ONLY ordering markers — no client's resent history
- *  ever contains them, so they can never anchor or be covered. When a
- *  separator-bearing view reached applyCompression (the plugin lane handed its
- *  processed view straight in), their ids were registered into new blocks'
- *  direct/effectiveMessageIds and inherited by higher folds via child merge —
- *  permanently "missing" on every reconcile pass: false [acp-drift]/fold-
- *  reconcile warns and stalled per-block ledger evidence against an unchanged
- *  history. They are protocol-ordering artifacts, not compressible raw history:
- *  exclude them everywhere coverage is stored or compared. */
-export const RESPONSES_TURN_SEPARATOR_ID_PREFIX = "acp_turn_sep_";
-
-export function isResponsesTurnSeparatorId(id: string): boolean {
-    return id.startsWith(RESPONSES_TURN_SEPARATOR_ID_PREFIX);
-}
-
-/** #2627: strip turn-separator ids from block coverage IN PLACE (load-time heal
- *  of persisted state + post-commit scrub). Returns how many ids were removed;
- *  0 means the state was already clean. */
-export function scrubTurnSeparatorIds(
-    blocks: ReadonlyArray<{ directMessageIds?: string[]; effectiveMessageIds?: string[] }>,
-): number {
-    let removed = 0;
-    for (const block of blocks) {
-        for (const key of ["directMessageIds", "effectiveMessageIds"] as const) {
-            const ids = block[key];
-            if (!ids) continue;
-            const kept = ids.filter((id) => !isResponsesTurnSeparatorId(id));
-            if (kept.length !== ids.length) {
-                removed += ids.length - kept.length;
-                block[key] = kept;
-            }
-        }
-    }
-    return removed;
-}
+// #2627 turn-separator helpers moved to ./turn-separator.ts (zero-dependency leaf
+// — the storage seam needs them without session.ts's built-acp-kernel import;
+// the doc comments live there now). Re-exported so existing consumers keep the
+// session.js import path.
+export { RESPONSES_TURN_SEPARATOR_ID_PREFIX, isResponsesTurnSeparatorId, scrubTurnSeparatorIds } from "./turn-separator.js";
 
 /** #2627: the REAL-history coverage set — active blocks' effective ids minus
  *  outbound-only turn separators. Single source for every drift consumer (the

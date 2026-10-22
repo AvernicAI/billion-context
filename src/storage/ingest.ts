@@ -30,28 +30,12 @@ import type { BlockView } from "../session.js";
 import { refToIndex } from "../../kernel/src/refs.js";
 import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, type MessageRow, type RefRow, type SessionRow } from "./store.js";
 
-/** Field order of mergeState() output (src/persist.ts) — the loader must
- *  rebuild the state object in exactly this order. Keep in sync. */
-const MERGE_STATE_FIELDS = [
-    "blocks",
-    "messageRefs",
-    "nudge",
-    "stats",
-    "nextBlockId",
-    "nextRunId",
-    "tokenSnapshot",
-    "lastPassIds",
-    "hiddenOrphanRefs",
-    "emergencyTruncateLatch",
-    "renderDeferredRefs",
-    "viewLatches",
-    "viewLatchConfigDigest",
-    "deadRefs",
-    "terminalStreak",
-    "nextRuleId",
-    "absorbed",
-    "rules",
-] as const;
+/**
+ * Field order of the hydration merge output — DERIVED from mergeState itself
+ * (src/state-hydration.ts), not hand-kept: the hand list had already drifted
+ * (#4192). The loader rebuilds the state object in exactly this order.
+ */
+import { COMPRESSION_STATE_FIELDS as MERGE_STATE_FIELDS } from "../state-hydration.js";
 
 /** Fields owned by dedicated tables/columns — never inside kstate_json. */
 const TABLE_OWNED_FIELDS = new Set(["blocks", "messageRefs", "deadRefs", "nextBlockId", "nextRunId"]);
@@ -103,20 +87,54 @@ export const ingestSerializations = { count: 0 };
  * reader (getMessages hydrates before returning) sees the verbatim original.
  * No media (or empty) → passthrough with the plain content hash.
  */
+/**
+ * Media payloads below this size ride inline even inside raw sidecars —
+ * splitting them costs a CAS row + a join for a few hundred bytes (#4069).
+ */
+const MIN_MEDIA_URL_SPLIT_BYTES = 2048;
+/** data:<mime>;base64,<payload> with the payload swapped for its CAS hash. */
+const MEDIA_URL_MARKER_RE = new RegExp(
+    `data:([a-zA-Z0-9.+\\/-]+);base64,([A-Za-z0-9+/=]{${MIN_MEDIA_URL_SPLIT_BYTES},})`,
+    "g",
+);
+
 function splitMediaContent(content: string): { content: string; hash: string; media: { hash: string; bytes: string }[] } {
-    if (!content.includes("\"imageBase64\"")) return { content, hash: sha256Hex(content), media: [] };
-    let parsed: { imageBase64?: unknown };
-    try {
-        parsed = JSON.parse(content) as { imageBase64?: unknown };
-    } catch {
-        return { content, hash: sha256Hex(content), media: [] };
+    let media: { hash: string; bytes: string }[] = [];
+    let split = content;
+    if (content.includes("\"imageBase64\"")) {
+        let parsed: { imageBase64?: unknown };
+        try {
+            parsed = JSON.parse(content) as { imageBase64?: unknown };
+        } catch {
+            parsed = undefined as unknown as { imageBase64?: unknown };
+        }
+        if (parsed) {
+            const bytes = parsed.imageBase64;
+            if (typeof bytes === "string" && bytes.length > 0) {
+                const mediaHash = sha256Hex(bytes);
+                parsed.imageBase64 = { $media: mediaHash };
+                split = JSON.stringify(parsed);
+                media.push({ hash: mediaHash, bytes });
+            }
+        }
     }
-    const bytes = parsed.imageBase64;
-    if (typeof bytes !== "string" || bytes.length === 0) return { content, hash: sha256Hex(content), media: [] };
-    const mediaHash = sha256Hex(bytes);
-    parsed.imageBase64 = { $media: mediaHash };
-    const split = JSON.stringify(parsed);
-    return { content: split, hash: sha256Hex(split), media: [{ hash: mediaHash, bytes }] };
+    // #4069: raw wire sidecars (rawOpenaiContent / rawOpenaiContentParts /
+    // rawResponsesItem / rawGoogleParts, …) carry the ORIGINAL part verbatim —
+    // for image parts that means the same base64 payload a second time, as a
+    // data URL. Swap every sufficiently large payload for its CAS hash, mime
+    // prefix and JSON structure untouched, so hydration is byte-identical.
+    if (split.includes(";base64,")) {
+        const byHash = new Map(media.map((m) => [m.hash, m.bytes]));
+        split = split.replace(MEDIA_URL_MARKER_RE, (_all: string, mime: string, payload: string) => {
+            const mediaHash = sha256Hex(payload);
+            if (!byHash.has(mediaHash)) {
+                byHash.set(mediaHash, payload);
+                media = [...media, { hash: mediaHash, bytes: payload }];
+            }
+            return `data:${mime};base64,{$media:${mediaHash}}`;
+        });
+    }
+    return { content: split, hash: sha256Hex(split), media };
 }
 
 interface LogEntry {
@@ -361,6 +379,19 @@ function finishPlan(
         };
     });
 
+    // #4216/#4242: the orphan journal — blockContents entries whose block is
+    // gone from state.blocks (#2695 reap keeps the contents for decompress).
+    // Rides every plan; the store merges it into sessions.orphans_json in the
+    // same transaction as the rest of the session. This is what makes the
+    // reap shape REPRESENTABLE, so record() no longer skips the ingest (the
+    // freeze in #4216: sessions stuck at hours-old rows).
+    const knownBlockIds = new Set(session.state.blocks.map((b) => b.blockId));
+    const orphanEntries: Record<string, { one: unknown; full: unknown }> = {};
+    for (const [blockId, view] of session.blockContents) {
+        if (!knownBlockIds.has(blockId)) orphanEntries[blockId] = { one: view.one, full: view.full };
+    }
+    const orphansJson = Object.keys(orphanEntries).length > 0 ? JSON.stringify(orphanEntries) : null;
+
     const deadRefs = (session.state.deadRefs ?? []).map((ref, ord) => ({
         ord,
         ref,
@@ -401,6 +432,7 @@ function finishPlan(
         status: "active",
         createdAt: session.createdAt,
         updatedAt: session.lastSeen,
+        orphansJson,
         nextBlockId: session.state.nextBlockId,
         nextRunId: session.state.nextRunId,
         metaJson: JSON.stringify(session.meta),

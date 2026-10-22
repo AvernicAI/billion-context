@@ -297,7 +297,10 @@ export class MysqlBackend implements StorageBackend {
 
     private async releaseContent(c: PoolConnection | Pool, hash: string | null): Promise<void> {
         if (!hash) return;
-        await c.query("UPDATE content SET refcount = GREATEST(refcount - 1, 0) WHERE hash = ?", [hash]);
+        // #3987 / #4242: delete-on-zero, same discipline as the sqlite twin —
+        // orphans must not structurally accumulate on either backend.
+        await c.query("UPDATE content SET refcount = refcount - 1 WHERE hash = ? AND refcount > 0", [hash]);
+        await c.query("DELETE FROM content WHERE hash = ? AND refcount <= 0", [hash]);
     }
 
     private async getContent(c: PoolConnection | Pool, hash: string): Promise<string | null> {
@@ -826,21 +829,40 @@ export class MysqlBackend implements StorageBackend {
     }
 
     private async hydrateMediaAsync(content: string): Promise<string> {
-        if (!content.includes('"$media"')) return content;
-        try {
-            const parsed = JSON.parse(content) as { imageBase64?: unknown };
-            const slot = parsed.imageBase64;
-            if (slot !== null && typeof slot === "object" && typeof (slot as { $media?: unknown }).$media === "string") {
-                const bytes = await this.getContent(this.pool, (slot as { $media: string }).$media);
-                if (typeof bytes === "string" && bytes.length > 0) {
-                    parsed.imageBase64 = bytes;
-                    return JSON.stringify(parsed);
+        let out = content;
+        if (out.includes('"$media"')) {
+            try {
+                const parsed = JSON.parse(out) as { imageBase64?: unknown };
+                const slot = parsed.imageBase64;
+                if (slot !== null && typeof slot === "object" && typeof (slot as { $media?: unknown }).$media === "string") {
+                    const bytes = await this.getContent(this.pool, (slot as { $media: string }).$media);
+                    if (typeof bytes === "string" && bytes.length > 0) {
+                        parsed.imageBase64 = bytes;
+                        out = JSON.stringify(parsed);
+                    }
                 }
+            } catch {
+                // fall through: raw-sidecar pass below still runs
             }
-            return content;
-        } catch {
-            return content;
         }
+        // #4069: restore data-URL payloads swapped out of raw wire sidecars
+        // (mysql twin of UnifiedStore.hydrateMedia).
+        if (out.includes(";base64,{$media:")) {
+            const markerRe = /data:([a-zA-Z0-9.+\/\-]+);base64,\{\$media:([0-9a-f]{64})\}/g;
+            const hits: { mime: string; hash: string }[] = [];
+            for (const m of out.matchAll(markerRe)) hits.push({ mime: m[1], hash: m[2] });
+            if (hits.length > 0) {
+                const cache = new Map<string, string | null>();
+                for (const h of new Set(hits.map((x) => x.hash))) {
+                    cache.set(h, await this.getContent(this.pool, h));
+                }
+                out = out.replace(markerRe, (all: string, mime: string, hash: string) => {
+                    const bytes = cache.get(hash);
+                    return typeof bytes === "string" && bytes.length > 0 ? `data:${mime};base64,${bytes}` : all;
+                });
+            }
+        }
+        return out;
     }
 
     async getBlocks(sessionId: string): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
