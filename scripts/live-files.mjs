@@ -21,6 +21,7 @@ export const LIVE_FILES = [
     "tests/index-entry-guard.test.ts",
     "tests/issue1958-routed-warn.test.ts",
     "tests/issue2752-forward-partial-outcome.test.ts",
+    "tests/issue4276-opencode-v2-hook-payload.test.ts",
     "tests/issue760-percall-conversation.test.ts",
     "tests/issue927-opencode-install.test.ts",
     "tests/kimi-native.test.ts",
