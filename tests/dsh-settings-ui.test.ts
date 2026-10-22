@@ -1740,4 +1740,22 @@ test("#4254: shell.overlay upstream-unavailable pill polls /__bili/upstreams, re
     assert.ok(mt.includes("约 30s 后重试"), "open-circuit host surfaces its own retry ETA");
     assert.ok(!mt.includes("×2 · 约"), "alert-only (circuit-null) host carries no retry ETA");
     mm.runCleanups();
+
+    // Defensive parse: malformed entries degrade to fewer rows and never throw —
+    // only the well-formed host survives into the banner.
+    const g = await mountOverlay([
+        { host: "192.168.1.20:8080", kind: "connect-refused", code: "ECONNREFUSED", count: 2 },
+        "not-an-object",
+        { kind: "no-host-entry" },
+        { host: "", code: 42 },
+    ]);
+    g.resetHooks();
+    g.component();
+    await tick();
+    const gt = textOf(g.component());
+    assert.ok(gt.includes("192.168.1.20:8080"), "well-formed entry still renders");
+    assert.ok(gt.includes("×2"), "the survivor keeps its tally");
+    assert.ok(!gt.includes("no-host-entry") && !gt.includes("not-an-object"), "malformed entries are dropped");
+    assert.ok(gt.includes("1 个上游不可用"), "header counts only surviving rows");
+    g.runCleanups();
 });
