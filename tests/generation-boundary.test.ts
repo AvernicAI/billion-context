@@ -132,3 +132,13 @@ test("#4305: injectSystem appends the note only when the boundary is active", ()
     // sysParts order contract: client head, standing prompt (attribution outermost), THEN the note.
     assert.ok(on.indexOf(GENERATION_BOUNDARY_NOTE) > on.indexOf(PROJECT_ATTRIBUTION_LINE), "note sits AFTER the standing prompt, matching every steady prepare* path");
 });
+
+test("#4305: tags-only surface (plugin/dsh lane, no bili tools) also carries the note when active", () => {
+    const parsed = { system: "You are a helpful assistant.", messages: [] };
+    const tagsOnlyOpts = { ...OPTS, compress: { injectTool: false } as typeof OPTS.compress };
+    const off = injectSystem({ ...parsed }, tagsOnlyOpts, undefined, defaultConfig(400_000), undefined, true, false, false);
+    assert.ok(typeof off === "string" && !off.includes(GENERATION_BOUNDARY_NOTE), "inactive: tags-only surface unchanged by this feature");
+    const on = injectSystem({ ...parsed }, tagsOnlyOpts, undefined, defaultConfig(400_000), undefined, true, false, true) as string;
+    assert.ok(on.includes(GENERATION_BOUNDARY_NOTE), "active: note rides the tags-only ACP surface (the #4305 incident lane)");
+    assert.ok(on.startsWith("You are a helpful assistant."), "client head stays byte-exact");
+});
