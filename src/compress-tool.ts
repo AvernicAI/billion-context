@@ -539,6 +539,13 @@ export function parseCompressInput(input: unknown, callId?: string) {
     if (parsed.diagnostics.quoteSalvage === true) {
         loggerLog("warn", `[acp-compress-input] quote-salvage: recovered ${parsed.ranges.length} range(s) after single->double quote normalization (kind=${parsed.diagnostics.kind})`);
     }
+    // #4252: the model put the summary text in content beside top-level
+    // startId/endId (the two documented forms merged) — the kernel now
+    // honors it; the warn line makes the salvage visible in the proxy log,
+    // same style as the #3780/#603 salvage lines above.
+    if (parsed.diagnostics.flatSummarySalvage === true) {
+        loggerLog("warn", `[acp-compress-input] flat-summary salvage: recovered ${parsed.ranges.length} range(s) from summary text riding in content beside top-level refs (kind=${parsed.diagnostics.kind}) (#4252)`);
+    }
     if (!parsed.diagnostics.ok && parsed.diagnostics.kind !== "ok") {
         loggerLog("warn", `[acp-compress-input] rejected: kind=${parsed.diagnostics.kind} invalidItems=${parsed.diagnostics.invalidItems}${parsed.diagnostics.keys ? ` keys=[${parsed.diagnostics.keys.join(",")}]` : ""}${parsed.diagnostics.length !== undefined ? ` len=${parsed.diagnostics.length}` : ""}${parsed.diagnostics.invalidReasons && parsed.diagnostics.invalidReasons.length > 0 ? ` reasons=[${parsed.diagnostics.invalidReasons.join(" | ")}]` : ""}`);
     } else if (parsed.diagnostics.invalidItems > 0 || parsed.diagnostics.kind === "truncated") {
