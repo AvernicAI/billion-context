@@ -532,8 +532,10 @@ interface ResumeMissCandidate {
     hashDomain: 1 | 2;
     /** Why this candidate was not accepted as a resume parent — the same
      *  gates findResumeParent applies, reported: "equal-depth" is a
-     *  byte-exact replay at exactly the stored depth under another id (a
-     *  duplicate conversation, rejected by design #1486); "prefix-break" is
+     *  byte-exact replay at exactly the stored depth under another id —
+     *  either a duplicate conversation or a branch taken at the parent's
+     *  last-request depth; content cannot tell them apart, and neither is a
+     *  resume (rejected by design #1486); "prefix-break" is
      *  a deeper incoming history whose head-anchored progressive hash at
      *  the stored depth differs (the shared prefix broke somewhere);
      *  "truncated" is an incoming history SHORTER than the stored chain
@@ -581,9 +583,9 @@ export function describeResumeMiss(report: ResumeMissReport): string {
     }
     switch (b.kind) {
         case "equal-depth":
-            return `no byte-exact resume among ${report.eligible} eligible chain(s); closest ${b.sessionId} is a byte-exact EQUAL-DEPTH replay (${b.chainDepth} msgs == incoming ${b.incomingDepth}) — duplicate conversation, not a resume by design`;
+            return `no byte-exact resume among ${report.eligible} eligible chain(s); closest ${b.sessionId} is a byte-exact EQUAL-DEPTH replay (${b.chainDepth} cells == incoming ${b.incomingDepth}) — rejected by design; either a duplicate conversation or a branch taken at the parent's last-request depth — content cannot distinguish`;
         case "truncated":
-            return `no byte-exact resume among ${report.eligible} eligible chain(s); closest ${b.sessionId} (chain ${b.chainDepth}) is LONGER than the incoming history (${b.incomingDepth} msgs)${b.tailWindowIntact ? `, visible cells ${b.windowStart}..${b.incomingDepth - 1} intact — truncated replay` : ""}`;
+            return `no byte-exact resume among ${report.eligible} eligible chain(s); closest ${b.sessionId} (chain ${b.chainDepth}) is LONGER than the incoming history (${b.incomingDepth} cells)${b.tailWindowIntact ? `, visible cells ${b.windowStart}..${b.incomingDepth - 1} intact — truncated replay` : ""}`;
         case "prefix-break": {
             let detail: string;
             if (b.firstDivergence !== null) {
@@ -1017,8 +1019,9 @@ export class PrefixAffinityResolver {
      *  window used for lineage lookups). The candidate must be STRICTLY
      *  deeper than the parent: a real resume adds at least one new message,
      *  while an equal-depth byte-exact replay under a DIFFERENT id is a
-     *  duplicate conversation, not a resume — linking it would adopt foreign
-     *  blocks and trip the derived-parent restrictions (#1486). The parent
+     *  duplicate conversation or a tail-branch replay, not a resume —
+     *  linking it would adopt foreign blocks and trip the derived-parent
+     *  restrictions (#1486). The parent
      *  chain must be >= MIN_RESUME_PREFIX deep. Deepest match wins; ties go
      *  to the most recently seen. */
     findResumeParent(messages: unknown[], selfSessionId: string): { sessionId: string; sharedDepth: number } | null {
@@ -1075,7 +1078,8 @@ export class PrefixAffinityResolver {
      *  null). It re-runs the SAME gates in reporting mode and names why the
      *  closest near-miss was rejected; it never influences matching. The
      *  three causes need completely different fixes, so they are reported
-     *  distinctly: equal-depth replay (a duplicate conversation by design),
+     *  distinctly: equal-depth replay (duplicate or tail-branch —
+     *  indistinguishable from content; rejected by design),
      *  parent-chain absence (LRU eviction / never noted), head break (host
      *  rebuild drift desynchronizes the byte-exact prefix). Cost-bounded:
      *  the candidate scan does only O(1) progressive-hash checks per entry;

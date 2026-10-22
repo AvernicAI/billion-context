@@ -33,7 +33,8 @@ test("resume-inheritance-miss: equal-depth replay under another id reports kind 
     assert.equal(report.best!.incomingDepth, 10);
     assert.equal(report.best!.firstDivergence, null, "every inspectable cell matches");
     assert.equal(report.best!.tailWindowIntact, true);
-    assert.match(describeResumeMiss(report), /EQUAL-DEPTH replay \(10 msgs == incoming 10\)/);
+    assert.match(describeResumeMiss(report), /EQUAL-DEPTH replay \(10 cells == incoming 10\)/);
+    assert.match(describeResumeMiss(report), /either a duplicate conversation or a branch taken at the parent's last-request depth — content cannot distinguish/, "equal-depth must not assert a cause content cannot establish");
 });
 
 test("resume-inheritance-miss: head break names the first diverging cell with hash digests (#4264)", () => {
@@ -95,7 +96,7 @@ test("resume-inheritance-miss: truncated replay is reported distinctly from a he
     assert.equal(report.best!.chainDepth, 10);
     assert.equal(report.best!.incomingDepth, 9);
     assert.equal(report.best!.tailWindowIntact, true, "the visible cells form a clean prefix");
-    assert.match(describeResumeMiss(report), /LONGER than the incoming history \(9 msgs\)/);
+    assert.match(describeResumeMiss(report), /LONGER than the incoming history \(9 cells\)/);
 });
 
 test("resume-inheritance-miss: absent parent chains report zero eligible at debug granularity (#4264)", () => {
