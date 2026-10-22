@@ -123,6 +123,28 @@ export function prune(
       summaryIndexById.set(message.id, index);
   });
 
+  // #4311: a wire-visible compress call already carries the full summary
+  // draft in its arguments, and the call+receipt pair stays protected —
+  // re-rendering the block summary duplicates that text on the wire. Skip
+  // the anchor for blocks whose ORIGINATING call is visible in THIS view
+  // (the exchange itself is the model-visible recap); blocks whose call is
+  // gone (folded away, gateway-dropped) or that never had one (system folds,
+  // codex/dsh forged-summary lanes) keep their render. The skip must key on
+  // the exact compressCallId — never on range overlap — so a RE-FOLD that
+  // covers similar ground still renders its own summary.
+  const visibleCompressCallIds = new Set<string>();
+  if (inject) {
+    for (const message of messages) {
+      if (
+        message.contentType === "tool-call" &&
+        message.toolCallId &&
+        typeof message.toolName === "string" &&
+        isCompressTool(message.toolName)
+      ) {
+        visibleCompressCallIds.add(message.toolCallId);
+      }
+    }
+  }
   const anchors = inject
     ? collectSummaryAnchors(
         state,
@@ -133,6 +155,7 @@ export function prune(
           : lastUserIndex >= 0
             ? lastUserIndex
             : messages.length,
+        visibleCompressCallIds,
       )
     : [];
   // Summary ids of every block this session has ever created — active or
@@ -184,9 +207,19 @@ function collectSummaryAnchors(
   baseIndexById: Map<string, number>,
   summaryIndexById: Map<string, number>,
   fallbackIndex: number,
+  // #4311: call ids of compress exchanges visible in the current view;
+  // blocks created by one of these skip their anchor render (see the
+  // collection site above for the rationale and the safety conditions).
+  visibleCompressCallIds: Set<string>,
 ): SummaryAnchor[] {
   const anchors: SummaryAnchor[] = [];
   for (const block of activeBlocks(state)) {
+    // #4311: the originating call is on the wire — its arguments carry the
+    // summary text, so injecting the block render would duplicate it. The
+    // stale render (if a previously-pruned view carried one) is dropped by
+    // rebuildMessages via knownSummaryIds and NOT re-injected here.
+    if (block.compressCallId && visibleCompressCallIds.has(block.compressCallId))
+      continue;
     // Prefer the position of an already-rendered summary (hosts may pass a
     // previously-pruned view): keeps the summary stable in place instead of
     // jumping to index 0 when the raw ids are no longer in the input.
