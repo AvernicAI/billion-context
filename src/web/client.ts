@@ -1499,7 +1499,7 @@ export const WEB_CLIENT = `(function () {
     }
     const chartZooms = [];   // live instances — Esc resets any zoomed chart (#2489 behavior)
     function makeChartZoom(cfg) {
-        // cfg: { elId, statusId, resetId, render(lines, folds, seams) -> svg }
+        // cfg: { elId, statusId, resetId, render(lines, folds, seams) -> svg, link?: { members } }
         const z = { range: null, drag: null, state: null, cfg };
         z.visible = function visible() {
             if (!z.state) return null;
@@ -1547,8 +1547,15 @@ export const WEB_CLIENT = `(function () {
             updateStatus(v);
         };
         z.setRange = function setRange(r) {
-            z.range = r && r[1] > r[0] ? [r[0], r[1]] : null;
+            const nr = r && r[1] > r[0] ? [r[0], r[1]] : null;
+            const same = (nr === null && z.range === null) || (nr !== null && z.range !== null && nr[0] === z.range[0] && nr[1] === z.range[1]);
+            if (same) return;
+            z.range = nr;
             z.render();
+            // #4317: linked charts share ONE brush window — a selection or reset on either
+            // re-renders its peers over the same sample indices. The length guard keeps a
+            // stale peer bound to another session's ledger out of the propagation.
+            if (cfg.link && z.state) cfg.link.members.forEach((m) => { if (m !== z && m.state && m.state.lines.length === z.state.lines.length) m.setRange(nr); });
         };
         function localX(wrap, ev) {
             const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
@@ -1614,11 +1621,15 @@ export const WEB_CLIENT = `(function () {
             z.render();
         };
         chartZooms.push(z);
+        if (cfg.link) cfg.link.members.push(z);
         return z;
     }
     const trajAux = { win: 0, baseIn: 0 };
-    const trajZoom = makeChartZoom({ elId: "traj-chart", statusId: "traj-status", resetId: "traj-reset", render: (lines, folds, seams) => trajectorySvg(lines, folds, trajAux.win, trajAux.baseIn, seams) });
-    const hitZoom = makeChartZoom({ elId: "hit-chart", statusId: "hit-status", resetId: "hit-reset", render: (lines, folds, seams) => hitRateSvg(lines, folds, seams) });
+    // #4317: both detail charts plot the SAME request timeline in two projections —
+    // one shared brush window keeps them in lockstep (select on either, both follow).
+    const detailChartLink = { members: [] };
+    const trajZoom = makeChartZoom({ elId: "traj-chart", statusId: "traj-status", resetId: "traj-reset", link: detailChartLink, render: (lines, folds, seams) => trajectorySvg(lines, folds, trajAux.win, trajAux.baseIn, seams) });
+    const hitZoom = makeChartZoom({ elId: "hit-chart", statusId: "hit-status", resetId: "hit-reset", link: detailChartLink, render: (lines, folds, seams) => hitRateSvg(lines, folds, seams) });
     function bindTrajectoryBrush(d) {
         const ledger = d.ledger || {};
         const lines = (ledger.lines || []).filter((l) => Boolean(l));
@@ -1637,6 +1648,7 @@ export const WEB_CLIENT = `(function () {
     window.bili_hitSvg = hitRateSvg;
     window.bili_causes = classifyLineCauses;
     window.bili_trajZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => trajZoom.visible(), range: () => trajZoom.range };
+    window.bili_hitZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => hitZoom.visible(), range: () => hitZoom.range };
     function blockTopic(b) {
         // #1426: untitled blocks fall back to the lead line of their summary
         if (b.topic && String(b.topic).trim()) return String(b.topic).trim();
