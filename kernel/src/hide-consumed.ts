@@ -172,6 +172,7 @@ function quotedRangeKeys(text: string | undefined): Set<string> {
 function rewriteCompressText(
   text: string | undefined,
   liveKeys: Set<string>,
+  stubEntries = true,
 ): string | null {
   const parsed = parseCallText(text);
   if (!parsed) return null;
@@ -197,13 +198,18 @@ function rewriteCompressText(
 
   if (kept.length === 0) return null;
 
-  return prefix + serializeCompacted(obj, kept, contentWasString).text;
+  return prefix + serializeCompacted(obj, kept, contentWasString, stubEntries).text;
 }
 
-// Live compress-call args duplicate every range's full summary text while the
-// rendered acp_summary message already carries it — on long sessions the
-// duplication alone measured ~22K tokens (billion-context-pi #336). Keep a
-// leading stub for recall; the block remains the durable record.
+// Compress-call args duplicate every range's full summary text — on long
+// sessions the duplication alone measured ~22K tokens (billion-context-pi
+// #336). Which side is the durable record depends on where the other is
+// (#4311): prune suppresses a block's acp_summary render exactly when its
+// originating call (block.compressCallId) is visible, so those id-matched
+// CARRIERS keep their full args while they ride — they are then the only
+// complete copy on the wire, and stubbing would leave the summary nowhere.
+// Every other kept call (orphans, inactive leftovers, range-quoted foreign
+// carriers whose renders stay visible) gets a leading stub for recall.
 const SUMMARY_STUB_CHARS = 200;
 
 function compactEntry(entry: unknown): unknown {
@@ -221,10 +227,11 @@ function serializeCompacted(
   obj: Record<string, unknown>,
   content: unknown[],
   contentWasString: boolean,
+  stubEntries = true,
 ): { text: string; changed: boolean } {
   let changed = false;
   const compacted = content.map((entry) => {
-    const out = compactEntry(entry);
+    const out = stubEntries ? compactEntry(entry) : entry;
     if (out !== entry) changed = true;
     return out;
   });
@@ -401,6 +408,29 @@ export function hideConsumedCompressCalls(
       message.toolCallId &&
       keepCallIds.has(message.toolCallId)
     ) {
+      // #4311: id-matched carrier of an active block — prune suppresses that
+      // block's render precisely because this call rides, so the args are the
+      // only full copy on the wire while it does. Keep them complete; dead
+      // ranges are still dropped (their blocks are inactive and their
+      // summaries render nowhere). Range-quoted foreign carriers (#2970) never
+      // match here — synthetic block ids differ from host call ids, their
+      // renders stay visible, and they keep stubbing below.
+      if (activeCallIds.has(message.toolCallId)) {
+        const liveKeys = liveRangeKeysByCallId.get(message.toolCallId);
+        if (
+          liveKeys &&
+          liveKeys.size > 0 &&
+          !legacyLiveByCallId.has(message.toolCallId)
+        ) {
+          const rewritten = rewriteCompressText(message.text, liveKeys, false);
+          if (rewritten !== null) {
+            result.push({ ...message, text: rewritten });
+            continue;
+          }
+        }
+        result.push(message);
+        continue;
+      }
       let liveKeys = liveRangeKeysByCallId.get(message.toolCallId);
       if (
         !liveKeys &&

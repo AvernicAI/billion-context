@@ -178,3 +178,60 @@ test("#4311 stale render from a previously-pruned view is dropped, not re-inject
   const pruned = prune(view, applied.state, {});
   assert.equal(summaryRenderCount(pruned), 0, "stale render dropped and not re-injected while the call is visible");
 });
+
+// Steady-state wire view one turn AFTER a fold, through the FULL pipeline
+// (processTurn runs prune → hide-consumed together). Regression guard for the
+// two halves contradicting each other: prune skips the render while the call
+// rides, so hide-consumed must NOT stub that carrier — otherwise no complete
+// summary survives anywhere on the wire.
+test("#4311 steady state: full summary survives on the wire one turn after the fold", () => {
+  const longSummary = "S".repeat(400) + "TAILMARKER_XYZ";
+  const core = createCore();
+  const turn = core.processTurn({
+    messages: [user("u1"), user("u2"), user("u3"), user("u4")],
+    state: createInitialState(),
+    config: cfg(),
+    tokenCount: 1000,
+  });
+  const startRef = turn.state.messageRefs.byRaw["u1"];
+  const endRef = turn.state.messageRefs.byRaw["u3"];
+  assert.ok(typeof startRef === "string" && typeof endRef === "string");
+  const applied = core.applyCompression({
+    ranges: [{ startRef, endRef, summary: longSummary, compressCallId: "call-1" }],
+    messages: [user("u1"), user("u2"), user("u3"), user("u4")],
+    state: turn.state,
+    config: cfg(),
+  });
+  assert.equal(applied.result.blocksCreated, 1);
+
+  const args = JSON.stringify({
+    content: [{ startId: startRef, endId: endRef, summary: longSummary }],
+  });
+  const history = [
+    user("u1"),
+    user("u2"),
+    user("u3"),
+    user("u4"),
+    call("c1", "call-1", args),
+    result("r1", "call-1", `[Compressed ${startRef}–${endRef} → 1 block(s), ~1234 tokens saved.]`),
+    user("u5"),
+  ];
+  const next = core.processTurn({
+    messages: history,
+    state: applied.state,
+    config: cfg(),
+    tokenCount: 1000,
+  });
+
+  assert.equal(summaryRenderCount(next.messages), 0, "render suppressed while the carrier rides");
+  const carrier = next.messages.find((m) => m.id === "c1");
+  assert.ok(carrier, "the originating call stays visible");
+  assert.ok(
+    typeof carrier!.text === "string" && carrier!.text.includes("TAILMARKER_XYZ"),
+    "carrier keeps the FULL summary (tail beyond the 200-char stub threshold survives)",
+  );
+  assert.ok(
+    next.messages.some((m) => m.id === "r1"),
+    "the receipt stays visible",
+  );
+});

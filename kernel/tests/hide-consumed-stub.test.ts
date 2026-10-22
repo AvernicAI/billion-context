@@ -65,7 +65,7 @@ function parsedContent(text: string | undefined): StubEntry[] {
   return (JSON.parse(text ?? "") as { content: StubEntry[] }).content;
 }
 
-test("fully-live compress call args get their long summaries stubbed", () => {
+test("fully-live carrier keeps its full summary while its render is suppressed (#4311)", () => {
   const longSummary = "x".repeat(5000);
   const callText = JSON.stringify({
     content: [
@@ -77,13 +77,11 @@ test("fully-live compress call args get their long summaries stubbed", () => {
   const { messages } = hideConsumedCompressCalls(state, [callWith(callText)]);
 
   assert.equal(messages.length, 1);
-  const content = parsedContent(messages[0]!.text);
-  assert.equal(content.length, 1);
-  assert.equal(content[0]!.summary!.length, 200);
-  assert.ok(content[0]!.summary!.endsWith("…"));
-  assert.ok(content[0]!.summary!.startsWith("xxxx"));
-  assert.equal(content[0]!.topic, "T");
-  assert.equal(content[0]!.startId, "m00001");
+  assert.equal(
+    messages[0]!.text,
+    callText,
+    "id-matched active carrier stays byte-identical — it is the only full copy on the wire while it rides",
+  );
 });
 
 test("short summaries are left byte-identical; kept orphans with long summaries are stubbed", () => {
@@ -108,7 +106,7 @@ test("short summaries are left byte-identical; kept orphans with long summaries 
   assert.equal(parsedContent(orphanOut[0]!.text)[0]!.summary!.length, 200);
 });
 
-test("tag-prefixed compress call text is still parsed and stubbed (ref tag precedes the JSON)", () => {
+test("tag-prefixed carrier text passes through byte-identical (ref tag precedes the JSON) (#4311)", () => {
   const longSummary = "z".repeat(3000);
   const state = liveState(longSummary, "m00001", "m00050");
   state.messageRefs.byRaw["mc1"] = "m00010";
@@ -123,10 +121,11 @@ test("tag-prefixed compress call text is still parsed and stubbed (ref tag prece
   const text = messages[0]!.text!;
   assert.ok(text.startsWith("<acp "));
   assert.ok(text.includes("m00010"));
+  assert.equal(text, tagged.text, "carrier passes through byte-identical incl. ref tag");
   const content = JSON.parse(text.slice(text.indexOf("{"))) as {
     content: { summary: string }[];
   };
-  assert.equal(content.content[0]!.summary.length, 200);
+  assert.equal(content.content[0]!.summary.length, 3000, "full summary retained");
 });
 
 test("tag-prefixed mixed call: consumed sibling entry is still dropped", () => {
@@ -225,6 +224,9 @@ test("parseCallText handles stringified content arrays and preserves the string 
   }[];
   assert.equal(entries.length, 1);
   assert.equal(entries[0]!.startId, "m1");
-  assert.ok(entries[0]!.summary.length <= 200, "summary stubbed");
-  assert.ok(entries[0]!.summary.endsWith("…"));
+  assert.equal(
+    entries[0]!.summary,
+    "x".repeat(300),
+    "active carrier keeps the full summary; only the dead range was dropped (#4311)",
+  );
 });
