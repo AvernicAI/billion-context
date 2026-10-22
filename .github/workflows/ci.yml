@@ -272,6 +272,11 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm install --ignore-scripts --no-fund --no-audit
+      # #4336: the storage suites transitively import acp-kernel at runtime
+      # (store.ts -> runtime-status -> knobs -> config) since #4177 — tsx
+      # resolves it to the built dist. Same prerequisite as the main test
+      # matrix (run-ci-tests pretest parity) and ci-e2e-dsh.yml.
+      - run: npm --prefix kernel run build
       - run: node --import tsx --test tests/storage-backend-contract.test.ts tests/storage-backend-knob.test.ts
         env:
           BILI_MYSQL_TEST_DSN: mysql://root:bili-test-root@127.0.0.1:3306/bili
