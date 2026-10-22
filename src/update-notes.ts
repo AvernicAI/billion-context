@@ -181,6 +181,36 @@ export function getUpdateVisibility(runningVersion: string): UpdateVisibility & 
     };
 }
 
+/** The ONE actionable update decision (#4295). Every surface — web banner,
+ *  /acp panel line, acp_status section — renders THIS instead of branching
+ *  on raw pendingRestart itself, so they can never disagree about what a
+ *  restart actually delivers:
+ *  ready     → the on-disk install already carries EVERY critical fix in the
+ *              span (disk ≥ the highest critical version), so restarting NOW
+ *              delivers them all; version = the ACTUAL disk version.
+ *  available → at least one critical fix is still uninstalled; version = the
+ *              MINIMUM version carrying the FIRST STILL-UNINSTALLED critical
+ *              fix (a partially installed span skips the criticals already on
+ *              disk — naming one of those would claim the disk holds a fix it
+ *              does not contain, the #4295 mismatch).
+ *  null when the span is invisible (#1977: routine/recommended-only stay
+ *  silent). The physical pendingRestart fact stays on UpdateVisibility
+ *  untouched — this only decides how the notice reads. */
+export function updateDecision(v: UpdateVisibility): { kind: "available" | "ready"; version: string; summary: string } | null {
+    if (!v.critical) return null;
+    const criticals = v.span.filter((e) => e.tier === "critical"); // ascending
+    if (criticals.length === 0) return null; // defensive: critical implies one, stay total
+    const top = criticals[criticals.length - 1];
+    const disk = v.diskVersion;
+    const diskUsable = disk !== undefined && semver.valid(disk) === disk;
+    if (v.pendingRestart && diskUsable && semver.gte(disk, top.version)) {
+        return { kind: "ready", version: disk, summary: top.summary };
+    }
+    const next = diskUsable ? criticals.find((e) => semver.gt(e.version, disk)) : undefined;
+    const target = next ?? criticals[0];
+    return { kind: "available", version: target.version, summary: target.summary };
+}
+
 /** Shared wording for the /acp panel line, acp_status and the web update
  *  banner — one line, stripper-safe slot is the caller's job. Kept compact:
  *  the panel is small, and acp_status carries the full span. Only ever
@@ -190,19 +220,20 @@ export function getUpdateVisibility(runningVersion: string): UpdateVisibility & 
  *  hosts differ (npm -g / opencode plugin / dsh / pi) and the wrong hint is
  *  worse than none — name the version, let the client's own docs say how. */
 export function describeUpdateReady(v: UpdateVisibility): string {
-    const latest = v.span.length > 0 ? v.span[v.span.length - 1].version : v.diskVersion;
-    const topCritical = v.span.find((e) => e.tier === "critical");
-    if (v.pendingRestart && latest !== undefined) {
+    const d = updateDecision(v);
+    if (d !== null && d.kind === "ready") {
+        const topCritical = v.span.find((e) => e.tier === "critical");
         const notable = topCritical ? ` Critical fix since ${v.runningVersion}: ${topCritical.summary}` : "";
-        return `Critical update ready: ${latest} — restart to finish.${notable}`;
+        return `Critical update ready: ${d.version} — restart to finish.${notable}`;
     }
-    if (topCritical && latest !== undefined) {
-        // ≥ the MINIMUM version carrying the fix (topCritical = first critical
-        // in the ascending span): any version at-or-above it is safe, so the
-        // line must read "≥ X", not "X" — pinning exactly X would be wrong
-        // advice for hosts whose installer grabbed a newer release.
-        return `Critical update available: ≥ ${topCritical.version} — ${topCritical.summary}`;
+    if (d !== null && d.kind === "available") {
+        // ≥ the MINIMUM version carrying the next still-uninstalled fix: any
+        // version at-or-above it is safe, so the line must read "≥ X", not
+        // "X" — pinning exactly X would be wrong advice for hosts whose
+        // installer grabbed a newer release.
+        return `Critical update available: ≥ ${d.version} — ${d.summary}`;
     }
+    const latest = v.span.length > 0 ? v.span[v.span.length - 1].version : v.diskVersion;
     return `Update available: ${latest ?? "newer version"}.`;
 }
 
@@ -210,20 +241,13 @@ export function describeUpdateReady(v: UpdateVisibility): string {
  *  the SERVER must not bake an English sentence — the UI ships zh + en, so
  *  it sends kind/version/summary and lets i18n compose the sentence
  *  ("upgrade to v{version} or newer", separately translated per locale).
- *  available → version = the MINIMUM version carrying the critical fix
- *  (first critical in the ascending span; anything ≥ it is safe).
- *  ready     → version = the on-disk version a restart delivers.
- *  null when the span is invisible (#1977: routine/recommended stay silent). */
+ *  Semantics live in updateDecision (#4295): ready names the actual disk
+ *  version once it carries ALL critical fixes; available names the minimum
+ *  version with the first still-uninstalled critical fix. null when the span
+ *  is invisible (#1977: routine/recommended stay silent). */
 export function updateBannerPayload(v: UpdateVisibility & { visible: boolean }): { kind: "available" | "ready"; version: string; summary: string } | null {
     if (!v.visible) return null;
-    const criticals = v.span.filter((e) => e.tier === "critical");
-    const first = criticals[0];
-    const newest = criticals[criticals.length - 1] ?? first;
-    if (first === undefined || newest === undefined) return null; // defensive: visible implies a critical, but stay total
-    if (v.pendingRestart && v.diskVersion !== undefined) {
-        return { kind: "ready", version: v.diskVersion, summary: newest.summary };
-    }
-    return { kind: "available", version: first.version, summary: first.summary };
+    return updateDecision(v);
 }
 
 function throttleFile(): string {

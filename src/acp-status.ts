@@ -22,7 +22,7 @@ import { coveredRefSpan } from "./decompress-shared.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
-import { getUpdateVisibility } from "./update-notes.js";
+import { getUpdateVisibility, updateDecision } from "./update-notes.js";
 import { VERSION, BUILD_COMMIT } from "./version.js";
 import { isExternalSummaryBlock } from "./external-summary-marker.js";
 import { storageStatusLabel } from "./persist.js";
@@ -423,10 +423,14 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // exists while auto-update is off.
         extra.push("");
         const lines: string[] = [];
-        if (upd.pendingRestart) {
-            lines.push(`CRITICAL UPDATE READY (instance-level): ${upd.diskVersion} downloaded — restart this agent's proxy to finish (running ${upd.runningVersion}).`);
+        // #4295: branch on the SAME shared decision the banner and panel use —
+        // raw pendingRestart alone would say "ready" when the disk holds a
+        // newer-but-still-unfixed version. visible ⇒ the decision is present.
+        const dec = updateDecision(upd);
+        if (dec !== null && dec.kind === "ready") {
+            lines.push(`CRITICAL UPDATE READY (instance-level): ${dec.version} downloaded — restart this agent's proxy to finish (running ${upd.runningVersion}).`);
         } else {
-            lines.push(`CRITICAL UPDATE AVAILABLE (instance-level): release with a critical-tier fix on the channel — running ${upd.runningVersion}.`);
+            lines.push(`CRITICAL UPDATE AVAILABLE (instance-level): critical fix ships in ${dec !== null ? dec.version : "a newer release"} or newer — running ${upd.runningVersion}.`);
         }
         for (const e of upd.span) {
             lines.push(`  · ${e.version} [${e.tier}] ${e.summary}`);

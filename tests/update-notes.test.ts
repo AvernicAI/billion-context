@@ -24,6 +24,7 @@ import {
     getUpdateVisibility,
     describeUpdateReady,
     updateBannerPayload,
+    updateDecision,
     type ReleaseNoteEntry,
 } from "../src/update-notes.ts";
 import { VERSION } from "../src/version.ts";
@@ -180,6 +181,66 @@ test("#1977 describeUpdateReady: critical wording + byte-stability", () => {
     }
 });
 
+test("#4295 updateDecision: ready iff disk carries ALL critical fixes; available names the first still-uninstalled one", () => {
+    _resetReleaseNotesWatcherForTest();
+    try {
+        const FIX_A: ReleaseNoteEntry = { version: "0.1.180", date: "2026-10-02", tier: "critical", summary: "fix A (#4295)" };
+        const FIX_B: ReleaseNoteEntry = { version: "0.1.182", tier: "critical", summary: "fix B (#4295)" };
+        const TAIL: ReleaseNoteEntry = { version: "0.1.183", tier: "routine", summary: "routine tail" };
+
+        // Issue scenario verbatim: running 0.1.178, disk 0.1.179 (newer but
+        // UNFIXED), notes 0.1.180 critical / 0.1.181 routine. A restart loads
+        // 0.1.179 — nothing may call that state ready.
+        _setReleaseNotesStateForTest({ entries: [{ version: "0.1.181", tier: "routine", summary: "tail" }, FIX_A], diskVersion: "0.1.179" });
+        let v = getUpdateVisibility("0.1.178");
+        assert.equal(v.pendingRestart, true, "physical pendingRestart fact preserved");
+        assert.equal(v.visible, true);
+        assert.deepEqual(updateDecision(v), { kind: "available", version: "0.1.180", summary: "fix A (#4295)" }, "partial install is NOT ready — names the first still-uninstalled critical");
+        assert.deepEqual(updateBannerPayload(v), { kind: "available", version: "0.1.180", summary: "fix A (#4295)" }, "banner shares the decision");
+        assert.ok(describeUpdateReady(v).startsWith("Critical update available: ≥ 0.1.180 —"), "panel wording says available");
+        assert.ok(!describeUpdateReady(v).includes("restart to finish"), "no restart instruction while the fix is uninstalled");
+
+        // Multiple criticals: a disk between them already holds the lower one.
+        _setReleaseNotesStateForTest({ entries: [TAIL, FIX_B, FIX_A], diskVersion: "0.1.181" });
+        v = getUpdateVisibility("0.1.178");
+        assert.deepEqual(updateDecision(v), { kind: "available", version: "0.1.182", summary: "fix B (#4295)" }, "disk 0.1.181 holds fix A only → next uninstalled is 0.1.182");
+        _setReleaseNotesStateForTest({ entries: [TAIL, FIX_B, FIX_A], diskVersion: "0.1.180" });
+        v = getUpdateVisibility("0.1.178");
+        assert.deepEqual(updateDecision(v), { kind: "available", version: "0.1.182", summary: "fix B (#4295)" }, "disk == fix A version → A IS installed, B still missing");
+
+        // Disk carries every critical (even when notes lag behind disk) →
+        // ready names the ACTUAL disk version, not the span tail.
+        _setReleaseNotesStateForTest({ entries: [TAIL, FIX_B, FIX_A], diskVersion: "0.1.183" });
+        v = getUpdateVisibility("0.1.178");
+        assert.deepEqual(updateDecision(v), { kind: "ready", version: "0.1.183", summary: "fix B (#4295)" }, "all criticals on disk → ready, actual disk version, newest critical summary");
+        assert.ok(describeUpdateReady(v).startsWith("Critical update ready: 0.1.183 — restart to finish."), "panel names the disk version");
+        _setReleaseNotesStateForTest({ entries: [FIX_B, FIX_A], diskVersion: "0.1.184" });
+        v = getUpdateVisibility("0.1.178");
+        assert.deepEqual(updateDecision(v), { kind: "ready", version: "0.1.184", summary: "fix B (#4295)" }, "notes lagging behind disk → still names the disk version");
+
+        // Equal / rollback / unknown / invalid disk → AVAILABLE at the first
+        // critical; none of them may read as ready.
+        for (const disk of ["0.1.178", "0.1.175", undefined, "not-semver"]) {
+            _setReleaseNotesStateForTest({ entries: [TAIL, FIX_B, FIX_A], ...(disk !== undefined ? { diskVersion: disk } : {}) });
+            v = getUpdateVisibility("0.1.178");
+            assert.equal(v.pendingRestart, false, `pendingRestart false for disk=${String(disk)}`);
+            assert.deepEqual(updateDecision(v), { kind: "available", version: "0.1.180", summary: "fix A (#4295)" }, `available at first critical for disk=${String(disk)}`);
+        }
+
+        // Quiet states stay silent through the shared decision.
+        _setReleaseNotesStateForTest({ entries: [TAIL], diskVersion: "0.1.183" });
+        v = getUpdateVisibility("0.1.182");
+        assert.equal(v.visible, false);
+        assert.equal(updateDecision(v), null, "routine-only span: no decision");
+        assert.equal(updateBannerPayload(v), null, "routine-only span: no banner");
+        _resetReleaseNotesWatcherForTest();
+        v = getUpdateVisibility("0.1.182");
+        assert.equal(updateDecision(v), null, "clean install: no decision");
+    } finally {
+        _resetReleaseNotesWatcherForTest();
+    }
+});
+
 // ---------------------------------------------------------------------------
 // Surfaces. Mirrors the #1577 advisory-surface tests.
 
@@ -300,6 +361,45 @@ test("#1977 /acp panel: one critical-update line BEFORE the footer, stripper-saf
         handlePluginStatus("never-seen", r2.res, deps, true);
         const p2 = JSON.parse(r2.body).panel as string;
         assert.ok(p2.includes(dollarSummary), "dollar-sign summary survives byte-exact");
+    } finally {
+        _resetReleaseNotesWatcherForTest();
+        _resetSessionsForTest();
+    }
+});
+
+test("#4295 surfaces: partially installed fix renders AVAILABLE (never READY) on acp_status + /acp panel", async () => {
+    _resetReleaseNotesWatcherForTest();
+    const { handleAcpStatus } = await import("../src/acp-status.ts");
+    const { _resetSessionsForTest } = await import("../src/session.ts");
+    const { handlePluginStatus } = await import("../src/plugin.ts");
+    try {
+        // Disk strictly between running and the first critical fix: the exact
+        // #4295 mismatch state (restart would load an unfixed version).
+        const PARTIAL_DISK = semver.inc(RUNNING, "patch") ?? "0.0.2";
+        const PARTIAL_CRIT = semver.inc(RUNNING, "minor") ?? "0.2.0";
+        const PARTIAL_TAIL = semver.inc(PARTIAL_CRIT, "patch") ?? "0.2.1";
+        const partial: ReleaseNoteEntry[] = [
+            { version: PARTIAL_TAIL, tier: "routine", summary: "routine tail after the fix" },
+            { version: PARTIAL_CRIT, date: "2026-10-02", tier: "critical", summary: "partial-install critical fix (#4295)" },
+        ];
+        _setReleaseNotesStateForTest({ entries: partial, diskVersion: PARTIAL_DISK });
+
+        const ctx = makeCtx12();
+        const out = handleAcpStatus({}, ctx);
+        assert.ok(out.text.includes("CRITICAL UPDATE AVAILABLE (instance-level):"), "acp_status says AVAILABLE while the critical fix is still uninstalled");
+        assert.ok(!out.text.includes("CRITICAL UPDATE READY"), "acp_status never claims ready/restart-to-finish in this state");
+        assert.ok(out.text.includes(`ships in ${PARTIAL_CRIT} or newer`), "names the minimum fixed version");
+        assert.ok(out.text.includes(`· ${PARTIAL_CRIT} [critical] partial-install critical fix (#4295)`), "span listing intact");
+
+        _resetSessionsForTest();
+        const { getSession } = await import("../src/session.ts");
+        getSession("upd-sess-4295", { protocol: "anthropic", label: "UPD" });
+        const deps = { core: createCore(), config: defaultConfig(200000), log: (_l: string, _m: string) => {} };
+        const r = mockRes();
+        handlePluginStatus("never-seen", r.res, deps, true);
+        const p = JSON.parse(r.body).panel as string;
+        assert.ok(p.includes(`Critical update available: ≥ ${PARTIAL_CRIT} —`), "panel line says available with the minimum fixed version");
+        assert.ok(!p.includes("Critical update ready"), "panel line never says ready for a partial install");
     } finally {
         _resetReleaseNotesWatcherForTest();
         _resetSessionsForTest();
